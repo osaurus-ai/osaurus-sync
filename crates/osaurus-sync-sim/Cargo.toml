@@ -13,5 +13,8 @@ rand_chacha.workspace = true
 rand_core.workspace = true
 tempfile = "3"
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

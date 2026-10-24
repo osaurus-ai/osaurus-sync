@@ -671,6 +671,9 @@ impl Engine {
 
     fn on_offer(&mut self, r: &mut Replica, peer: DeviceKey, scopes: Vec<ScopeOffer>) -> Result<()> {
         for o in scopes {
+            if r.has_left(o.scope)? {
+                continue;
+            }
             if !r.scope_exists(o.scope)? {
                 r.join_scope_tentatively(o.scope)?;
             }
@@ -1041,6 +1044,7 @@ impl Engine {
     /// Pushes new events and starts queued reconciliation. Call after local writes.
     pub fn poll(&mut self, r: &mut Replica) -> Result<Vec<Out>> {
         let mut out = Vec::new();
+        r.finish_leaving()?;
         if r.is_self_revoked() {
             let peers: Vec<_> = self.sessions.keys().copied().collect();
             for p in peers {

@@ -416,6 +416,15 @@ impl SyncCore {
         self.write(|r| r.change_role(scope, p, role.into()))
     }
 
+    /// Leaves a conversation: removes this user from its members and deletes the local copy
+    /// once another device has the removal. Other members keep theirs; an invite brings it
+    /// back. The last owner of a shared conversation has to make someone else an owner first
+    /// (`PermissionDenied`). This user's other devices stop listing it.
+    pub fn leave_conversation(&self, scope: String) -> R<()> {
+        let scope = scope_id(&scope)?;
+        self.write(|r| r.leave_scope(scope))
+    }
+
     // ---- devices ----
 
     pub fn devices(&self) -> R<Vec<Device>> {
@@ -524,6 +533,42 @@ impl SyncCore {
         Ok(self.node.sync_status(scope)?.into())
     }
 
+    pub fn storage_usage(&self) -> R<StorageUsage> {
+        self.read(|r| r.storage_usage()).map(Into::into)
+    }
+
+    /// Writes a conversation to the directory `path` (created if needed) as
+    /// `conversation.json`, with its downloaded attachments under `attachments/`. Only what
+    /// this device holds is included.
+    pub async fn export_conversation(&self, scope: String, path: String) -> R<ExportSummary> {
+        let scope = scope_id(&scope)?;
+        let node = self.node.clone();
+        self.live()?;
+        let dir = std::path::PathBuf::from(path);
+        let res = self.handle.spawn_blocking(move || node.read(|r| r.export_conversation(scope, &dir))).await;
+        Ok(res.map_err(|e| SyncError::from(osaurus_sync_core::Error::Internal(e.to_string())))??.into())
+    }
+
+    /// Signs this device out: stops networking, deletes the data directory and this core's key
+    /// store entries. Conversations stay on other devices and with other members; to stop
+    /// this device being admitted again, revoke it from another device. Further calls fail
+    /// with `Closed`; open a new core to start over.
+    pub async fn reset(&self) -> R<()> {
+        let node = self.node.clone();
+        let res = self
+            .on_runtime(async move {
+                // Wipe even if a clean shutdown fails; the user asked for the data to go.
+                if let Err(e) = node.shutdown().await {
+                    tracing::warn!(error = %format!("{e:#}"), "shutdown before reset failed");
+                }
+                Ok(node.read(|r| r.wipe())?)
+            })
+            .await;
+        self.closed.store(true, Ordering::Release);
+        self.hub.stop();
+        res
+    }
+
     pub fn diagnostics(&self) -> Diagnostics {
         self.node.diagnostics().into()
     }
@@ -589,6 +634,11 @@ impl SyncCore {
             "backfill_paused": d.backfill_paused,
             "home_relays": d.home_relays.iter().map(|r| serde_json::json!({ "url": r.url, "connected": r.connected })).collect::<Vec<_>>(),
             "local_addresses": d.local_addrs.len(),
+            "storage": self.node.read(|r| r.storage_usage()).ok().map(|u| serde_json::json!({
+                "database_bytes": u.database_bytes,
+                "attachment_bytes": u.blob_bytes,
+                "attachment_cache_bytes": u.attachment_cache_bytes,
+            })),
             "peers": peers,
             "scopes": scopes,
             "counters": {

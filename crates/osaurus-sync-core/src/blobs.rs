@@ -148,6 +148,14 @@ impl BlobStore {
         removed
     }
 
+    /// Bytes of encrypted blobs (including partial downloads) and of the decrypted cache.
+    pub fn usage(&self) -> (u64, u64) {
+        let sum = |dir: &Path| -> u64 {
+            fs::read_dir(dir).map_or(0, |entries| entries.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
+        };
+        (sum(&self.dir), sum(&self.dir.join("plain")))
+    }
+
     pub fn delete(&self, hash: &[u8; 32]) {
         let _ = fs::remove_file(self.path(hash));
         let _ = fs::remove_file(self.part_path(hash));

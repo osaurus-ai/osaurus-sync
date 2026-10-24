@@ -263,6 +263,41 @@ final class BindingTests: XCTestCase {
         try await core.close()
     }
 
+    func testDataManagement() async throws {
+        let keys = MemoryKeyStore()
+        let core = try open("data", keys: keys)
+        let keep = try core.createConversation(title: "Keep")
+        let file = dir.appendingPathComponent("notes.txt")
+        try Data("attached".utf8).write(to: file)
+        var msg = OutgoingMessage.text("hello")
+        msg.attachments = [AttachmentFile(path: file.path, mediaType: "text/plain", name: "notes.txt")]
+        _ = try core.sendMessage(scope: keep, message: msg)
+
+        let usage = try core.storageUsage()
+        XCTAssertGreaterThan(usage.databaseBytes, 0)
+        XCTAssertGreaterThanOrEqual(usage.attachmentBytes, 8)
+
+        let out = dir.appendingPathComponent("export")
+        let summary = try await core.exportConversation(scope: keep, path: out.path)
+        XCTAssertEqual(summary, ExportSummary(messages: 1, attachments: 1, missingAttachments: 0))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: out.appendingPathComponent("conversation.json").path))
+
+        let gone = try core.createConversation(title: "Leave")
+        try core.leaveConversation(scope: gone)
+        XCTAssertEqual(try core.conversations().map(\.scope), [keep])
+
+        XCTAssertNotNil(keys.load(name: "device-key"))
+        try await core.reset()
+        XCTAssertNil(keys.load(name: "device-key"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("data").path))
+        XCTAssertThrowsError(try core.conversations()) { e in
+            XCTAssertEqual((e as? SyncError)?.code, SyncErrorCode.closed)
+        }
+        let fresh = try open("data", keys: keys)
+        XCTAssertEqual(try fresh.conversations().count, 0)
+        try await fresh.close()
+    }
+
     func testKeychainKeyStoreRoundTrip() throws {
         #if os(macOS)
         let store = KeychainKeyStore(service: "ai.osaurus.sync.tests.\(UUID().uuidString)", useDataProtectionKeychain: false)

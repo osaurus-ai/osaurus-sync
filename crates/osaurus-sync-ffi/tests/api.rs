@@ -294,6 +294,42 @@ fn restored_backup_unlocks_with_the_phrase() {
     block_on(new.close()).unwrap();
 }
 
+#[test]
+fn data_management() {
+    let tmp = tempfile::tempdir().unwrap();
+    let keys = Keys::default();
+    let c = SyncCore::open(config(tmp.path(), "Mac", Platform::MacOs, false), Box::new(keys.clone())).unwrap();
+    let keep = c.create_conversation("Keep".into()).unwrap();
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, b"attached").unwrap();
+    let mut m = text("hello");
+    m.attachments.push(AttachmentFile { path: file.to_string_lossy().into_owned(), media_type: "text/plain".into(), name: "notes.txt".into() });
+    c.send_message(keep.clone(), m).unwrap();
+
+    let usage = c.storage_usage().unwrap();
+    assert!(usage.database_bytes > 0 && usage.attachment_bytes >= 8);
+
+    let out = tmp.path().join("export");
+    let summary = block_on(c.export_conversation(keep.clone(), out.to_string_lossy().into_owned())).unwrap();
+    assert_eq!(summary, ExportSummary { messages: 1, attachments: 1, missing_attachments: 0 });
+    assert!(out.join("conversation.json").exists());
+
+    let gone = c.create_conversation("Leave".into()).unwrap();
+    c.leave_conversation(gone.clone()).unwrap();
+    assert_eq!(c.conversations().unwrap().iter().map(|x| x.scope.clone()).collect::<Vec<_>>(), [keep]);
+    assert!(c.support_bundle().contains("\"database_bytes\""));
+
+    assert!(!keys.0.lock().unwrap().is_empty());
+    block_on(c.reset()).unwrap();
+    assert!(keys.0.lock().unwrap().is_empty());
+    assert!(!tmp.path().join("Mac").exists());
+    assert!(matches!(c.conversations(), Err(SyncError::Closed { .. })));
+    // A fresh core starts empty.
+    let c = SyncCore::open(config(tmp.path(), "Mac", Platform::MacOs, false), Box::new(keys)).unwrap();
+    assert!(c.conversations().unwrap().is_empty());
+    block_on(c.close()).unwrap();
+}
+
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {

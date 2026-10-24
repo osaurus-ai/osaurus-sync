@@ -539,6 +539,37 @@ pub struct PeerConnection {
     pub storage_role: bool,
 }
 
+/// Disk space used by the core, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct StorageUsage {
+    /// The database with its write-ahead log.
+    pub database_bytes: u64,
+    /// Encrypted attachments, including partial downloads.
+    pub attachment_bytes: u64,
+    /// Decrypted copies of opened attachments, evicted automatically past the cap.
+    pub attachment_cache_bytes: u64,
+}
+
+impl From<osaurus_sync_core::replica::StorageUsage> for StorageUsage {
+    fn from(u: osaurus_sync_core::replica::StorageUsage) -> Self {
+        StorageUsage { database_bytes: u.database_bytes, attachment_bytes: u.blob_bytes, attachment_cache_bytes: u.attachment_cache_bytes }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct ExportSummary {
+    pub messages: u32,
+    pub attachments: u32,
+    /// Attachments this device hasn't downloaded: listed in the export without a file.
+    pub missing_attachments: u32,
+}
+
+impl From<osaurus_sync_core::replica::ExportSummary> for ExportSummary {
+    fn from(s: osaurus_sync_core::replica::ExportSummary) -> Self {
+        ExportSummary { messages: s.messages, attachments: s.attachments, missing_attachments: s.missing_attachments }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct Diagnostics {
     pub device: String,

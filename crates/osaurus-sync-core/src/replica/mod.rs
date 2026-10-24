@@ -5,6 +5,7 @@
 
 mod apply;
 mod compact;
+mod data;
 mod loro_docs;
 mod maintain;
 mod ops;
@@ -34,6 +35,7 @@ use crate::store::{self, status};
 use crate::types::{Change, HistoryMode};
 
 pub use compact::{Compaction, PointInTimeView};
+pub use data::{ExportSummary, StorageUsage};
 pub use loro_docs::LoroCache;
 pub use maintain::{Maintenance, PEER_TTL_MS, TENTATIVE_TTL_MS};
 pub use ops::InviteToken;
@@ -454,6 +456,7 @@ impl Replica {
             "INSERT OR IGNORE INTO scopes(scope, history_mode, window_days, storage_role, joined_ms, tentative) VALUES (?, ?, ?, ?, ?, ?)",
             params![&scope.0[..], m, days, self.cfg.storage_role as i64, self.env.now_ms() as i64, tentative as i64],
         )?;
+        self.db.execute("DELETE FROM left_scopes WHERE scope = ?", [&scope.0[..]])?;
         Ok(())
     }
 

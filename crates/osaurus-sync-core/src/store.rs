@@ -137,6 +137,10 @@ CREATE TABLE IF NOT EXISTS revoked_devices (device BLOB PRIMARY KEY, revoked_ms 
 -- User identities this device has rotated away from. Their certificates are no longer trusted.
 CREATE TABLE IF NOT EXISTS retired_users (user BLOB PRIMARY KEY, successor BLOB NOT NULL, retired_ms INTEGER NOT NULL);
 
+-- Scopes this device left. Kept after the scope is purged so offers don't bring it back; an
+-- invite clears it.
+CREATE TABLE IF NOT EXISTS left_scopes (scope BLOB PRIMARY KEY, left_ms INTEGER NOT NULL);
+
 CREATE TABLE IF NOT EXISTS blobs (
     hash BLOB PRIMARY KEY,
     size INTEGER NOT NULL,

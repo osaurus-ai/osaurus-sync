@@ -248,6 +248,42 @@ public sealed class BindingTests : IDisposable
     }
 
     [Fact]
+    public async Task DataManagement()
+    {
+        var keys = new MemoryKeyStore();
+        var core = Open("data", keys: keys);
+        var keep = core.CreateConversation("Keep");
+        var file = Path.Combine(_dir, "notes.txt");
+        File.WriteAllText(file, "attached");
+        core.SendMessage(keep, OsaurusSync.Text("hello") with { Attachments = [new AttachmentFile(file, "text/plain", "notes.txt")] });
+
+        var usage = core.StorageUsage();
+        Assert.True(usage.DatabaseBytes > 0);
+        Assert.True(usage.AttachmentBytes >= 8);
+
+        var outDir = Path.Combine(_dir, "export");
+        var summary = await core.ExportConversation(keep, outDir);
+        Assert.Equal(new ExportSummary(1, 1, 0), summary);
+        Assert.True(File.Exists(Path.Combine(outDir, "conversation.json")));
+
+        var gone = core.CreateConversation("Leave");
+        core.LeaveConversation(gone);
+        Assert.Equal([keep], core.Conversations().Select(c => c.Scope));
+
+        Assert.NotNull(keys.Load("device-key"));
+        await core.Reset();
+        Assert.Null(keys.Load("device-key"));
+        Assert.False(Directory.Exists(Path.Combine(_dir, "data")));
+        var e = Assert.ThrowsAny<SyncException>(() => core.Conversations());
+        Assert.Equal(SyncErrorCode.Closed, SyncErrorCode.CodeOf(e));
+        core.Dispose();
+
+        using var fresh = Open("data", keys: keys);
+        Assert.Empty(fresh.Conversations());
+        await fresh.Close();
+    }
+
+    [Fact]
     public void DpapiKeyStoreRoundTrip()
     {
         if (!OperatingSystem.IsWindows()) return;

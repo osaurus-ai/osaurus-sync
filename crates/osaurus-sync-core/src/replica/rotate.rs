@@ -134,7 +134,7 @@ impl Replica {
 
     /// The highest HLC seen from each device, for a removal. Computed last, so the remover's
     /// own events before the removal stay valid.
-    fn cutoffs_of(&self, scope: ScopeId, devices: &[DeviceKey]) -> Result<Vec<(DeviceKey, u64)>> {
+    pub(super) fn cutoffs_of(&self, scope: ScopeId, devices: &[DeviceKey]) -> Result<Vec<(DeviceKey, u64)>> {
         let mut out = Vec::new();
         for d in devices {
             if let Some(h) = self.max_hlc_of(scope, d)? {

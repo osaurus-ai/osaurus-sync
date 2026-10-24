@@ -401,6 +401,36 @@ past.complete               // false if this device compacted or never synced pa
 
 The view is read-only. To restore old content, write new messages.
 
+## Managing data
+
+```swift
+try core.leaveConversation(scope: scope)
+let usage = try core.storageUsage()          // databaseBytes, attachmentBytes, attachmentCacheBytes
+let summary = try await core.exportConversation(scope: scope, path: folder.path)
+try await core.reset()                       // sign out: deletes this device's data and keys
+```
+
+- **`leaveConversation`** removes this user from the conversation and deletes the local
+  copy. Other members keep theirs, and the remaining members get a new key, so this device
+  can't read anything posted afterwards. The copy stays hidden on disk until another device
+  has received the removal, so the removal isn't lost if the app quits first. On this user's
+  other devices the conversation disappears from the list; each device deletes its own copy
+  when it leaves. An invite brings the conversation back. The last owner of a conversation
+  shared with others gets `PermissionDenied`; make someone else an owner first.
+- **`storageUsage`** reports the database (including its write-ahead log), the encrypted
+  attachments and the cache of decrypted attachments. The cache is trimmed automatically.
+- **`exportConversation`** writes `conversation.json` and an `attachments/` folder into the
+  given directory, creating it if needed. The JSON has `format: "osaurus-sync-conversation"`
+  and `version: 1`, the title, members and roles, and each message with its author, device
+  name, time, content, reactions and attachments (`file` is a path relative to the export,
+  or `null` for attachments this device hasn't downloaded). `complete` is false when this
+  device doesn't hold the whole history: older messages outside its history window, or
+  history it compacted. Call `requestHistory` first to export more.
+- **`reset`** is for signing out. It stops networking, deletes the data directory and the
+  key store entries (`device-key`, `user-secret`, `user-secret-next`), and closes the core.
+  Open a new core to start again as a new device. Other devices and members keep their
+  data; revoke this device from another one to stop it being admitted with old keys.
+
 ## App lifecycle
 
 On iOS, call `suspend()` when the app goes to the background and `resume()` when it returns.

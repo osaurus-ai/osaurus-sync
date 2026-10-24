@@ -47,7 +47,7 @@ impl Node {
         self.replica.as_ref().expect("node is running").device_key()
     }
 
-    fn config(&self) -> ReplicaConfig {
+    pub fn config(&self) -> ReplicaConfig {
         let mut c = ReplicaConfig::new(self.dir.path(), self.name.clone(), self.platform);
         c.history_mode = self.history;
         c.snapshot_every = 8;

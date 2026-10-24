@@ -45,6 +45,8 @@ impl Replica {
             }
         }
 
+        m.scopes_purged += self.finish_leaving()? as usize;
+
         // Expired or used invites can't admit anyone.
         let mut used: Vec<Vec<u8>> = Vec::new();
         for scope in self.scope_ids()? {

@@ -209,7 +209,18 @@ directory. A lock file makes sure only one process opens a data directory at a t
   the view tables are dropped and replayed. The views are `messages_view`, `messages_fts`,
   `edits`, `tombstones`, `reactions` and `conversations_view`.
 - Supporting tables track DAG heads, held events, the outbox, peers, storage peers, known and
-  revoked devices, retired users, blobs, Loro snapshots and read state.
+  revoked devices, retired users, blobs, Loro snapshots and read state. `left_scopes` remembers
+  scopes this device left, so offers from its own devices don't bring them back; redeeming an
+  invite clears the entry.
+- **Leaving** (`Replica::leave_scope`) rotates the scope key to the remaining members' devices,
+  then publishes `MemberRemove` for this user, with cutoffs for each of this user's devices.
+  The removal goes into the outbox even though it's a control event, so the scope is purged
+  only after a peer acknowledges it. This user's other devices see a self-removal and drop
+  the scope from their list, but don't purge: identity rotation also publishes self-removals,
+  and only the leaving device knows which case it is.
+- **Wiping** (`Replica::wipe`, the FFI's `reset`) deletes the key store entries, swaps the
+  database for an in-memory one so its files close (Windows can't delete open files), releases
+  the lock and deletes the database, blobs and lock file.
 - **Retention.** `Replica::maintain`, which the network node runs at start and then hourly, does
   the following:
   - expires held events;
@@ -217,6 +228,8 @@ directory. A lock file makes sure only one process opens a data directory at a t
   - drops contact records for peers that are revoked or unseen for 90 days;
   - forgets other users' devices that are no longer certified in any scope;
   - purges tentatively joined scopes still unproven after a day;
+  - purges scopes this device left once another device has acknowledged the removal (also
+    checked on every engine poll);
   - takes over scopes that still list a retired user (see [Identity rotation](#identity-rotation));
   - seals keys to the user's recovery key where that grant is missing;
   - evicts decrypted attachments (`blobs/plain`) by least-recent use, above
