@@ -254,9 +254,44 @@ Artifacts from each run: `xcframework` (the zipped XCFramework), `osx-arm64`, `w
 
 ## Releasing
 
-1. Bump the version in `bindings/csharp/OsaurusSync/OsaurusSync.csproj` (or pass `VERSION` to
-   `pack-nuget.sh`), and the crate versions if needed.
-2. Push to `main` and wait for CI to pass.
-3. Download the `nuget` artifact and publish the `.nupkg` to the package feed.
-4. Download the `xcframework` artifact and attach it to a GitHub release, or ship it with the
-   apps that use the local package.
+Releases are cut by pushing a tag. `.github/workflows/release.yml` then:
+
+1. Builds the XCFramework in release, runs the Swift tests, zips it and computes its SwiftPM
+   checksum.
+2. Writes the distributable Swift package (`scripts/make-swift-package.sh`): the sources with
+   the generated bindings, and a `binaryTarget(url:checksum:)` pointing at the release asset.
+3. Builds the `win-x64` and `win-arm64` DLLs on native runners, runs the xUnit tests on each,
+   and signs both with Authenticode (`signtool`, SHA-256, RFC 3161 timestamp), verifying the
+   signatures.
+4. Packs `Osaurus.Sync` with the tag's version and both signed DLLs plus `osx-arm64`.
+5. Creates the GitHub release with the XCFramework zip, its checksum, the Swift package zip and
+   the `.nupkg`; pushes the package to NuGet; and, if configured, commits the Swift package to
+   the distribution repository and tags it with the bare version (SwiftPM ignores a `v`
+   prefix).
+
+To cut a release:
+
+1. Check that CI and the latest nightly passed on the commit, and run the
+   [device validation](#device-validation) checklists on its build.
+2. Update the crate versions in `Cargo.toml` if they changed, and note breaking API or wire
+   changes (`API_VERSION`, protocol version) in the release notes.
+3. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`. Use a suffix such as
+   `v0.2.0-beta.1` for a prerelease; the GitHub release is marked as one.
+
+Run the workflow by hand (**Actions > Release > Run workflow**) for a dry run: it builds,
+tests and packs everything as workflow artifacts, signs only if the certificate is configured,
+and publishes nothing.
+
+The publishing jobs run in the `release` environment, so it can require approval. They need:
+
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `WINDOWS_SIGNING_CERT` | Secret | Base64 of the code-signing `.pfx`. Required for a tagged release |
+| `WINDOWS_SIGNING_PASSWORD` | Secret | The `.pfx` password |
+| `NUGET_API_KEY` | Secret | Push key for `Osaurus.Sync` |
+| `NUGET_SOURCE` | Variable | Optional feed URL; defaults to nuget.org |
+| `SWIFT_DIST_REPO` | Variable | Optional `owner/name` of the Swift distribution repository, such as `osaurus-ai/osaurus-sync-swift` |
+| `SWIFT_DIST_TOKEN` | Secret | A token that can push to that repository |
+
+If the signing key lives in an HSM or a cloud signing service rather than a `.pfx`, replace the
+Authenticode step with that service's signing action; the rest of the pipeline is unchanged.

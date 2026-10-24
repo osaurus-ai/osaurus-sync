@@ -34,6 +34,9 @@ exposed in the API. MLS group keys and the Osaurus Server binary are later phase
 | iOS 17+ (device and simulator) | Swift package, [`bindings/swift`](bindings/swift) | Keychain (this device only) |
 | Windows x64 and arm64 | NuGet `Osaurus.Sync`, [`bindings/csharp`](bindings/csharp) | DPAPI |
 
+Tagged releases publish the Swift package (with a prebuilt XCFramework) and the signed NuGet
+package; see [Releasing](docs/development.md#releasing).
+
 ## Quick look
 
 ```swift
@@ -80,7 +83,7 @@ core.SendMessage(scope, OsaurusSync.Text("Book the flights"));
 | [`crates/osaurus-sync-sim`](crates/osaurus-sync-sim) | Deterministic simulation harness (tests only) |
 | [`bindings/swift`](bindings/swift) | Swift package for macOS and iOS |
 | [`bindings/csharp`](bindings/csharp) | .NET 8 package and tests |
-| [`scripts`](scripts) | Building the XCFramework, generating bindings, packing NuGet |
+| [`scripts`](scripts) | Building the XCFramework, generating bindings, packing NuGet and the release Swift package |
 | [`tests/fixtures`](tests/fixtures) | Signed events from earlier builds, for compatibility tests |
 
 ## Building

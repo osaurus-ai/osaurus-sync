@@ -5,11 +5,23 @@ Swift package wrapping the Osaurus sync core (`OsaurusSyncFFI.xcframework`). Tar
 
 This README covers package setup and the Apple-specific pieces. For the full API (reading,
 writing, subscriptions, streaming, pairing, errors), see the
-[client guide](../../docs/client-guide.md).
+[client guide](https://github.com/osaurus-ai/osaurus-sync/blob/main/docs/client-guide.md).
 
 ## Adding the package
 
-The package needs `OsaurusSyncFFI.xcframework` next to `Package.swift`. Get it in one of two ways:
+**From a release.** Each release publishes the package with the generated bindings and a
+`binaryTarget` that downloads the XCFramework by URL and checksum. Add the distribution
+repository by version:
+
+```swift
+.package(url: "https://github.com/osaurus-ai/osaurus-sync-swift", from: "0.1.0")
+```
+
+and link the `OsaurusSync` library. Without the distribution repository, unzip
+`OsaurusSync-swift-<version>.zip` from the GitHub release and add the folder as a local package.
+
+**From source.** The repository's own `bindings/swift` package expects
+`OsaurusSyncFFI.xcframework` next to `Package.swift`:
 
 - **Build it:** run `scripts/build-xcframework.sh` from the repo root. This also regenerates the
   Swift bindings in `Sources/OsaurusSync/Generated`.
