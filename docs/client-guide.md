@@ -51,7 +51,7 @@ optional parameters are:
 | --- | --- | --- |
 | `keyStore` | Keychain (Swift), DPAPI (C# on Windows) | Use `MemoryKeyStore` only in tests |
 | `history` | Platform default | iOS: last 90 days. macOS and Windows: full history |
-| `network` | `defaultNetworkConfig()` | See [Network configuration](#network-configuration) |
+| `network` | `defaultNetworkConfig()`: LAN only until the app sets relays and discovery | See [Network configuration](#network-configuration) |
 
 On first open the core creates a device key and a user identity. Opening also brings the network
 up, unless `network.enabled` is false.
@@ -499,26 +499,58 @@ and device names are left out. The recent records are kept even without a listen
 
 ## Network configuration
 
+The core doesn't default to anyone's servers. `defaultNetworkConfig()` has mDNS on and no
+relays or discovery server, so devices sync on the same network only. For sync over the
+internet, the app passes its own relay and discovery servers, for example from its remote
+configuration:
+
 ```swift
-var net = defaultNetworkConfig()   // Osaurus relays, default discovery, mDNS on
-net.mdns = false                   // e.g. if the iOS local network permission was declined
-net.relays = ["https://relay.example.com"]
-net.dnsServer = "https://dns.example.com"; net.dnsOrigin = "example.com"   // set both or neither
+var net = defaultNetworkConfig()
+net.relays = ["https://relay-us.example.com", "https://relay-eu.example.com"]
+net.discoveryServer = "https://dns.example.com/pkarr"   // set both or neither
+net.discoveryOrigin = "dns.example.com"
+net.publish = .relayOnly                                 // the default
+net.mdns = false                                         // e.g. if the local network permission was declined
 let core = try SyncCore.open(dataDirectory: dir, deviceName: name, network: net)
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `enabled` | Bring the network up at open. If false, call `resume()` to go online |
-| `relays` | Relay URLs. Empty means the Osaurus defaults |
-| `relaysDisabled` | No relays: direct connections only |
-| `dnsServer`, `dnsOrigin` | A self-hosted discovery server |
-| `dnsDisabled` | No DNS discovery |
+| `relays` | Relay server URLs (`iroh-relay`). Empty means no relays: direct connections only |
+| `discoveryServer`, `discoveryOrigin` | A pkarr relay and the DNS origin it serves records under. Unset means no internet discovery |
+| `publish` | What goes into this device's discovery record: `relayOnly` or `directAddresses` |
 | `mdns` | LAN discovery |
 | `bindPort` | 0 picks any port |
 
-`localNetworkConfig()` turns off relays, DNS and mDNS. Use it for tests, and connect devices with
-`localAddress()` and `addPeerAddress(address:)`.
+- **`n0PublicNetworkConfig()`** uses number0's public relays and discovery server. It's
+  convenient for development, but they're shared, rate limited and not run for Osaurus, so
+  don't ship it.
+- **`localNetworkConfig()`** also turns off mDNS. Use it for tests, and connect devices with
+  `localAddress()` and `addPeerAddress(address:)`.
+- Devices find each other by device id. Without a discovery server, a device that isn't on the
+  same network can still be reached through a relay if both use the same relays and the dialer
+  knows the address, for example from `localAddress()` in a QR code.
+- `publishAgentRecord` and `resolveAgent` need a discovery server.
+
+### What each setting discloses
+
+All sync traffic is end-to-end encrypted and authenticated with the device keys, so no server
+sees message content, titles, attachments or keys. What servers and peers can see:
+
+| Who | Learns |
+| --- | --- |
+| Relay servers | Each device's id and public IP; which device ids talk to each other, when, and how much (for traffic that goes through the relay) |
+| The discovery server | Each device's id and the IP it publishes from, and anyone's lookups of a device id |
+| Anyone who knows a device id, with `relayOnly` | The device's home relay URL, and from the record's timestamp roughly when it was last online |
+| Anyone who knows a device id, with `directAddresses` | The above, plus the device's LAN and public IP addresses |
+| Devices on the same network, with `mdns` on | The device id and LAN addresses |
+| A peer that connects | The device's public IP and LAN addresses, exchanged to set up a direct path, before the sync handshake decides whether to admit it |
+
+Device ids appear in invites, pairing codes and QR payloads, so treat them as shareable, not
+secret. Use `directAddresses` only for devices with a public address, such as a server, where
+it saves the first round trip through a relay. Agent host records published with
+`publishAgentRecord` go into the same discovery record and are readable the same way.
 
 ## Errors
 

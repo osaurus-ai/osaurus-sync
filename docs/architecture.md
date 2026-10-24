@@ -390,12 +390,18 @@ to a device and authenticating it are the same step.
 | `osaurus/stream/1` | Ephemeral streaming tokens, on unidirectional streams |
 | `osaurus/blobs/1` | Encrypted attachments, with resumable range reads |
 
-- **Discovery.** mDNS finds devices on the LAN (service `osaurus-sync`). DNS discovery, through a
-  pkarr relay, finds known devices elsewhere; it can point at a self-hosted server or be
-  disabled. On iOS, mDNS needs the local network permission.
-- **Relays.** The default is the Osaurus relay fleet; until that's deployed, it's the n0
-  production relays. Apps can set custom relays or turn relays off. Relays only see encrypted
-  QUIC traffic.
+- **Discovery.** mDNS finds devices on the LAN (service `osaurus-sync`). Internet discovery
+  publishes a signed pkarr record per device to a discovery server and resolves peers through
+  its DNS origin. The app supplies the server; with none, devices only find each other on the
+  LAN or through addresses added by hand. On iOS, mDNS needs the local network permission.
+- **Address publishing.** By default a device's discovery record holds only its home relay
+  URL, so looking up a device id doesn't reveal its IP addresses. `DirectAddresses` adds them,
+  for servers with a public address. Direct paths are still set up after connecting, through
+  the relay.
+- **Relays.** The app supplies relay URLs (`iroh-relay` servers). With none, connections are
+  direct only. Relays only see encrypted QUIC traffic, device ids and IP addresses. The
+  Osaurus relay and discovery servers are deployed separately from this repository; the client
+  guide lists what each server learns.
 - **Dialing.** The node dials known devices on startup, on `sync_now`, and every 30 seconds,
   with exponential backoff from 2 seconds to 5 minutes per device.
 - **Diagnostics** report every connection as direct or relayed, with round-trip time, and the

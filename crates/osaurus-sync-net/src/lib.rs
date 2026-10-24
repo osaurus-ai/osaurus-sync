@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver};
+use iroh::address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher, PkarrResolver};
 use iroh::endpoint::{Connection, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
@@ -47,30 +47,38 @@ const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
 /// Events applied per state-lock hold when a received chunk is large.
 const APPLY_SLICE: usize = 16;
 
+/// A discovery server: a pkarr relay that devices publish signed records to, and the DNS
+/// origin those records are served under.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Relays {
-    /// The Osaurus relay fleet. Until it is deployed this is the n0 production relays.
-    Default,
-    Disabled,
-    Custom(Vec<String>),
+pub struct Discovery {
+    pub pkarr_relay: String,
+    pub origin_domain: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Dns {
-    /// Publish and resolve through the default discovery server.
-    Default,
-    /// A self-hosted pkarr relay and DNS origin.
-    Custom {
-        pkarr_relay: String,
-        origin_domain: String,
-    },
-    Disabled,
+/// What a device publishes to the discovery server under its device id. Anyone who knows the
+/// id can read the record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Publish {
+    /// Only the home relay URL. Peers reach the device through the relay first and upgrade to
+    /// a direct path from there.
+    #[default]
+    RelayOnly,
+    /// The relay URL and the device's direct addresses, including LAN and public IPs. Saves a
+    /// round trip through the relay; meant for servers with a public address.
+    DirectAddresses,
 }
 
+/// Networking configuration. Nothing here defaults to third-party infrastructure: without
+/// relays or discovery, devices find each other over mDNS or through addresses exchanged out
+/// of band. Apps pass their own relay and discovery servers; `n0_public` uses number0's public
+/// ones for development.
 #[derive(Clone, Debug)]
 pub struct NetConfig {
-    pub relays: Relays,
-    pub dns: Dns,
+    /// Relay server URLs. Empty means no relays, so devices only connect directly.
+    pub relays: Vec<String>,
+    pub discovery: Option<Discovery>,
+    pub publish: Publish,
+    /// Local-network discovery. Advertises this device's LAN addresses on the local network.
     pub mdns: bool,
     /// 0 picks any port.
     pub bind_port: u16,
@@ -80,15 +88,33 @@ pub struct NetConfig {
 
 impl Default for NetConfig {
     fn default() -> Self {
-        NetConfig { relays: Relays::Default, dns: Dns::Default, mdns: true, bind_port: 0, dial_interval: Duration::from_secs(30) }
+        NetConfig { relays: Vec::new(), discovery: None, publish: Publish::RelayOnly, mdns: true, bind_port: 0, dial_interval: Duration::from_secs(30) }
     }
 }
 
 impl NetConfig {
-    /// Loopback-only: no relays, no DNS, no mDNS. Peers are added with `add_peer_addr`.
+    /// Loopback-only: no relays, no discovery, no mDNS. Peers are added with `add_peer_addr`.
     pub fn local() -> Self {
-        NetConfig { relays: Relays::Disabled, dns: Dns::Disabled, mdns: false, bind_port: 0, dial_interval: Duration::from_secs(5) }
+        NetConfig { mdns: false, dial_interval: Duration::from_secs(5), ..NetConfig::default() }
     }
+
+    /// number0's public relays and discovery server. Fine for development; they're shared,
+    /// rate limited, and not operated for Osaurus.
+    pub fn n0_public() -> Self {
+        NetConfig {
+            relays: n0_relays(),
+            discovery: Some(Discovery {
+                pkarr_relay: iroh::address_lookup::pkarr::N0_DNS_PKARR_RELAY_PROD.to_string(),
+                origin_domain: iroh::address_lookup::dns::N0_DNS_ENDPOINT_ORIGIN_PROD.to_string(),
+            }),
+            ..NetConfig::default()
+        }
+    }
+}
+
+/// The URLs of number0's public relays.
+pub fn n0_relays() -> Vec<String> {
+    iroh::defaults::prod::default_relay_map().urls::<Vec<RelayUrl>>().into_iter().map(|u| u.to_string()).collect()
 }
 
 /// Receives view changes and engine notices. Called from network tasks; keep it cheap.
@@ -449,28 +475,28 @@ impl Inner {
         if net.is_some() {
             return Ok(());
         }
-        let relay_mode = match &self.cfg.relays {
-            Relays::Default => RelayMode::Default,
-            Relays::Disabled => RelayMode::Disabled,
-            Relays::Custom(urls) => {
-                let urls: Vec<RelayUrl> = urls.iter().map(|u| u.parse()).collect::<Result<_, _>>().context("relay url")?;
-                RelayMode::Custom(urls.into_iter().collect::<RelayMap>())
-            }
+        let relay_mode = if self.cfg.relays.is_empty() {
+            RelayMode::Disabled
+        } else {
+            let urls: Vec<RelayUrl> = self.cfg.relays.iter().map(|u| u.parse()).collect::<Result<_, _>>().context("relay url")?;
+            RelayMode::Custom(urls.into_iter().collect::<RelayMap>())
         };
         let mut b = Endpoint::builder(presets::Minimal)
             .secret_key(SecretKey::from_bytes(&self.secret))
             .alpns(vec![ALPN_SYNC.to_vec(), ALPN_STREAM.to_vec(), ALPN_BLOBS.to_vec()])
             .relay_mode(relay_mode)
             .address_lookup(self.memory.clone());
-        match &self.cfg.dns {
-            Dns::Default => {
-                b = b.address_lookup(PkarrPublisher::n0_dns()).address_lookup(PkarrResolver::n0_dns()).address_lookup(DnsAddressLookup::n0_dns());
-            }
-            Dns::Custom { pkarr_relay, origin_domain } => {
-                let url = pkarr_relay.parse().context("pkarr relay url")?;
-                b = b.address_lookup(PkarrPublisher::builder(url)).address_lookup(DnsAddressLookup::builder(origin_domain.clone()));
-            }
-            Dns::Disabled => {}
+        if let Some(d) = &self.cfg.discovery {
+            // `RelayUrl` is a parsed URL; iroh doesn't re-export the `url` crate.
+            let url: RelayUrl = d.pkarr_relay.parse().context("pkarr relay url")?;
+            let filter = match self.cfg.publish {
+                Publish::RelayOnly => AddrFilter::relay_only(),
+                Publish::DirectAddresses => AddrFilter::unfiltered(),
+            };
+            b = b
+                .address_lookup(PkarrPublisher::builder(url.clone().into()).addr_filter(filter))
+                .address_lookup(PkarrResolver::builder(url.into()))
+                .address_lookup(DnsAddressLookup::builder(d.origin_domain.clone()));
         }
         if self.cfg.bind_port != 0 {
             b = b.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], self.cfg.bind_port)))?;
@@ -512,7 +538,7 @@ impl Inner {
         *net = Some(Net { endpoint, router, tasks });
         drop(net);
         self.apply_agent_record();
-        tracing::info!(relays = ?self.cfg.relays, dns = ?self.cfg.dns, mdns = self.cfg.mdns, "networking started");
+        tracing::info!(relays = ?self.cfg.relays, discovery = ?self.cfg.discovery.as_ref().map(|d| &d.origin_domain), publish = ?self.cfg.publish, mdns = self.cfg.mdns, "networking started");
         Ok(())
     }
 

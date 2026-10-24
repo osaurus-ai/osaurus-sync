@@ -35,16 +35,34 @@ pub fn api_version() -> u32 {
     API_VERSION
 }
 
-/// Defaults for `CoreConfig.network`: Osaurus relays, default discovery, mDNS on.
+/// Defaults for `CoreConfig.network`: mDNS on, and no relays or discovery server until the
+/// app sets its own. Devices on the same network still find each other.
 #[uniffi::export]
 pub fn default_network_config() -> NetworkConfig {
-    NetworkConfig { enabled: true, relays: vec![], relays_disabled: false, dns_server: None, dns_origin: None, dns_disabled: false, mdns: true, bind_port: 0 }
+    NetworkConfig {
+        enabled: true,
+        relays: vec![],
+        discovery_server: None,
+        discovery_origin: None,
+        publish: AddressPublishing::RelayOnly,
+        mdns: true,
+        bind_port: 0,
+    }
+}
+
+/// number0's public relays and discovery server, for development. They're shared and rate
+/// limited; production apps configure their own.
+#[uniffi::export]
+pub fn n0_public_network_config() -> NetworkConfig {
+    let n = osaurus_sync_net::NetConfig::n0_public();
+    let d = n.discovery.expect("n0 has a discovery server");
+    NetworkConfig { relays: n.relays, discovery_server: Some(d.pkarr_relay), discovery_origin: Some(d.origin_domain), ..default_network_config() }
 }
 
 /// No relays, discovery or mDNS. For tests and air-gapped setups.
 #[uniffi::export]
 pub fn local_network_config() -> NetworkConfig {
-    NetworkConfig { relays_disabled: true, dns_disabled: true, mdns: false, ..default_network_config() }
+    NetworkConfig { mdns: false, ..default_network_config() }
 }
 
 /// Stores device and user secrets in the OS key store (Keychain, DPAPI). Secrets never touch

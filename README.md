@@ -5,7 +5,8 @@ core runs inside the Mac, iOS and Windows apps, through generated Swift and C# b
 
 - **Peer to peer.** Devices sync directly over QUIC ([Iroh](https://iroh.computer)), finding each
   other on the LAN with mDNS or anywhere through DNS discovery. Relays only forward encrypted
-  traffic when there's no direct path. Osaurus stores nothing.
+  traffic when there's no direct path. The app chooses the relay and discovery servers, and
+  they store nothing.
 - **Local first.** Reads and writes hit local SQLite and return in well under a millisecond. The
   app works the same offline, and changes sync when devices reconnect.
 - **Encrypted and signed.** Every change is a signed event. Content is encrypted with per-scope

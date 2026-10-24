@@ -85,7 +85,8 @@ catch (SyncException e) when (SyncErrorCode.CodeOf(e) == SyncErrorCode.AlreadyOp
 
 ## Networking
 
-Discovery uses mDNS on the LAN, DNS for known devices elsewhere, and relays as a fallback. The
+Discovery uses mDNS on the LAN and, if the app sets a discovery server and relays in
+`NetworkConfig`, DNS for known devices elsewhere with relays as a fallback. The
 first launch may show a Windows Firewall prompt for UDP on private networks. Accept it so that
 devices on the same LAN can connect directly. Otherwise they connect through a relay, which
 works but is slower. `core.Diagnostics()` shows whether each connection is direct or relayed.

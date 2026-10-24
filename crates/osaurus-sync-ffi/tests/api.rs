@@ -295,6 +295,21 @@ fn restored_backup_unlocks_with_the_phrase() {
 }
 
 #[test]
+fn network_configs() {
+    let d = default_network_config();
+    assert!(d.relays.is_empty() && d.discovery_server.is_none() && d.mdns);
+    assert_eq!(d.publish, AddressPublishing::RelayOnly);
+    let n0 = n0_public_network_config();
+    assert!(!n0.relays.is_empty() && n0.discovery_server.is_some() && n0.discovery_origin.is_some());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = config(tmp.path(), "Mac", Platform::MacOs, false);
+    cfg.network.discovery_server = Some("https://dns.example.com/pkarr".into());
+    let err = SyncCore::open(cfg, Box::new(Keys::default())).err().expect("half a discovery config is refused");
+    assert!(matches!(err, SyncError::InvalidInput { .. }));
+}
+
+#[test]
 fn data_management() {
     let tmp = tempfile::tempdir().unwrap();
     let keys = Keys::default();

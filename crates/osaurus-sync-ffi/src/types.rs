@@ -165,18 +165,27 @@ impl From<CoreScopeKind> for ScopeKind {
     }
 }
 
+/// What this device publishes to the discovery server. See the client guide for what each
+/// mode discloses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AddressPublishing {
+    /// Only the home relay URL.
+    RelayOnly,
+    /// The relay URL and direct IP addresses. For servers with a public address.
+    DirectAddresses,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct NetworkConfig {
     /// Bring the endpoint up at open. When false, call `resume` to go online.
     pub enabled: bool,
-    /// Relay URLs. Empty means the default Osaurus relays.
+    /// Relay server URLs. Empty means no relays: devices connect only directly.
     pub relays: Vec<String>,
-    pub relays_disabled: bool,
-    /// A self-hosted discovery server (pkarr relay URL). None means the default.
-    pub dns_server: Option<String>,
-    /// DNS origin domain for the custom discovery server.
-    pub dns_origin: Option<String>,
-    pub dns_disabled: bool,
+    /// The discovery server's pkarr relay URL. None means no internet discovery.
+    pub discovery_server: Option<String>,
+    /// The DNS origin domain the discovery server serves records under.
+    pub discovery_origin: Option<String>,
+    pub publish: AddressPublishing,
     /// Local-network discovery. On iOS this needs the local network permission.
     pub mdns: bool,
     /// 0 picks any port.
@@ -185,23 +194,16 @@ pub struct NetworkConfig {
 
 impl NetworkConfig {
     pub(crate) fn to_net(&self) -> Result<net::NetConfig, SyncError> {
-        let relays = if self.relays_disabled {
-            net::Relays::Disabled
-        } else if self.relays.is_empty() {
-            net::Relays::Default
-        } else {
-            net::Relays::Custom(self.relays.clone())
+        let discovery = match (&self.discovery_server, &self.discovery_origin) {
+            (None, None) => None,
+            (Some(s), Some(o)) => Some(net::Discovery { pkarr_relay: s.clone(), origin_domain: o.clone() }),
+            _ => return Err(SyncError::invalid("discovery_server and discovery_origin must be set together")),
         };
-        let dns = if self.dns_disabled {
-            net::Dns::Disabled
-        } else {
-            match (&self.dns_server, &self.dns_origin) {
-                (None, None) => net::Dns::Default,
-                (Some(s), Some(o)) => net::Dns::Custom { pkarr_relay: s.clone(), origin_domain: o.clone() },
-                _ => return Err(SyncError::invalid("dns_server and dns_origin must be set together")),
-            }
+        let publish = match self.publish {
+            AddressPublishing::RelayOnly => net::Publish::RelayOnly,
+            AddressPublishing::DirectAddresses => net::Publish::DirectAddresses,
         };
-        Ok(net::NetConfig { relays, dns, mdns: self.mdns, bind_port: self.bind_port, ..net::NetConfig::default() })
+        Ok(net::NetConfig { relays: self.relays.clone(), discovery, publish, mdns: self.mdns, bind_port: self.bind_port, ..net::NetConfig::default() })
     }
 }
 
