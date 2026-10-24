@@ -420,8 +420,9 @@ to a device and authenticating it are the same step.
 - **One connection per device.** When two devices dial each other at once, both keep the
   connection the lower device id dialed. Past a 5-second window, a newer connection replaces
   the older one. Frames still arriving on a replaced connection, or on any connection after
-  `suspend`, are dropped rather than handed to the engine: sessions are keyed by device, so
-  a late `Hello` would otherwise open a session the next connection inherits half-finished.
+  `suspend`, are dropped rather than handed to the engine, and a dialed connection replaced
+  before it sends its `Hello` sends none. Sessions are keyed by device, so either would
+  otherwise reset or half-open the session the current connection is using.
 - **Diagnostics** report every connection as direct or relayed, with round-trip time, and the
   sync status of each scope.
 

@@ -688,6 +688,14 @@ impl Inner {
         Some(id)
     }
 
+    /// Whether connection `id` is still the one registered for `peer`. Only meaningful while
+    /// the caller holds the state lock, which `register` holds across a replacement. Anything
+    /// else must not reach the engine: sessions are keyed by peer, so a late frame or Hello
+    /// would land in, or reset, the session of the connection that replaced it.
+    fn is_current(&self, peer: &DeviceKey, id: u64) -> bool {
+        lock(&self.peers).get(peer).is_some_and(|p| p.id == id)
+    }
+
     fn unregister(&self, peer: &DeviceKey, id: u64) {
         let mut st = lock(&self.state);
         let mut peers = lock(&self.peers);
@@ -740,16 +748,23 @@ impl Inner {
         });
         if dialed {
             let me = self.clone();
-            let (notices, changes) = tokio::task::spawn_blocking(move || -> osaurus_sync_core::Result<_> {
+            let opened = tokio::task::spawn_blocking(move || -> osaurus_sync_core::Result<_> {
                 let mut st = lock(&me.state);
+                if !me.is_current(&peer, id) {
+                    return Ok(None);
+                }
                 let State { replica, engine } = &mut *st;
                 let outs = match &pairing {
                     Some(inv) => engine.connect_pairing(replica, inv)?,
                     None => engine.connect(replica, peer)?,
                 };
-                Ok((me.route(outs), replica.take_changes()))
+                Ok(Some((me.route(outs), replica.take_changes())))
             })
             .await??;
+            let Some((notices, changes)) = opened else {
+                writer.abort();
+                return Ok(());
+            };
             self.deliver(notices, changes);
         }
         self.listener.changes(vec![Change::DevicesChanged]);
@@ -760,8 +775,7 @@ impl Inner {
     }
 
     /// Hands frames from connection `id` to the engine until the peer closes it or another
-    /// connection replaces it. A replaced or suspended connection's late frames are dropped:
-    /// the engine keys sessions by peer, so they would land in the next connection's session.
+    /// connection replaces it. A replaced or suspended connection's late frames are dropped.
     async fn read_loop(self: Arc<Self>, peer: DeviceKey, id: u64, recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
         while let Some(bytes) = frame::read(recv).await? {
             self.bytes_received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -773,7 +787,7 @@ impl Inner {
                     let n = if let Msg::Events { events, .. } = &msg { events.len() } else { 0 };
                     let res = {
                         let mut st = lock(&me.state);
-                        if !lock(&me.peers).get(&peer).is_some_and(|p| p.id == id) {
+                        if !me.is_current(&peer, id) {
                             return None;
                         }
                         let State { replica, engine } = &mut *st;
