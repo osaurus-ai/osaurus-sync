@@ -1,7 +1,8 @@
 use osaurus_sync_core::identity::Platform;
-use osaurus_sync_core::ids::Role;
+use osaurus_sync_core::ids::{Role, ScopeId};
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
-use osaurus_sync_core::sync::Notice;
+use osaurus_sync_core::sync::proto::ScopeOffer;
+use osaurus_sync_core::sync::{Msg, Notice, Out};
 use osaurus_sync_core::types::{DeliveryStatus, HistoryMode, ImportedMessage, NewMessage};
 use osaurus_sync_sim::{Sim, snapshot};
 
@@ -185,4 +186,97 @@ fn revoked_device_is_refused() {
     assert!(!sim.is_linked(lost, mac));
     assert!(contents(&mut sim, lost, scope).is_empty());
     assert!(sim.r(mac).devices().unwrap().iter().any(|d| d.device == dev && d.revoked));
+}
+
+/// Delivers `msg` from `from` to `to` as if `from` had sent it, session or not.
+fn inject(sim: &mut Sim, from: usize, to: usize, msg: Msg) {
+    let dev = sim.nodes[to].device();
+    sim.link(from, to);
+    sim.process(from, vec![Out::Send(dev, msg)]);
+}
+
+fn all_events(sim: &mut Sim, i: usize, scope: ScopeId) -> Vec<Vec<u8>> {
+    let hashes = sim.r(i).all_hashes(scope).unwrap();
+    sim.r(i).events_by_hashes(&hashes).unwrap()
+}
+
+fn offer(sim: &mut Sim, i: usize, scope: ScopeId) -> Msg {
+    let (control_heads, heads) = sim.r(i).scope_heads(scope).unwrap();
+    Msg::Offer { scopes: vec![ScopeOffer { scope, control_heads, heads }] }
+}
+
+#[test]
+fn strangers_are_turned_away() {
+    let mut sim = Sim::new(9);
+    let alice = sim.add_node("Alice", Platform::MacOs);
+    let mallory = sim.add_node("Mallory", Platform::Windows);
+    let scope = sim.r(alice).create_scope(ScopeKind::Conversation, "Private").unwrap();
+    sim.r(alice).send_message(scope, text("private")).unwrap();
+    let spam = sim.r(mallory).create_scope(ScopeKind::Conversation, "Spam").unwrap();
+    sim.r(mallory).send_message(spam, text("buy now")).unwrap();
+
+    sim.connect(mallory, alice);
+    sim.run(10_000);
+    assert!(!sim.is_linked(mallory, alice));
+    assert!(sim.nodes[alice].notices.iter().any(|n| matches!(n, Notice::PeerRejected(_))));
+    assert!(!sim.r(mallory).scope_ids().unwrap().contains(&scope));
+
+    // Unsolicited pushes and offers outside a session are dropped without storing anything.
+    let events = all_events(&mut sim, mallory, spam);
+    inject(&mut sim, mallory, alice, Msg::Events { scope: spam, tag: 0, events, last: true });
+    let o = offer(&mut sim, mallory, spam);
+    inject(&mut sim, mallory, alice, o);
+    sim.run(10_000);
+    assert!(!sim.r(alice).scope_ids().unwrap().contains(&spam));
+    assert_eq!(sim.r(alice).conversations().unwrap().len(), 1);
+    assert!(sim.r(alice).devices().unwrap().iter().all(|d| d.user == sim.nodes[alice].replica.as_ref().unwrap().user_key()));
+}
+
+#[test]
+fn open_invite_lets_a_stranger_redeem_but_not_sync() {
+    let mut sim = Sim::new(10);
+    let alice = sim.add_node("Alice", Platform::MacOs);
+    let mallory = sim.add_node("Mallory", Platform::Windows);
+    let scope = sim.r(alice).create_scope(ScopeKind::Workspace, "Team").unwrap();
+    sim.r(alice).send_message(scope, text("team only")).unwrap();
+    sim.r(alice).create_invite(scope, Role::Member, 3_600_000).unwrap();
+    let spam = sim.r(mallory).create_scope(ScopeKind::Conversation, "Spam").unwrap();
+    sim.r(mallory).send_message(spam, text("buy now")).unwrap();
+
+    // Alice keeps the session while the invite is open but offers and accepts nothing. (Mallory,
+    // holding no invite from Alice, hangs up on its side.)
+    sim.connect(mallory, alice);
+    sim.run(10_000);
+    assert!(!sim.nodes[alice].notices.iter().any(|n| matches!(n, Notice::PeerRejected(_))));
+    assert!(!sim.r(mallory).scope_ids().unwrap().contains(&scope));
+    let events = all_events(&mut sim, mallory, spam);
+    inject(&mut sim, mallory, alice, Msg::Events { scope: spam, tag: 0, events, last: true });
+    let o = offer(&mut sim, mallory, spam);
+    inject(&mut sim, mallory, alice, o);
+    sim.run(10_000);
+    assert!(!sim.r(alice).scope_ids().unwrap().contains(&spam));
+    assert_eq!(sim.r(alice).conversations().unwrap().len(), 1);
+}
+
+#[test]
+fn member_cannot_plant_a_foreign_scope() {
+    let mut sim = Sim::new(11);
+    let alice = sim.add_node("Alice", Platform::MacOs);
+    let bob = sim.add_node("Bob", Platform::Windows);
+    let shared = sim.r(alice).create_scope(ScopeKind::Workspace, "Team").unwrap();
+    sim.invite(alice, bob, shared, Role::Member);
+    sim.run(10_000);
+    assert_eq!(sim.r(bob).conversations().unwrap().len(), 1);
+
+    // Bob offers and pushes a scope Alice was never added to.
+    let other = sim.r(bob).create_scope(ScopeKind::Conversation, "Not for Alice").unwrap();
+    sim.r(bob).send_message(other, text("planted")).unwrap();
+    let events = all_events(&mut sim, bob, other);
+    inject(&mut sim, bob, alice, Msg::Events { scope: other, tag: 0, events, last: true });
+    let o = offer(&mut sim, bob, other);
+    inject(&mut sim, bob, alice, o);
+    sim.run(10_000);
+    assert!(!sim.r(alice).scope_ids().unwrap().contains(&other));
+    let listed: Vec<_> = sim.r(alice).conversations().unwrap().into_iter().map(|c| c.scope).collect();
+    assert_eq!(listed, vec![shared]);
 }

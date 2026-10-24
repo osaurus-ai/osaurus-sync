@@ -159,6 +159,7 @@ fn fixtures_still_decode_and_apply() {
         files.push((name.to_string(), bytes));
     }
     // Reverse order: everything must still apply once its parents arrive.
+    r.join_scope(scope).unwrap();
     for (name, bytes) in files.iter().rev() {
         let out = r.ingest(bytes).unwrap();
         assert!(!matches!(out, IngestOutcome::Invalid(_)), "{name}: {out:?}");

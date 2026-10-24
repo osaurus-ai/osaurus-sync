@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use osaurus_sync_core::env::SystemEnv;
 use osaurus_sync_core::identity::Platform;
-use osaurus_sync_core::ids::ScopeId;
+use osaurus_sync_core::ids::{Role, ScopeId};
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
-use osaurus_sync_core::replica::MemorySecretStore;
+use osaurus_sync_core::replica::{InviteToken, MemorySecretStore};
 use osaurus_sync_core::sync::Notice;
 use osaurus_sync_core::types::{Attachment, Change, NewMessage, StreamState};
 use osaurus_sync_core::{Replica, ReplicaConfig};
@@ -109,4 +109,27 @@ async fn pair_sync_stream_blob_suspend() {
 
     mac.shutdown().await.unwrap();
     pc.shutdown().await.unwrap();
+}
+
+/// A device that is neither Alice's nor a member's is refused after Hello and learns nothing,
+/// even when it presents a forged invite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stranger_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_rec) = node(dir.path(), "alice", Platform::MacOs).await;
+    let (mallory, _) = node(dir.path(), "mallory", Platform::Windows).await;
+    let scope = alice.write(|r| r.create_scope(ScopeKind::Conversation, "Private")).unwrap();
+    alice.write(|r| r.send_message(scope, NewMessage::text(MessageRole::User, "secret"))).unwrap();
+
+    mallory.add_peer_addr(alice.addr().unwrap());
+    let forged = InviteToken { scope, token: [7; 32], inviter: alice.device_key(), role: Role::Member };
+    mallory.redeem_invite(&forged.encode()).unwrap();
+    until("rejection", || alice_rec.notices.lock().unwrap().iter().any(|n| matches!(n, Notice::PeerRejected(d) if *d == mallory.device_key()))).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(contents(&mallory, scope).is_empty());
+    assert!(mallory.read(|r| r.conversations().unwrap()).is_empty());
+    assert!(alice.read(|r| r.devices().unwrap()).iter().all(|d| d.device != mallory.device_key()));
+
+    alice.shutdown().await.unwrap();
+    mallory.shutdown().await.unwrap();
 }

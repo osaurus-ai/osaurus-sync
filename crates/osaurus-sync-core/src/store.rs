@@ -83,7 +83,9 @@ CREATE TABLE IF NOT EXISTS scopes (
     storage_role INTEGER NOT NULL DEFAULT 0,
     synced_from_hlc INTEGER,
     last_sync_ms INTEGER,
-    joined_ms INTEGER NOT NULL
+    joined_ms INTEGER NOT NULL,
+    -- Joined from a peer's offer and kept only if its control layer lists this user.
+    tentative INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS outbox (
@@ -248,6 +250,9 @@ pub fn open(path: Option<&std::path::Path>) -> Result<Connection> {
 /// Creates tables. Returns true when view tables were (re)created and must be rebuilt.
 pub fn migrate(conn: &Connection) -> Result<bool> {
     conn.execute_batch(BASE_SCHEMA)?;
+    if !has_column(conn, "scopes", "tentative")? {
+        conn.execute_batch("ALTER TABLE scopes ADD COLUMN tentative INTEGER NOT NULL DEFAULT 0;")?;
+    }
     let view_version: Option<i64> = meta_i64(conn, "view_version")?;
     let rebuild = view_version != Some(VIEW_VERSION);
     if rebuild {
@@ -260,6 +265,12 @@ pub fn migrate(conn: &Connection) -> Result<bool> {
     set_meta(conn, "view_version", &VIEW_VERSION.to_le_bytes())?;
     let had_events: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM events)", [], |r| r.get(0))?;
     Ok(rebuild && had_events)
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names: Vec<String> = stmt.query_map([], |r| r.get(1))?.collect::<std::result::Result<_, _>>()?;
+    Ok(names.iter().any(|n| n == column))
 }
 
 pub fn meta(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>> {

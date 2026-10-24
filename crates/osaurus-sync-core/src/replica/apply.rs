@@ -476,8 +476,10 @@ impl Replica {
             "UPDATE conversations_view SET title = ?, pinned = ?, sort_order = ?, archived = ?, my_role = ?, members = ? WHERE scope = ?",
             params![meta.title, meta.pinned as i64, meta.sort_order, meta.archived as i64, my_role.map(|r| r as i64), payload::encode(&members), &scope.0[..]],
         )?;
-        if let Some(c) = self.conversation(scope)? {
-            self.emit(Change::ConversationChanged(c));
+        match self.conversation(scope)? {
+            Some(c) if c.my_role.is_some() => self.emit(Change::ConversationChanged(c)),
+            Some(_) => self.emit(Change::ConversationRemoved(scope)),
+            None => {}
         }
         Ok(())
     }

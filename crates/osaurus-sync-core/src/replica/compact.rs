@@ -147,6 +147,7 @@ impl Replica {
             let mut past = Replica::open(cfg, self.env.clone(), secrets)?;
             // Keys granted to this device after `at_hlc` still decrypt what was written before it.
             past.seeded_keys.insert(scope, self.scope_keys(scope)?.clone());
+            past.join_scope(scope)?;
             past.tx(|p| {
                 for b in &rows {
                     p.ingest(b)?;

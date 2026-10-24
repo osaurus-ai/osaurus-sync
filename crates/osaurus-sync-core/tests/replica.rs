@@ -33,6 +33,7 @@ fn copy_scope(a: &Replica, b: &mut Replica, scope: ScopeId) {
     let hashes = a.all_hashes(scope).unwrap();
     let mut events = a.events_by_hashes(&hashes).unwrap();
     events.reverse();
+    b.join_scope(scope).unwrap();
     for e in events {
         if let IngestOutcome::Invalid(m) = b.ingest(&e).unwrap() {
             panic!("invalid: {m}");

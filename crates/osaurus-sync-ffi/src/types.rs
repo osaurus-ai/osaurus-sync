@@ -632,6 +632,10 @@ pub enum CoreEvent {
     PeerRevoked {
         device: String,
     },
+    /// A device that isn't this user's or a member's tried to sync and was turned away.
+    PeerRejected {
+        device: String,
+    },
     IncompatiblePeer {
         device: String,
         version: u32,
@@ -645,6 +649,7 @@ impl From<Notice> for CoreEvent {
             Notice::PairingFailed(reason) => CoreEvent::PairingFailed { reason },
             Notice::InviteResult { scope, error } => CoreEvent::InviteResult { scope: scope.to_hex(), error },
             Notice::PeerRevoked(d) => CoreEvent::PeerRevoked { device: d.to_hex() },
+            Notice::PeerRejected(d) => CoreEvent::PeerRejected { device: d.to_hex() },
             Notice::Incompatible { device, version } => CoreEvent::IncompatiblePeer { device: device.to_hex(), version },
         }
     }

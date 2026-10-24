@@ -260,8 +260,19 @@ sequenceDiagram
 
 1. **Hello.** Both sides send their protocol version, device certificate and whether they have
    the storage role. A peer with a different major version gets `IncompatiblePeer`.
+   **Admission** follows. A peer is trusted if its certificate belongs to this user, or to a
+   user who is a member of (or certified in) a scope held here, and its device isn't revoked.
+   The inviter named in a queued invite is also trusted by the redeemer. An untrusted peer is
+   sent `Bye` and reported as `PeerRejected`. The one exception: while this device has an
+   unexpired invite open, an untrusted session stays up so its peer can send `InviteRedeem`.
+   Nothing else from an untrusted peer is processed: offers, reconciliation, pushes, acks and
+   `Seen` are all dropped.
 2. **Offer.** Each side lists the scopes it believes the other may read, with its heads for each
-   layer. A side refuses a scope with `Denied` if the other isn't a member.
+   layer. A side refuses a scope with `Denied` if the other isn't a member. A scope that is
+   offered but not held here is joined *tentatively*. Once its control layer has synced, the
+   scope is kept only if it lists this user (or this device). Otherwise it is purged, along with
+   everything stored for it. Events for a scope this device never joined are refused.
+   `conversations()` lists only scopes where this user has a role.
 3. **Reconcile.** Each side acts as initiator for its own pulls. Reconciliation is range-based
    over `(hlc, id)` keys (`recon.rs`). A range carries a fingerprint, the full id list, or
    nothing if it's already in sync. The responder answers with smaller ranges until every range

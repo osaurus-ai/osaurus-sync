@@ -52,6 +52,8 @@ pub enum Notice {
     },
     /// A peer was refused because its device is revoked.
     PeerRevoked(DeviceKey),
+    /// A peer was refused because it is neither this user's device nor a member's device.
+    PeerRejected(DeviceKey),
     /// A peer runs an incompatible protocol version.
     Incompatible {
         device: DeviceKey,
@@ -160,6 +162,9 @@ struct Session {
     cert: Option<DeviceCert>,
     storage_role: bool,
     established: bool,
+    /// The peer may sync: one of this user's devices or a member's device. Untrusted sessions
+    /// exist only to pair or redeem an invite; nothing they send is stored.
+    trusted: bool,
     hello_sent: bool,
     /// Pairing code while this device waits for a grant.
     joining: Option<String>,
@@ -183,6 +188,7 @@ impl Session {
             cert: None,
             storage_role: false,
             established: false,
+            trusted: false,
             hello_sent: false,
             joining: None,
             queued_invites: vec![],
@@ -258,7 +264,7 @@ impl Engine {
     }
 
     pub fn is_connected(&self, device: &DeviceKey) -> bool {
-        self.sessions.get(device).is_some_and(|s| s.established)
+        self.sessions.get(device).is_some_and(|s| s.established && s.trusted)
     }
 
     pub fn backfill_paused(&self) -> bool {
@@ -313,8 +319,9 @@ impl Engine {
         let peer = token.inviter;
         let s = self.sessions.entry(peer).or_insert_with(Session::new);
         if s.established {
+            s.trusted = true;
             let msg = Msg::InviteRedeem { scope: token.scope, token: token.token, cert: r.cert().clone() };
-            r.join_scope(token.scope)?;
+            r.join_scope_tentatively(token.scope)?;
             return Ok(vec![Out::Send(peer, msg)]);
         }
         s.queued_invites.push(token);
@@ -363,6 +370,10 @@ impl Engine {
 
     pub fn handle(&mut self, r: &mut Replica, peer: DeviceKey, msg: Msg) -> Result<Vec<Out>> {
         let mut out = Vec::new();
+        let sync_msg = matches!(msg, Msg::Offer { .. } | Msg::Recon { .. } | Msg::Want { .. } | Msg::Events { .. } | Msg::Ack { .. } | Msg::Seen { .. });
+        if sync_msg && !self.sessions.get(&peer).is_some_and(|s| s.established && s.trusted) {
+            return Ok(out);
+        }
         self.sessions.entry(peer).or_insert_with(Session::new);
         match msg {
             Msg::Hello { version, cert, storage_role } => self.on_hello(r, peer, version, cert, storage_role, &mut out)?,
@@ -382,6 +393,9 @@ impl Engine {
                     s.queue.retain(|j| j.scope != scope);
                     s.running.retain(|_, j| j.job.scope != scope);
                 }
+                if r.is_tentative(scope)? && !self.sessions.values().any(|s| s.running.values().any(|j| j.job.scope == scope)) {
+                    r.settle_scope(scope)?;
+                }
             }
             Msg::PairRequest { cert, proof } => self.on_pair_request(r, peer, cert, proof, &mut out)?,
             Msg::PairingGrant { sealed_user, cert } => self.on_pairing_grant(r, peer, sealed_user, cert, &mut out)?,
@@ -391,7 +405,9 @@ impl Engine {
                 self.sessions.remove(&peer);
             }
             Msg::InviteRedeem { scope, token, cert } => {
-                let res = if cert.device != peer || !cert.verify() {
+                let res = if !self.sessions[&peer].established {
+                    Err(Error::InvalidInput("hello required".into()))
+                } else if cert.device != peer || !cert.verify() {
                     Err(Error::InvalidInput("bad certificate".into()))
                 } else {
                     r.admit_invitee(scope, token, &cert)
@@ -399,10 +415,18 @@ impl Engine {
                 let error = res.err().map(|e| e.to_string());
                 out.push(Out::Send(peer, Msg::InviteResult { scope, error: error.clone() }));
                 if error.is_none() {
+                    self.sessions.get_mut(&peer).unwrap().trusted = true;
+                    r.upsert_known_device(&cert)?;
+                    r.record_contact(&peer, None)?;
                     self.offer_new(r, peer, &mut out)?;
                 }
             }
-            Msg::InviteResult { scope, error } => out.push(Out::Notify(Notice::InviteResult { scope, error })),
+            Msg::InviteResult { scope, error } => {
+                if error.is_some() {
+                    r.settle_scope(scope)?;
+                }
+                out.push(Out::Notify(Notice::InviteResult { scope, error }))
+            }
             Msg::Bye { reason } => {
                 self.disconnect(&peer);
                 out.push(Out::Close(peer, reason));
@@ -434,23 +458,42 @@ impl Engine {
             self.sessions.remove(&peer);
             return Ok(());
         }
+        // Admission: this user's devices and members' devices sync. The inviter of a queued
+        // invite is trusted by the redeemer. Strangers stay only while an invite is open, so
+        // they can redeem it; otherwise they are turned away.
+        let (vouched, was_trusted) = {
+            let s = &self.sessions[&peer];
+            (!s.queued_invites.is_empty(), s.trusted)
+        };
+        let trusted = was_trusted || vouched || r.is_trusted_peer(&cert)?;
+        if !trusted && !r.has_open_invites()? {
+            out.push(Out::Notify(Notice::PeerRejected(peer)));
+            out.push(Out::Send(peer, Msg::Bye { reason: "not a member".into() }));
+            out.push(Out::Close(peer, "not a member".into()));
+            self.sessions.remove(&peer);
+            return Ok(());
+        }
         let send_hello = {
             let s = self.sessions.get_mut(&peer).expect("session exists");
             s.cert = Some(cert.clone());
             s.storage_role = storage_role;
             s.established = true;
+            s.trusted = trusted;
             s.offered.clear();
             !std::mem::replace(&mut s.hello_sent, true)
         };
-        r.upsert_known_device(&cert)?;
-        r.admit_device(&cert)?;
-        r.record_contact(&peer, None)?;
         if send_hello {
             out.push(Out::Send(peer, self.hello(r)));
         }
+        if !trusted {
+            return Ok(());
+        }
+        r.upsert_known_device(&cert)?;
+        r.admit_device(&cert)?;
+        r.record_contact(&peer, None)?;
         let invites = std::mem::take(&mut self.sessions.get_mut(&peer).unwrap().queued_invites);
         for t in invites {
-            r.join_scope(t.scope)?;
+            r.join_scope_tentatively(t.scope)?;
             out.push(Out::Send(peer, Msg::InviteRedeem { scope: t.scope, token: t.token, cert: r.cert().clone() }));
         }
         self.offer_new(r, peer, out)
@@ -485,12 +528,9 @@ impl Engine {
     }
 
     fn on_offer(&mut self, r: &mut Replica, peer: DeviceKey, scopes: Vec<ScopeOffer>) -> Result<()> {
-        if !self.sessions[&peer].established {
-            return Ok(());
-        }
         for o in scopes {
-            if !r.scope_ids()?.contains(&o.scope) {
-                r.join_scope(o.scope)?;
+            if !r.scope_exists(o.scope)? {
+                r.join_scope_tentatively(o.scope)?;
             }
             r.record_contact(&peer, Some(o.scope))?;
             // Equal heads do not imply equal sets: pushes can leave gaps below the heads. Every
@@ -672,9 +712,21 @@ impl Engine {
             JobKind::Phase(i) => {
                 if job.layer == Layer::Content {
                     r.mark_synced_from(job.scope, job.lo.0)?;
-                } else {
+                } else if r.settle_scope(job.scope)? {
                     r.mark_synced(job.scope)?;
+                } else {
+                    // Offered a scope this user isn't in: it has been purged.
+                    for s in self.sessions.values_mut() {
+                        s.plans.remove(&job.scope);
+                        s.planned_from.remove(&job.scope);
+                        s.queue.retain(|j| j.scope != job.scope);
+                        s.parked.retain(|j| j.scope != job.scope);
+                        s.running.retain(|_, j| j.job.scope != job.scope);
+                    }
+                    self.on_demand.retain(|j| j.scope != job.scope);
+                    return Ok(());
                 }
+                let s = self.sessions.get_mut(&peer).unwrap();
                 if let Some(w) = s.plans.get(&job.scope).and_then(|p| p.get(i + 1)).copied() {
                     let next = Job { scope: job.scope, layer: w.layer, lo: w.lo, hi: w.hi, kind: JobKind::Phase(i + 1) };
                     if w.backfill && self.backfill_paused {
@@ -790,7 +842,7 @@ impl Engine {
 
         let fresh = r.take_new_events();
         let mut touched: Vec<ScopeId> = Vec::new();
-        let peers: Vec<DeviceKey> = self.sessions.iter().filter(|(_, s)| s.established).map(|(d, _)| *d).collect();
+        let peers: Vec<DeviceKey> = self.sessions.iter().filter(|(_, s)| s.established && s.trusted).map(|(d, _)| *d).collect();
         let mut batches: BTreeMap<(DeviceKey, ScopeId), Vec<Vec<u8>>> = BTreeMap::new();
         let mut auth_cache: HashMap<(DeviceKey, ScopeId), bool> = HashMap::new();
         for (scope, hash, bytes) in fresh {

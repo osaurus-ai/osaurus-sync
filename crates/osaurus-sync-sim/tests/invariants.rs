@@ -278,6 +278,8 @@ fn check(run: &mut Run, seed: u64) -> u32 {
             let j = sim.rand(i + 1);
             random.swap(i, j);
         }
+        causal.join_scope(scope).unwrap();
+        shuffled.join_scope(scope).unwrap();
         for e in &ordered {
             assert!(!matches!(causal.ingest(e).unwrap(), IngestOutcome::Invalid(_)));
         }

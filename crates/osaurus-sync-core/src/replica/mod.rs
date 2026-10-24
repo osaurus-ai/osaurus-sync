@@ -376,17 +376,116 @@ impl Replica {
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM scopes WHERE scope = ?)", [&scope.0[..]], |r| r.get(0))?)
     }
 
-    /// Subscribes to a scope so its events are accepted and synced.
+    /// Subscribes to a scope so its events are accepted and synced. Events for scopes that were
+    /// never joined are refused.
     pub fn join_scope(&mut self, scope: ScopeId) -> Result<()> {
+        self.insert_scope(scope, false)?;
+        self.db.execute("UPDATE scopes SET tentative = 0 WHERE scope = ?", [&scope.0[..]])?;
+        Ok(())
+    }
+
+    /// Joins a scope a peer offered, pending proof that this user is a member. `settle_scope`
+    /// keeps or drops it once the control layer has synced.
+    pub fn join_scope_tentatively(&mut self, scope: ScopeId) -> Result<()> {
+        self.insert_scope(scope, true)
+    }
+
+    fn insert_scope(&mut self, scope: ScopeId, tentative: bool) -> Result<()> {
         let mode = self.cfg.default_history();
         let (m, days) = match mode {
             HistoryMode::Full => (0, 0),
             HistoryMode::Recent { days } => (1, days as i64),
         };
         self.db.execute(
-            "INSERT OR IGNORE INTO scopes(scope, history_mode, window_days, storage_role, joined_ms) VALUES (?, ?, ?, ?, ?)",
-            params![&scope.0[..], m, days, self.cfg.storage_role as i64, self.env.now_ms() as i64],
+            "INSERT OR IGNORE INTO scopes(scope, history_mode, window_days, storage_role, joined_ms, tentative) VALUES (?, ?, ?, ?, ?, ?)",
+            params![&scope.0[..], m, days, self.cfg.storage_role as i64, self.env.now_ms() as i64, tentative as i64],
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn is_tentative(&self, scope: ScopeId) -> Result<bool> {
+        let t: Option<bool> = self.db.query_row("SELECT tentative FROM scopes WHERE scope = ?", [&scope.0[..]], |r| r.get(0)).optional()?;
+        Ok(t.unwrap_or(false))
+    }
+
+    /// Whether this user (or this device) appears in the scope's membership.
+    pub fn is_member(&mut self, scope: ScopeId) -> Result<bool> {
+        let me = self.me();
+        let device = self.device_key();
+        let st = self.auth_mut(scope)?.full_state();
+        Ok(st.members.contains_key(&me) || st.certs.contains_key(&device))
+    }
+
+    /// Keeps a tentatively joined scope if this user is a member, and purges it otherwise.
+    /// Returns whether the scope is kept.
+    pub fn settle_scope(&mut self, scope: ScopeId) -> Result<bool> {
+        if !self.is_tentative(scope)? {
+            return self.scope_exists(scope);
+        }
+        if self.is_member(scope)? {
+            self.db.execute("UPDATE scopes SET tentative = 0 WHERE scope = ?", [&scope.0[..]])?;
+            return Ok(true);
+        }
+        // Control events still waiting for parents may yet list this user.
+        let held: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM held WHERE scope = ?)", [&scope.0[..]], |r| r.get(0))?;
+        if held {
+            return Ok(true);
+        }
+        self.purge_scope(scope)?;
+        Ok(false)
+    }
+
+    /// Deletes everything stored for a scope on this device. Peers are unaffected.
+    pub fn purge_scope(&mut self, scope: ScopeId) -> Result<()> {
+        let had_view: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM conversations_view WHERE scope = ?)", [&scope.0[..]], |r| r.get(0))?;
+        let blobs: Vec<Vec<u8>> = {
+            let mut stmt = self
+                .db
+                .prepare_cached("SELECT DISTINCT hash FROM blob_refs WHERE scope = ?1 AND hash NOT IN (SELECT hash FROM blob_refs WHERE scope != ?1)")?;
+            stmt.query_map([&scope.0[..]], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+        };
+        self.tx(|r| {
+            let s = &scope.0[..];
+            r.db.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT rowid FROM messages_view WHERE scope = ?)", [s])?;
+            r.db.execute("DELETE FROM event_parents WHERE child IN (SELECT hash FROM events WHERE scope = ?)", [s])?;
+            for table in [
+                "events",
+                "heads",
+                "held",
+                "outbox",
+                "peers",
+                "storage_peers",
+                "blob_refs",
+                "loro_snapshots",
+                "read_state",
+                "invites_issued",
+                "messages_view",
+                "edits",
+                "tombstones",
+                "reactions",
+                "reaction_removed",
+                "conversations_view",
+                "pending_decrypt",
+                "scopes",
+            ] {
+                r.db.execute(&format!("DELETE FROM {table} WHERE scope = ?"), [s])?;
+            }
+            for h in &blobs {
+                r.db.execute("DELETE FROM blobs WHERE hash = ?", [h])?;
+            }
+            Ok(())
+        })?;
+        for h in &blobs {
+            if let Ok(h) = <[u8; 32]>::try_from(h.as_slice()) {
+                self.blobs.delete(&h);
+            }
+        }
+        self.auth.remove(&scope);
+        self.keys.remove(&scope);
+        self.loro.remove(&scope);
+        if had_view {
+            self.changes.push(Change::ConversationRemoved(scope));
+        }
         Ok(())
     }
 
@@ -496,9 +595,8 @@ impl Replica {
             return Ok(Accepted::Duplicate);
         }
         if !self.scope_exists(e.scope)? {
-            self.join_scope(e.scope)?;
+            return Err(Error::NotFound("scope not joined".into()));
         }
-        self.clock.observe(e.hlc, self.env.now_ms());
         let scope = e.scope;
         let missing = self.auth_mut(scope)?.missing_parents(&e.control_parents);
         if !missing.is_empty() {
@@ -562,6 +660,10 @@ impl Replica {
             }
             v
         };
+        // Rejected events must not move this device's clock.
+        if verdict.is_valid() {
+            self.clock.observe(e.hlc, self.env.now_ms());
+        }
         self.pending_events.push((scope, hash, e.encode()));
         Ok(Accepted::Stored(verdict))
     }

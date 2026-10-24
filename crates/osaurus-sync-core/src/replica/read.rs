@@ -142,7 +142,8 @@ impl Replica {
     }
 
     pub fn conversations(&self) -> Result<Vec<ConversationSummary>> {
-        self.conversations_where("?1 IS NULL OR 1", params![Option::<Vec<u8>>::None, self.me().to_hex()])
+        // Scopes this user isn't a member of (removed, or offered but not joined) stay out of the list.
+        self.conversations_where("c.my_role IS NOT NULL AND ?1 IS NULL", params![Option::<Vec<u8>>::None, self.me().to_hex()])
     }
 
     fn conversations_where(&self, filter: &str, p: impl rusqlite::Params) -> Result<Vec<ConversationSummary>> {

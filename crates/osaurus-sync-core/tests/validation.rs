@@ -24,6 +24,7 @@ fn text(s: &str) -> NewMessage {
 fn copy(a: &Replica, b: &mut Replica, scope: ScopeId) {
     let mut events = a.events_by_hashes(&a.all_hashes(scope).unwrap()).unwrap();
     events.reverse();
+    b.join_scope(scope).unwrap();
     for e in events {
         if let IngestOutcome::Invalid(m) = b.ingest(&e).unwrap() {
             panic!("invalid: {m}");
@@ -153,6 +154,8 @@ fn held_until_parents_arrive_and_garbage_rejected() {
     // Content first: it waits for the control events it depends on.
     let content = a.events_by_ids(scope, &ids(false)).unwrap();
     let control = a.events_by_ids(scope, &ids(true)).unwrap();
+    assert!(matches!(b.ingest(&content[0]).unwrap(), IngestOutcome::Invalid(_)), "events for unjoined scopes are refused");
+    b.join_scope(scope).unwrap();
     for e in &content {
         assert!(matches!(b.ingest(e).unwrap(), IngestOutcome::Held { .. }));
     }
@@ -172,6 +175,28 @@ fn held_until_parents_arrive_and_garbage_rejected() {
 }
 
 #[test]
+fn tentative_scopes_are_kept_only_for_members() {
+    let env = Arc::new(TestEnv::new(17, 1_700_000_000_000));
+    let ((alice, _a), (mut bob, _b), scope) = alice_and_bob(&env);
+    let (mut carol, _c) = open("Carol", &env);
+    let events = alice.events_by_hashes(&alice.all_hashes(scope).unwrap()).unwrap();
+    for r in [&mut bob, &mut carol] {
+        r.purge_scope(scope).unwrap();
+        r.join_scope_tentatively(scope).unwrap();
+        for e in &events {
+            r.ingest(e).unwrap();
+        }
+    }
+    assert!(carol.conversations().unwrap().is_empty(), "tentative scopes are not listed");
+    assert!(!carol.settle_scope(scope).unwrap());
+    assert!(!carol.scope_ids().unwrap().contains(&scope));
+    assert!(carol.all_hashes(scope).unwrap().is_empty());
+    assert!(bob.settle_scope(scope).unwrap());
+    assert_eq!(contents(&bob, scope), vec!["welcome"]);
+    assert_eq!(bob.conversations().unwrap().len(), 1);
+}
+
+#[test]
 fn delivery_order_does_not_matter() {
     let env = Arc::new(TestEnv::new(16, 1_700_000_000_000));
     let ((mut alice, _a), (mut bob, _b), scope) = alice_and_bob(&env);
@@ -184,6 +209,8 @@ fn delivery_order_does_not_matter() {
     copy(&bob, &mut alice, scope);
     let (mut c1, _c1) = open("observer1", &env);
     let (mut c2, _c2) = open("observer2", &env);
+    c1.join_scope(scope).unwrap();
+    c2.join_scope(scope).unwrap();
     let mut events = alice.events_by_hashes(&alice.all_hashes(scope).unwrap()).unwrap();
     for e in &events {
         c1.ingest(e).unwrap();

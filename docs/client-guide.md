@@ -229,6 +229,7 @@ concurrent removal). Reload the scope from `messages`.
 | `identityChanged` | Pairing or recovery replaced the user identity; reload everything |
 | `selfRevoked` | This device was revoked; sync has stopped |
 | `peerRevoked(device)` | Another device was revoked |
+| `peerRejected(device)` | A device that is neither yours nor a member's tried to sync and was turned away |
 | `inviteResult(scope, error)` | The result of `redeemInvite` |
 | `incompatiblePeer(device, version)` | A peer runs an incompatible protocol version; suggest updating |
 

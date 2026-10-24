@@ -43,12 +43,12 @@ impl Replica {
         };
         let e = match decoded {
             Decoded::Unknown { version, id, scope, hash, bytes } => {
+                if !self.scope_exists(scope)? {
+                    return Ok(IngestOutcome::Invalid("scope not joined".into()));
+                }
                 return self.tx(|r| {
                     if r.event_exists(&hash)? {
                         return Ok(IngestOutcome::Duplicate { hash });
-                    }
-                    if !r.scope_exists(scope)? {
-                        r.join_scope(scope)?;
                     }
                     r.db.execute(
                         "INSERT INTO events(hash, id, scope, author, hlc, kind, version, epoch, control, status, bytes) VALUES (?, ?, ?, NULL, 0, 0, ?, 0, 0, ?, ?)",
@@ -66,6 +66,9 @@ impl Replica {
         let hash = e.hash();
         let scope = e.scope;
         let author = e.author;
+        if !self.scope_exists(scope)? {
+            return Ok(IngestOutcome::Invalid("scope not joined".into()));
+        }
         let held: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM held WHERE hash = ?)", [&hash.0[..]], |r| r.get(0))?;
         if held {
             let missing = self.auth_mut(scope)?.missing_parents(&e.control_parents);
@@ -193,6 +196,34 @@ impl Replica {
     pub fn may_read_control(&mut self, scope: ScopeId, device: &DeviceKey) -> Result<bool> {
         let st = self.auth_mut(scope)?.full_state();
         Ok(st.certs.contains_key(device) && !st.revoked.contains(device))
+    }
+
+    /// Whether a peer may sync with this device at all: one of this user's devices, or a device
+    /// of a user that is a member of (or was certified in) a scope held here. Anyone else may
+    /// only pair or redeem an invite.
+    pub fn is_trusted_peer(&mut self, cert: &DeviceCert) -> Result<bool> {
+        if !cert.verify() || cert.device == self.device_key() || self.is_device_revoked(&cert.device)? {
+            return Ok(false);
+        }
+        if cert.user == self.user_key() {
+            return Ok(true);
+        }
+        let user = crate::ids::Principal::User(cert.user);
+        for scope in self.scope_ids()? {
+            let st = self.auth_mut(scope)?.full_state();
+            if st.revoked.contains(&cert.device) {
+                continue;
+            }
+            if st.members.contains_key(&user) || st.certs.contains_key(&cert.device) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether an issued invite is still open, so an unknown device may connect to redeem it.
+    pub fn has_open_invites(&self) -> Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM invites_issued WHERE expires_ms > ?)", [self.env.now_ms() as i64], |r| r.get(0))?)
     }
 
     /// Whether a peer presenting this certificate would be admitted automatically.
