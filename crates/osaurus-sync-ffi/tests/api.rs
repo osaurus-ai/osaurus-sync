@@ -234,6 +234,34 @@ fn pairing_sync_and_streams_over_loopback() {
     block_on(phone.close()).unwrap();
 }
 
+#[test]
+fn restored_backup_unlocks_with_the_phrase() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = SyncCore::open(config(dir.path(), "old", Platform::MacOs, false), Box::new(Keys::default())).unwrap();
+    let scope = old.create_conversation("Kept".into()).unwrap();
+    old.send_message(scope.clone(), text("from the old Mac")).unwrap();
+    let phrase = old.recovery_phrase().unwrap().join(" ");
+    let user = old.user_key().unwrap();
+    block_on(old.close()).unwrap();
+
+    // The backup lands on new hardware: same files, empty key store.
+    copy_dir(&dir.path().join("old"), &dir.path().join("new"));
+    let new = SyncCore::open(config(dir.path(), "new", Platform::MacOs, false), Box::new(Keys::default())).unwrap();
+    let events = Events::default();
+    new.set_listener(Some(Box::new(events.clone())));
+    assert!(new.recovery_available().unwrap());
+    assert!(new.conversations().unwrap().is_empty());
+
+    new.recover_from_phrase(phrase).unwrap();
+    until("identity", || events.0.lock().unwrap().iter().any(|e| matches!(e, CoreEvent::IdentityChanged)));
+    assert!(!new.recovery_available().unwrap());
+    assert_eq!(new.user_key().unwrap(), user);
+    assert_eq!(new.conversations().unwrap().len(), 1);
+    new.send_message(scope.clone(), text("from the new Mac")).unwrap();
+    assert_eq!(contents(&new, &scope), ["from the old Mac", "from the new Mac"]);
+    block_on(new.close()).unwrap();
+}
+
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {

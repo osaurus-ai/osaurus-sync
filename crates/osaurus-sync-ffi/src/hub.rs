@@ -117,6 +117,7 @@ impl Hub {
                 Change::DevicesChanged => core_events.push(CoreEvent::DevicesChanged),
                 Change::SelfRevoked => core_events.push(CoreEvent::SelfRevoked),
                 Change::IdentityChanged => core_events.push(CoreEvent::IdentityChanged),
+                Change::RecoveryAvailable => core_events.push(CoreEvent::RecoveryAvailable),
             }
         }
         for (scope, l) in scopes {

@@ -132,9 +132,26 @@ Wall clocks never decide validity. They only order messages for display and pick
   inside `key_update` events. Removing a member or revoking a device rotates to a new epoch, and
   the new key is sealed only to the remaining devices. Phase 1 uses this simple scheme; MLS is
   deferred.
+- **Recovery grants.** Each user also has a recovery key, an Ed25519 key that HKDF derives from
+  the user secret (`osaurus-sync/recovery-key/v1`). Scope keys are sealed to it exactly as to a
+  device, as a `KeyGrant` addressed to the recovery public key, so the wire format is unchanged.
+  New scopes and rotations include the creator's recovery key. Every device also repairs
+  missing grants on its own: whenever it holds keys its user's recovery key lacks, it publishes
+  a `key_update` adding them. That covers other members and scopes from before this scheme.
+  `unseal_grants` tries the device key and then the recovery key.
+- **Consequence for revocation.** A revoked device that still has the user secret can derive
+  the recovery key, so it can read new epochs. A plain revoke is for lost or wiped devices; a
+  stolen device needs identity rotation, which replaces the user secret.
 - **Device keys never leave the device.** The core never writes private keys to SQLite. On Apple
   platforms the Keychain items are `ThisDeviceOnly`, so a restored or migrated device gets a fresh
-  device key and must pair again, or recover from the phrase.
+  device key.
+- **Restored databases are kept.** A database whose stored device key differs from the key
+  store's was restored or copied. Its events, blobs and views stay. The per-install state resets:
+  the device certificate, Loro peer id, outbox, peer records and revoked flag. Conversation roles
+  are recomputed (to none, since the new device isn't certified yet), and `RecoveryAvailable` is
+  raised. Once the device holds that identity (from the phrase, or a synced keychain),
+  `finish_recovery` presents its own certificate in each scope its user belongs to, drains
+  `pending_decrypt` through the recovery grants, and repairs grants.
 - **Agents** have their own secp256k1 identity. An agent binding, signed by the agent's key,
   names the device that hosts it and an expiry. `agent_assign` puts an agent in a scope; the
   latest causally valid assignment wins.
@@ -354,8 +371,11 @@ Pairing adds a new device to the user's identity:
 4. The new device adopts the user identity and syncs everything.
 
 **Recovery from the phrase** is the fallback when no other device is at hand. The recovered
-device has the user identity but isn't yet in any scope's key grants. An existing device admits
-it with `approve_device`.
+device has the user identity, and through the recovery grants it can read every scope whose
+events it obtains: from a restored backup, from a member's device (which admits it, because its
+user is a member), or from a storing peer. `approve_device` is still available, to certify it
+from an existing device right away. If every device is lost and nothing holds the events,
+nothing can be recovered.
 
 **Invites** (`osaurus-invite:1:...`) are one-time tokens for adding someone to a scope with a
 role. The redeemer presents the token to a member device, which records the `member_add`.

@@ -70,7 +70,7 @@ impl Replica {
         Ok(())
     }
 
-    fn drain_pending_decrypt(&mut self, scope: ScopeId) -> Result<()> {
+    pub(crate) fn drain_pending_decrypt(&mut self, scope: ScopeId) -> Result<()> {
         let hashes: Vec<Vec<u8>> = {
             let mut stmt = self.db.prepare_cached("SELECT hash FROM pending_decrypt WHERE scope = ?")?;
             stmt.query_map([&scope.0[..]], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
@@ -441,7 +441,8 @@ impl Replica {
         Ok(())
     }
 
-    pub(crate) fn rebuild_all_views(&mut self) -> Result<()> {
+    /// Replays every view table from the event log, as after a view schema change.
+    pub fn rebuild_all_views(&mut self) -> Result<()> {
         let scopes: Vec<Vec<u8>> = {
             let mut stmt = self.db.prepare("SELECT scope FROM scopes")?;
             stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?

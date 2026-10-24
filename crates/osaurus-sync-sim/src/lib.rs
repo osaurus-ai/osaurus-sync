@@ -68,6 +68,18 @@ pub struct Sim {
     pub delivered: u64,
 }
 
+fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for e in std::fs::read_dir(src).unwrap().flatten() {
+        let to = dst.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &to);
+        } else {
+            std::fs::copy(e.path(), to).unwrap();
+        }
+    }
+}
+
 fn pair(a: usize, b: usize) -> (usize, usize) {
     if a < b { (a, b) } else { (b, a) }
 }
@@ -228,6 +240,24 @@ impl Sim {
         n.replica = None;
         n.engine = Engine::new();
         n.replica = Some(Replica::open(n.config(), n.env.clone(), n.secrets.clone()).unwrap());
+    }
+
+    /// Retires node `i` and starts a new device from a copy of its data directory, as when a
+    /// backup is restored onto new hardware. The new node has its own, fresh secrets.
+    pub fn restore_onto_new_device(&mut self, i: usize, name: &str) -> usize {
+        self.disconnect_all(i);
+        if let Some(mut r) = self.nodes[i].replica.take() {
+            r.close().unwrap();
+        }
+        let platform = self.nodes[i].platform;
+        let j = self.add_node(name, platform);
+        let src = self.nodes[i].dir.path().to_path_buf();
+        let n = &mut self.nodes[j];
+        n.replica.take().unwrap().close().unwrap();
+        std::fs::remove_dir_all(n.dir.path()).unwrap();
+        copy_dir(&src, n.dir.path());
+        n.replica = Some(Replica::open(n.config(), n.env.clone(), n.secrets.clone()).unwrap());
+        j
     }
 
     /// Lets the engine push local writes. Call after every operation on a replica.

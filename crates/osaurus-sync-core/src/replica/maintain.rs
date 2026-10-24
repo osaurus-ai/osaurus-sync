@@ -22,6 +22,8 @@ pub struct Maintenance {
     pub devices_pruned: usize,
     pub scopes_purged: usize,
     pub attachments_evicted: usize,
+    /// Scopes where this device sealed keys to its user's recovery key.
+    pub recovery_grants_added: usize,
 }
 
 impl Replica {
@@ -77,6 +79,10 @@ impl Replica {
             if DeviceKey::from_slice(&d).is_some_and(|k| !live.contains(&k)) {
                 m.devices_pruned += self.db.execute("DELETE FROM known_devices WHERE device = ? AND user != ?", params![d, &self.user_key().0[..]])?;
             }
+        }
+
+        for scope in self.scope_ids()? {
+            m.recovery_grants_added += self.repair_recovery_grants(scope)? as usize;
         }
 
         m.attachments_evicted = self.blobs.evict_plain(self.cfg.plain_cache_bytes, None);

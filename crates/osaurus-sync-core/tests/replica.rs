@@ -8,7 +8,7 @@ use osaurus_sync_core::keys::UserSecret;
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
 use osaurus_sync_core::replica::{IngestOutcome, MemorySecretStore};
 use osaurus_sync_core::types::{Attachment, Change, DeliveryStatus, NewMessage};
-use osaurus_sync_core::{Replica, ReplicaConfig};
+use osaurus_sync_core::{Replica, ReplicaConfig, SecretStore};
 
 struct Dev {
     replica: Replica,
@@ -163,16 +163,78 @@ fn reopen_keeps_state_and_rebuilds_views() {
 }
 
 #[test]
-fn copied_database_is_discarded() {
+fn restored_database_waits_for_the_recovery_phrase() {
     let env = Arc::new(TestEnv::new(6, 1_700_000_000_000));
     let dir = tempfile::tempdir().unwrap();
-    {
+    let (scope, phrase, old_device) = {
         let mut r = Replica::open(ReplicaConfig::new(dir.path(), "Mac", Platform::MacOs), env.clone(), Arc::new(MemorySecretStore::default())).unwrap();
-        r.create_scope(ScopeKind::Conversation, "old").unwrap();
-    }
-    // Same files, different key store: a disk image restored on another machine.
-    let r = Replica::open(ReplicaConfig::new(dir.path(), "Mac", Platform::MacOs), env, Arc::new(MemorySecretStore::default())).unwrap();
+        let scope = r.create_scope(ScopeKind::Conversation, "old").unwrap();
+        r.send_message(scope, text("before the backup")).unwrap();
+        (scope, r.recovery_phrase().join(" "), r.device_key())
+    };
+    // Same files, different key store: a backup restored on another machine.
+    let mut r = Replica::open(ReplicaConfig::new(dir.path(), "Mac", Platform::MacOs), env.clone(), Arc::new(MemorySecretStore::default())).unwrap();
+    assert_ne!(r.device_key(), old_device);
+    assert!(r.recovery_available().unwrap());
+    assert!(r.take_changes().contains(&Change::RecoveryAvailable));
     assert!(r.conversations().unwrap().is_empty());
+
+    // The phrase unlocks the history through the recovery grants, with no other device online.
+    r.adopt_user(UserSecret::from_phrase(&phrase).unwrap()).unwrap();
+    assert!(!r.recovery_available().unwrap());
+    assert_eq!(r.conversations().unwrap().len(), 1);
+    r.rebuild_all_views().unwrap();
+    assert_eq!(contents(&r, scope), vec!["before the backup"]);
+    env.advance(10);
+    r.send_message(scope, text("after recovery")).unwrap();
+    assert_eq!(contents(&r, scope), vec!["before the backup", "after recovery"]);
+    let mine = r.messages(scope, None, 10).unwrap().messages[1].author_device;
+    assert_eq!(mine, r.device_key());
+}
+
+#[test]
+fn restored_database_with_the_user_secret_recovers_on_open() {
+    let env = Arc::new(TestEnv::new(8, 1_700_000_000_000));
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(MemorySecretStore::default());
+    let scope = {
+        let mut r = Replica::open(ReplicaConfig::new(dir.path(), "Mac", Platform::MacOs), env.clone(), secrets.clone()).unwrap();
+        let scope = r.create_scope(ScopeKind::Conversation, "old").unwrap();
+        r.send_message(scope, text("hello")).unwrap();
+        scope
+    };
+    // The user secret synced through the keychain; the device key did not.
+    let restored = Arc::new(MemorySecretStore::default());
+    restored.store("user-secret", &secrets.load("user-secret").unwrap()).unwrap();
+    let mut r = Replica::open(ReplicaConfig::new(dir.path(), "Mac", Platform::MacOs), env.clone(), restored).unwrap();
+    assert!(!r.recovery_available().unwrap());
+    assert_eq!(r.conversations().unwrap().len(), 1);
+    env.advance(10);
+    r.send_message(scope, text("still mine")).unwrap();
+    assert_eq!(contents(&r, scope), vec!["hello", "still mine"]);
+}
+
+#[test]
+fn recovery_key_alone_decrypts_history_from_a_peer() {
+    let env = Arc::new(TestEnv::new(9, 1_700_000_000_000));
+    let mut a = open("Mac", env.clone());
+    let scope = a.replica.create_scope(ScopeKind::Conversation, "c").unwrap();
+    a.replica.send_message(scope, text("one")).unwrap();
+    // Key rotation (revoking a device) also seals the new epoch to the recovery key.
+    let ghost = open("Ghost", env.clone());
+    let user = UserSecret::from_entropy(a.secrets.load_entropy());
+    let mut ghost = ghost;
+    ghost.replica.adopt_user(user).unwrap();
+    a.replica.admit_device(ghost.replica.cert()).unwrap();
+    a.replica.revoke_device(ghost.replica.device_key()).unwrap();
+    env.advance(10);
+    a.replica.send_message(scope, text("two")).unwrap();
+
+    // Every device lost; a new one recovers from the phrase and receives the events.
+    let mut n = open("New phone", env.clone());
+    n.replica.adopt_user(UserSecret::from_phrase(&a.replica.recovery_phrase().join(" ")).unwrap()).unwrap();
+    copy_scope(&a.replica, &mut n.replica, scope);
+    assert_eq!(contents(&n.replica, scope), vec!["one", "two"]);
 }
 
 #[test]
@@ -222,12 +284,15 @@ fn revoked_device_events_rejected_and_keys_rotate() {
     b.replica.send_message(scope, text("written after revocation")).unwrap();
     copy_scope(&b.replica, &mut a.replica, scope);
     assert!(contents(&a.replica, scope).is_empty());
-    // New messages from A use an epoch B cannot read.
+    // New messages use a new epoch with no grant to B's device key. B still holds the user
+    // secret, though, so it can open the recovery grant: a plain revoke is for lost or wiped
+    // devices, and a stolen one needs `rotate_identity`.
     env.advance(5);
     a.replica.send_message(scope, text("secret")).unwrap();
     copy_scope(&a.replica, &mut b.replica, scope);
-    assert!(!contents(&b.replica, scope).contains(&"secret".to_string()));
+    assert_eq!(b.replica.all_hashes(scope).unwrap(), a.replica.all_hashes(scope).unwrap());
     assert!(b.replica.is_self_revoked());
+    assert!(b.replica.send_message(scope, text("again")).is_err());
 }
 
 #[test]

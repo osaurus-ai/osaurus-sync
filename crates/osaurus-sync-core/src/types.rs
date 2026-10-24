@@ -199,6 +199,9 @@ pub enum Change {
     /// The user identity changed after pairing or recovery; the app should persist the new
     /// user secret (already written through the secret store) and refresh everything.
     IdentityChanged,
+    /// This device holds a restored database for another identity. Entering that identity's
+    /// recovery phrase unlocks its history.
+    RecoveryAvailable,
 }
 
 impl Change {
@@ -209,7 +212,7 @@ impl Change {
             Change::ScopeReset(s) | Change::ConversationRemoved(s) | Change::SyncStatusChanged(s) => Some(*s),
             Change::ConversationChanged(c) => Some(c.scope),
             Change::Stream(s) => Some(s.scope),
-            Change::DevicesChanged | Change::SelfRevoked | Change::IdentityChanged => None,
+            Change::DevicesChanged | Change::SelfRevoked | Change::IdentityChanged | Change::RecoveryAvailable => None,
         }
     }
 }

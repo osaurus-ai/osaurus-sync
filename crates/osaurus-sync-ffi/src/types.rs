@@ -619,6 +619,9 @@ pub enum CoreEvent {
     SelfRevoked,
     /// Pairing or recovery replaced the user identity; reload everything.
     IdentityChanged,
+    /// A restored database for another identity was found. Prompt for its recovery phrase and
+    /// call `recover_from_phrase` to unlock its history.
+    RecoveryAvailable,
     Paired {
         device: String,
     },

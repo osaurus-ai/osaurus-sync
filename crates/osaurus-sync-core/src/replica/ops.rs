@@ -92,7 +92,7 @@ impl Replica {
             self.append_control(scope, &Control::DeviceCert(c.clone()))?;
         }
         let key: [u8; 32] = random_array(self.env.as_ref());
-        let mut devices = vec![self.device_key()];
+        let mut devices = vec![self.device_key(), self.user.recovery_public()];
         devices.extend(others.iter().map(|c| c.device));
         let grants = self.grants_for(&devices, &[(1, key)])?;
         self.append_control(scope, &Control::KeyUpdate(KeyUpdatePayload { grants }))?;
@@ -306,7 +306,11 @@ impl Replica {
     /// Starts a new epoch whose key only remaining member devices receive.
     pub(crate) fn rotate_key(&mut self, scope: ScopeId) -> Result<()> {
         let st = self.auth_mut(scope)?.full_state();
-        let devices: Vec<DeviceKey> = st.certs.keys().copied().filter(|d| !st.acting(d).is_empty()).collect();
+        let mut devices: Vec<DeviceKey> = st.certs.keys().copied().filter(|d| !st.acting(d).is_empty()).collect();
+        // Other members' recovery grants are added by their own devices (`repair_recovery_grants`).
+        if st.members.contains_key(&self.me()) {
+            devices.push(self.user.recovery_public());
+        }
         let next = self.current_key(scope)?.map(|(e, _)| e + 1).unwrap_or(1);
         let key: [u8; 32] = random_array(self.env.as_ref());
         let grants = self.grants_for(&devices, &[(next, key)])?;
@@ -394,6 +398,11 @@ impl Replica {
 
     fn device_has_all_keys(&mut self, scope: ScopeId, device: &DeviceKey) -> Result<bool> {
         let mine: BTreeSet<[u8; 8]> = self.all_keys(scope)?.iter().map(|(_, k)| crypto::key_check(k)).collect();
+        Ok(mine.is_subset(&self.granted_checks(scope, device)?))
+    }
+
+    /// Key checks of every key granted to `device` (or a recovery key) in the scope.
+    fn granted_checks(&self, scope: ScopeId, device: &DeviceKey) -> Result<BTreeSet<[u8; 8]>> {
         let mut theirs = BTreeSet::new();
         let rows: Vec<Vec<u8>> = {
             let mut stmt = self.db.prepare_cached("SELECT bytes FROM events WHERE scope = ? AND kind = ? AND status = 0")?;
@@ -406,7 +415,60 @@ impl Replica {
                 theirs.extend(ku.grants.iter().filter(|g| g.device == *device).map(|g| g.key_check));
             }
         }
-        Ok(mine.is_subset(&theirs))
+        Ok(theirs)
+    }
+
+    /// Seals every key this device holds to its user's recovery key where that grant is missing,
+    /// so the recovery phrase alone decrypts the scope. Returns whether a `key_update` was added.
+    pub fn repair_recovery_grants(&mut self, scope: ScopeId) -> Result<bool> {
+        let n = self.all_keys(scope)?.len();
+        if n == 0 || self.recovery_checked.get(&scope) == Some(&n) || self.is_self_revoked() {
+            return Ok(false);
+        }
+        let me = self.device_key();
+        let st = self.auth_mut(scope)?.full_state();
+        if !st.members.contains_key(&self.me()) || st.max_role(&me).is_none() {
+            return Ok(false);
+        }
+        let recovery = self.user.recovery_public();
+        let have = self.granted_checks(scope, &recovery)?;
+        let missing: Vec<(u64, [u8; 32])> = self.all_keys(scope)?.into_iter().filter(|(_, k)| !have.contains(&crypto::key_check(k))).collect();
+        let added = !missing.is_empty();
+        if added {
+            let grants = self.grants_for(&[recovery], &missing)?;
+            self.tx(|r| r.append_control(scope, &Control::KeyUpdate(KeyUpdatePayload { grants })))?;
+        }
+        self.recovery_checked.insert(scope, n);
+        Ok(added)
+    }
+
+    /// Takes on the identity of a restored database: certifies this device in the scopes its
+    /// user belongs to, decrypts history with the recovery grants, and repairs missing grants.
+    pub(crate) fn finish_recovery(&mut self) -> Result<()> {
+        let me = self.device_key();
+        let user = self.user_key();
+        let cert = self.cert.clone();
+        let scopes = self.scope_ids()?;
+        self.keys.clear();
+        self.recovery_checked.clear();
+        self.tx(|r| {
+            for &scope in &scopes {
+                let st = r.auth_mut(scope)?.full_state();
+                let member = st.members.contains_key(&Principal::User(user));
+                let certified = st.certs.get(&me).is_some_and(|u| u.contains_key(&user));
+                if member && !certified && !st.revoked.contains(&me) {
+                    r.append_control(scope, &Control::DeviceCert(cert.clone()))?;
+                }
+                r.drain_pending_decrypt(scope)?;
+                r.refresh_conversation(scope)?;
+            }
+            r.db.execute("DELETE FROM meta WHERE key = 'restored_user' AND value = ?", [&user.0[..]])?;
+            Ok(())
+        })?;
+        for scope in scopes {
+            self.repair_recovery_grants(scope)?;
+        }
+        Ok(())
     }
 
     // ---- invites ----
@@ -508,6 +570,7 @@ impl Replica {
         self.user = user;
         self.cert = cert.clone();
         self.upsert_known_device(&cert)?;
+        self.finish_recovery()?;
         self.changes.push(Change::IdentityChanged);
         Ok(())
     }

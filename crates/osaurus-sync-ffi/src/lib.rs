@@ -219,8 +219,15 @@ impl SyncCore {
         self.read(|r| Ok(r.recovery_phrase()))
     }
 
+    /// Whether this data directory was restored from another device's backup and its history
+    /// is waiting for that identity's recovery phrase. Also signalled by `RecoveryAvailable`.
+    pub fn recovery_available(&self) -> R<bool> {
+        self.read(|r| r.recovery_available())
+    }
+
     /// Replaces this device's user identity with the one derived from the phrase. Existing
-    /// local conversations are kept and shared with the recovered identity.
+    /// local conversations are kept and shared with the recovered identity, and history sealed
+    /// to that identity's recovery key (including a restored database's) becomes readable.
     pub fn recover_from_phrase(&self, phrase: String) -> R<()> {
         let user = UserSecret::from_phrase(&phrase)?;
         self.write(|r| r.adopt_user(user))?;

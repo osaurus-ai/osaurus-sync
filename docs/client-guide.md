@@ -227,6 +227,7 @@ concurrent removal). Reload the scope from `messages`.
 | `paired(device)` | Pairing finished |
 | `pairingFailed(reason)` | Pairing failed |
 | `identityChanged` | Pairing or recovery replaced the user identity; reload everything |
+| `recoveryAvailable` | A restored backup is waiting for its recovery phrase |
 | `selfRevoked` | This device was revoked; sync has stopped |
 | `peerRevoked(device)` | Another device was revoked |
 | `peerRejected(device)` | A device that is neither yours nor a member's tried to sync and was turned away |
@@ -292,9 +293,24 @@ let words = try core.recoveryPhrase()
 ```
 
 On a device with no other device available, `recoverFromPhrase` restores the identity. Local
-conversations on that device are kept. The recovered device can't read existing conversations
-until another of the user's devices sees it and calls `approveDevice(device:)`, which returns the
-scopes it was added to.
+conversations on that device are kept. Every scope key is also sealed to a recovery key derived
+from the phrase, so the recovered device can read whatever history it can get. That might be a
+restored backup, a member's device it syncs with, or a storing peer. It doesn't need another of
+the user's devices to approve it. Recovery can't help if every device is gone and no backup or
+peer still holds the events.
+
+**Restored backups.** If the app's data directory comes back from a backup (Time Machine, iCloud
+or Windows backup) without its keychain items, the core keeps the history and starts as a new
+device. `recoveryAvailable()` returns true, and `recoveryAvailable` is delivered to the
+listener. Until the user enters the phrase, the restored conversations aren't listed. If the user
+secret was restored with the data (a synced keychain), the device finishes recovery by itself
+when it opens.
+
+```swift
+if try core.recoveryAvailable() {
+    try core.recoverFromPhrase(phrase: words.joined(separator: " "))
+}
+```
 
 ## Sharing and membership
 

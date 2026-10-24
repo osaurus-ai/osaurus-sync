@@ -950,9 +950,11 @@ impl Engine {
             }
         }
         self.came_from.clear();
-        // Connected devices of members join scopes they are not yet certified in.
+        // Connected devices of members join scopes they are not yet certified in, and keys
+        // this device received are sealed to its user's recovery key if nobody has yet.
         let mut admitted = false;
         for scope in &touched {
+            admitted |= r.repair_recovery_grants(*scope)?;
             for p in &peers {
                 if auth_cache.get(&(*p, *scope)) == Some(&true) {
                     continue;

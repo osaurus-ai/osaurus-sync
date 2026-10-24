@@ -63,8 +63,9 @@ for example with `Dispatcher.InvokeAsync`. A callback may call back into the cor
 `DpapiKeyStore` keeps the device key and the user secret as files under
 `%LOCALAPPDATA%\Osaurus\Sync\keys`, each encrypted with DPAPI in `CurrentUser` scope. Only this
 Windows user on this machine can decrypt them, so a copied or restored profile gets a fresh
-device key and has to pair again. Scope encryption keys aren't stored here; the core recovers
-them from the event log using the device key.
+device key. Its history is kept, and the core raises `RecoveryAvailable` until the user enters
+the recovery phrase. Scope encryption keys aren't stored here; the core recovers them from the
+event log using the device key or the recovery key.
 
 Pass a directory to `new DpapiKeyStore(path)` to keep keys elsewhere. Use `MemoryKeyStore` only
 in tests.

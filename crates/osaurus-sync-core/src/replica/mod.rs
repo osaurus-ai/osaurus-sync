@@ -158,6 +158,8 @@ pub struct Replica {
     pub(crate) seeded_keys: HashMap<ScopeId, ScopeKeys>,
     pub(crate) loro: LoroCache,
     pub(crate) blobs: BlobStore,
+    /// Number of keys per scope when recovery grants were last checked.
+    pub(crate) recovery_checked: HashMap<ScopeId, usize>,
     in_tx: bool,
     changes: Vec<Change>,
     pending_changes: Vec<Change>,
@@ -194,22 +196,22 @@ impl Replica {
             }
         };
 
-        let mut db = store::open(Some(&db_path))?;
+        let db = store::open(Some(&db_path))?;
         let initialized: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')", [], |r| r.get(0))?;
-        // A database whose device key is not ours was copied from another device or restored
-        // from a disk image. Its identifiers must never be reused, so start fresh and resync.
-        if initialized
-            && let Some(stored) = store::meta(&db, "device_pub")?
-            && stored != device.public().0
-        {
-            drop(db);
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(cfg.data_dir.join(format!("sync.db{suffix}")));
-            }
-            let _ = std::fs::remove_dir_all(cfg.data_dir.join("blobs"));
-            db = store::open(Some(&db_path))?;
-        }
+        let restored = initialized && store::meta(&db, "device_pub")?.is_some_and(|stored| stored != device.public().0);
         let rebuild = store::migrate(&db)?;
+        // A database whose device key is not ours was restored from a backup or copied from
+        // another device. Its events and blobs are kept; the per-install identifiers (device
+        // certificate, Loro peer id, outbox, peer records) must never be reused, so they reset.
+        if restored {
+            if let Some(c) = store::meta(&db, "device_cert")?.and_then(|b| payload::decode::<DeviceCert>(&b).ok()) {
+                store::set_meta(&db, "restored_user", &c.user.0)?;
+            }
+            db.execute_batch(
+                "DELETE FROM meta WHERE key IN ('device_cert', 'loro_peer', 'self_revoked');
+                 DELETE FROM outbox; DELETE FROM peers; DELETE FROM storage_peers;",
+            )?;
+        }
 
         let user = match secrets.load(USER_SECRET) {
             Some(b) => UserSecret::from_entropy(b.try_into().map_err(|_| Error::Crypto("bad user secret".into()))?),
@@ -247,6 +249,7 @@ impl Replica {
             seeded_keys: HashMap::new(),
             loro: LoroCache::new(peer_id),
             blobs,
+            recovery_checked: HashMap::new(),
             in_tx: false,
             changes: Vec::new(),
             pending_changes: Vec::new(),
@@ -258,7 +261,29 @@ impl Replica {
         if rebuild {
             r.rebuild_all_views()?;
         }
+        if restored {
+            // Roles were computed for the old device; this one isn't certified anywhere yet.
+            for scope in r.scope_ids()? {
+                r.refresh_conversation(scope)?;
+            }
+        }
+        match r.restored_user()? {
+            Some(u) if u == r.user_key() => r.finish_recovery()?,
+            Some(_) => r.changes.push(Change::RecoveryAvailable),
+            None => {}
+        }
         Ok(r)
+    }
+
+    /// The user a restored database belonged to, until this device takes on that identity.
+    pub fn restored_user(&self) -> Result<Option<UserKey>> {
+        Ok(store::meta(&self.db, "restored_user")?.and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()).map(UserKey))
+    }
+
+    /// Whether this device holds a restored database for another identity, so entering that
+    /// identity's recovery phrase would unlock its history.
+    pub fn recovery_available(&self) -> Result<bool> {
+        Ok(self.restored_user()?.is_some_and(|u| u != self.user_key()))
     }
 
     fn load_or_issue_cert(db: &Connection, cfg: &ReplicaConfig, user: &UserSecret, device: &DeviceSecret, env: &dyn Env) -> Result<DeviceCert> {
@@ -363,6 +388,7 @@ impl Replica {
         self.auth.clear();
         self.keys.clear();
         self.loro.clear();
+        self.recovery_checked.clear();
     }
 
     /// Flushes Loro snapshots and checkpoints the WAL. Called on clean shutdown and when an iOS
@@ -761,9 +787,17 @@ impl Replica {
     fn unseal_grants(&self, e: &Envelope, sk: &mut ScopeKeys) -> bool {
         let Some(Ok(Some(Control::KeyUpdate(ku)))) = e.payload_bytes().map(|b| Control::decode(kind::KEY_UPDATE, b)) else { return false };
         let me = self.device_key();
+        let recovery = self.user.recovery_public();
         let mut added = false;
-        for g in ku.grants.iter().filter(|g| g.device == me) {
-            if let Ok(k) = crypto::unseal(self.device.signing_key(), &g.sealed)
+        for g in &ku.grants {
+            let opener = if g.device == me {
+                self.device.signing_key()
+            } else if g.device == recovery {
+                self.user.recovery_key()
+            } else {
+                continue;
+            };
+            if let Ok(k) = crypto::unseal(opener, &g.sealed)
                 && let Ok(k) = <[u8; 32]>::try_from(k.as_slice())
                 && crypto::key_check(&k) == g.key_check
             {

@@ -260,6 +260,41 @@ fn open_invite_lets_a_stranger_redeem_but_not_sync() {
 }
 
 #[test]
+fn restored_backup_recovers_with_every_device_lost() {
+    let mut sim = Sim::new(13);
+    let mac = sim.add_node("Mac", Platform::MacOs);
+    let pc = sim.add_node("PC", Platform::Windows);
+    let bob = sim.add_node("Bob", Platform::Windows);
+    sim.pair(mac, pc);
+    sim.run(10_000);
+    let scope = sim.r(mac).create_scope(ScopeKind::Workspace, "Team").unwrap();
+    sim.r(mac).send_message(scope, text("before the loss")).unwrap();
+    sim.invite(mac, bob, scope, Role::Member);
+    sim.run(10_000);
+    let phrase = sim.r(mac).recovery_phrase().join(" ");
+    let user = sim.r(mac).user_key();
+
+    // Both of Alice's devices are gone. Bob keeps talking; a backup of the Mac is restored.
+    sim.disconnect_all(pc);
+    sim.nodes[pc].replica = None;
+    sim.r(bob).send_message(scope, text("anyone there?")).unwrap();
+    let new = sim.restore_onto_new_device(mac, "New Mac");
+    assert!(sim.r(new).recovery_available().unwrap());
+    assert!(sim.r(new).conversations().unwrap().is_empty());
+
+    sim.r(new).adopt_user(osaurus_sync_core::keys::UserSecret::from_phrase(&phrase).unwrap()).unwrap();
+    assert_eq!(sim.r(new).user_key(), user);
+    assert_eq!(contents(&mut sim, new, scope), vec!["before the loss"]);
+    sim.connect(new, bob);
+    sim.run(10_000);
+    assert_eq!(contents(&mut sim, new, scope), vec!["before the loss", "anyone there?"]);
+    sim.r(new).send_message(scope, text("back")).unwrap();
+    sim.poll(new);
+    sim.run(10_000);
+    assert_eq!(contents(&mut sim, bob, scope), vec!["before the loss", "anyone there?", "back"]);
+}
+
+#[test]
 fn peers_over_budget_are_disconnected() {
     let mut sim = Sim::new(12);
     let mac = sim.add_node("Mac", Platform::MacOs);

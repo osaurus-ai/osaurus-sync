@@ -71,8 +71,8 @@ strings, to user-facing copy.
 
 `KeychainKeyStore` stores the device key and user secret as generic passwords with
 `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. They are never backed up or migrated, so a
-restored or new device always gets a fresh device key and must be paired (or recovered from the
-24-word phrase). On macOS, signed apps should use the data protection keychain (the default);
+restored or new device always gets a fresh device key. A restored data directory keeps its
+history, and `recoveryAvailable()` reports that it's waiting for the 24-word phrase. On macOS, signed apps should use the data protection keychain (the default);
 unsigned tools pass `useDataProtectionKeychain: false`.
 
 ## iOS integration

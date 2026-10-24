@@ -41,6 +41,8 @@ impl DeviceSecret {
 pub struct UserSecret {
     entropy: [u8; 32],
     key: SigningKey,
+    /// Scope keys are also sealed to this key, so the phrase alone decrypts history.
+    recovery: SigningKey,
 }
 
 impl UserSecret {
@@ -52,7 +54,9 @@ impl UserSecret {
         let hk = Hkdf::<Sha256>::new(Some(b"osaurus-sync"), &entropy);
         let mut seed = [0u8; 32];
         hk.expand(b"osaurus-sync/user-key/v1", &mut seed).expect("hkdf length");
-        Self { entropy, key: SigningKey::from_bytes(&seed) }
+        let mut rseed = [0u8; 32];
+        hk.expand(b"osaurus-sync/recovery-key/v1", &mut rseed).expect("hkdf length");
+        Self { entropy, key: SigningKey::from_bytes(&seed), recovery: SigningKey::from_bytes(&rseed) }
     }
 
     pub fn from_phrase(phrase: &str) -> Result<Self> {
@@ -76,6 +80,15 @@ impl UserSecret {
     pub fn signing_key(&self) -> &SigningKey {
         &self.key
     }
+
+    /// The recovery key, addressed in `KeyGrant`s like a device. It never signs anything.
+    pub fn recovery_public(&self) -> DeviceKey {
+        DeviceKey(self.recovery.verifying_key().to_bytes())
+    }
+
+    pub fn recovery_key(&self) -> &SigningKey {
+        &self.recovery
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +104,8 @@ mod tests {
         assert_eq!(words.len(), 24);
         let restored = UserSecret::from_phrase(&words.join(" ")).unwrap();
         assert_eq!(restored.public(), u.public());
+        assert_eq!(restored.recovery_public(), u.recovery_public());
+        assert_ne!(u.recovery_public().0, u.public().0);
     }
 
     #[test]
