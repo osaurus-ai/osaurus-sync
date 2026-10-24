@@ -40,14 +40,18 @@ jobs:
       - name: Toolchain
         run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
+      # Shared runners are noisy: here a regression has to triple a budget to fail. The nightly
+      # workflow enforces the budgets themselves.
       - name: Local budgets
         run: cargo bench -p osaurus-sync-core --bench budgets --locked -- --warm-up-time 1 --measurement-time 3
         env:
           OSAURUS_BUDGETS: enforce
+          OSAURUS_BUDGET_SLACK: "3"
       - name: Network budgets
         run: cargo bench -p osaurus-sync-net --bench network --locked -- --warm-up-time 1
         env:
           OSAURUS_BUDGETS: enforce
+          OSAURUS_BUDGET_SLACK: "3"
 
   apple:
     name: Swift (macOS and iOS Simulator)
@@ -87,23 +91,31 @@ jobs:
 
   csharp-windows:
     name: C# (Windows ${{ matrix.rid }})
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - rid: win-x64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
-            test: true
-          # Cross-compiled on the x64 runner; tested on arm64 hardware outside CI.
+            bindings: true
           - rid: win-arm64
+            os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            test: false
+            bindings: false
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - name: Install rustup
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -sSfL -o rustup-init.exe "https://static.rust-lang.org/rustup/dist/${{ matrix.target }}/rustup-init.exe"
+            ./rustup-init.exe -y --profile minimal --default-toolchain none
+            echo "$USERPROFILE/.cargo/bin" >> "$GITHUB_PATH"
+          fi
       - name: Toolchain
         run: |
           rustup toolchain install || rustup show
@@ -114,26 +126,22 @@ jobs:
       - name: Build native library
         run: cargo build -p osaurus-sync-ffi --lib --release --locked --target ${{ matrix.target }}
       - uses: actions/setup-dotnet@v4
-        if: matrix.test
         with:
           dotnet-version: 8.0.x
       - name: Cache uniffi-bindgen-cs
-        if: matrix.test
         id: bindgen-cache
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/uniffi-bindgen-cs.exe
-          key: uniffi-bindgen-cs-${{ env.UNIFFI_BINDGEN_CS_TAG }}-${{ runner.os }}
+          key: uniffi-bindgen-cs-${{ env.UNIFFI_BINDGEN_CS_TAG }}-${{ runner.os }}-${{ runner.arch }}
       - name: Install uniffi-bindgen-cs
-        if: matrix.test && steps.bindgen-cache.outputs.cache-hit != 'true'
+        if: steps.bindgen-cache.outputs.cache-hit != 'true'
         run: cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag "$UNIFFI_BINDGEN_CS_TAG"
       - name: Generate C# bindings
-        if: matrix.test
         run: scripts/gen-csharp.sh
         env:
           TARGET: ${{ matrix.target }}
       - name: xUnit tests
-        if: matrix.test
         run: dotnet test bindings/csharp/OsaurusSync.Tests -c Release
       - name: Stage native library
         run: |
@@ -144,7 +152,7 @@ jobs:
           name: ${{ matrix.rid }}
           path: dist/${{ matrix.rid }}/osaurus_sync_ffi.dll
       - uses: actions/upload-artifact@v4
-        if: matrix.test
+        if: matrix.bindings
         with:
           name: csharp-bindings
           path: bindings/csharp/OsaurusSync/Generated/

@@ -446,8 +446,10 @@ reclaims them, but only once that history is safe somewhere else.
   point, and records a watermark for it.
 - A device compacts a scope up to the **minimum watermark across all known storing peers**.
   With no storing peer, nothing is compacted.
-- Compaction drops superseded edit payloads, and folds Loro updates into a **shallow snapshot**
-  appended as a new `loro_update` event.
+- Compaction drops superseded edit payloads, and folds Loro updates into one **snapshot**
+  appended as a new `loro_update` event. The snapshot keeps the folded history: a shallow one
+  could not merge an update a partitioned device made on top of the trimmed history, or another
+  device's concurrent fold, and devices would settle on different states.
 - Compacted events **keep their signed headers**, so reconciliation still counts them and peers
   never send them back. A new device can sync from a compacted device; it just doesn't get the
   dropped history.

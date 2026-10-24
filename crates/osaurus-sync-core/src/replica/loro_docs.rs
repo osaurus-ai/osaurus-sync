@@ -140,10 +140,12 @@ impl Replica {
         Ok(None)
     }
 
-    /// Folds the scope's Loro updates up to `upto_seq` into one shallow snapshot, published as a
-    /// new `loro_update` event, and drops their payloads. History before the version those
-    /// updates reach is trimmed; the state and every later change are kept. Returns the number
-    /// of updates folded.
+    /// Folds the scope's Loro updates up to `upto_seq` into one snapshot, published as a new
+    /// `loro_update` event, and drops their payloads. Returns the number of updates folded.
+    ///
+    /// The snapshot keeps the folded history. A shallow one would not merge with an update a
+    /// partitioned device made on top of the trimmed history, nor with another device's
+    /// concurrent fold, and devices would settle on different states.
     pub(crate) fn fold_loro(&mut self, scope: ScopeId, upto_seq: i64) -> Result<u32> {
         if self.my_role(scope)? < Some(Role::Member) {
             return Ok(0);
@@ -169,30 +171,21 @@ impl Replica {
                 folded.push(h);
             }
         }
-        let frontiers = base.oplog_frontiers();
-        let bytes = match self.loro_doc(scope)?.doc.export(ExportMode::shallow_snapshot(&frontiers)) {
+        let bytes = match base.export(ExportMode::Snapshot) {
             Ok(b) => b,
             Err(e) => {
-                tracing::debug!(error = %e, "shallow snapshot failed; not folding");
+                tracing::debug!(error = %e, "snapshot failed; not folding");
                 return Ok(0);
             }
         };
-        self.append_content(scope, &Content::Loro(LoroUpdatePayload { doc: 0, shallow: true, bytes: bytes.clone() }), None, None)?;
+        // Only a fold over an earlier shallow snapshot, from before folds kept history, is shallow.
+        let shallow = base.is_shallow();
+        self.append_content(scope, &Content::Loro(LoroUpdatePayload { doc: 0, shallow, bytes }), None, None)?;
         for h in &folded {
             self.compact_event(h)?;
         }
-        let upto: i64 = self.db.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE scope = ? AND kind = ?",
-            params![&scope.0[..], kind::LORO_UPDATE as i64],
-            |r| r.get(0),
-        )?;
-        self.db.execute(
-            "INSERT INTO loro_snapshots(scope, snapshot, upto_seq) VALUES (?, ?, ?)
-             ON CONFLICT(scope) DO UPDATE SET snapshot = excluded.snapshot, upto_seq = excluded.upto_seq",
-            params![&scope.0[..], bytes, upto],
-        )?;
-        // Reload from the shallow snapshot so the trimmed history leaves memory too.
-        self.loro.remove(&scope);
+        self.loro_doc(scope)?.updates_since_snapshot += 1;
+        self.snapshot_loro(scope)?;
         Ok(folded.len() as u32)
     }
 

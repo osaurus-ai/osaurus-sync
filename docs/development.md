@@ -80,7 +80,8 @@ cargo bench -p osaurus-sync-net --bench network     # catch-up of 1,000 events, 
 ```
 
 Each benchmark prints its median next to its budget. With `OSAURUS_BUDGETS=enforce`, a median over
-budget fails the run, which is how CI uses them.
+budget fails the run. `OSAURUS_BUDGET_SLACK` multiplies every budget: push CI uses 3, since shared
+runners are noisy, and the nightly workflow enforces the budgets themselves.
 
 ## Swift package
 
@@ -154,11 +155,20 @@ installed device, so changes need care:
 | Job | Runner | What it does |
 | --- | --- | --- |
 | Rust | Ubuntu | fmt, clippy, workspace tests, 200 simulation seeds in release |
-| Performance budgets | Ubuntu | Both benchmark suites with `OSAURUS_BUDGETS=enforce` |
+| Performance budgets | Ubuntu | Both benchmark suites, enforced at three times the budgets |
 | Swift | macOS 15 | Builds the XCFramework; Swift tests on macOS and the iOS Simulator |
-| C# (win-x64) | Windows | Builds the DLL, generates bindings, runs xUnit tests |
-| C# (win-arm64) | Windows | Cross-compiles the arm64 DLL (not tested in CI) |
+| C# (win-x64) | Windows x64 | Builds the DLL, generates bindings, runs xUnit tests |
+| C# (win-arm64) | Windows 11 arm64 | The same, natively on arm64 |
 | NuGet package | Ubuntu | Packs all native libraries and the bindings into a `.nupkg` |
+
+`.github/workflows/nightly.yml` runs every night and on manual dispatch:
+
+| Job | What it does |
+| --- | --- |
+| Performance budgets (strict) | Both benchmark suites against the budgets themselves, with longer measurement |
+| Simulation | 2,000 simulation seeds in release |
+
+A strict budget failure on a shared runner is worth one re-run before treating it as a regression.
 
 Artifacts from each run: `xcframework` (the zipped XCFramework), `osx-arm64`, `win-x64` and
 `win-arm64` (native libraries), `csharp-bindings`, and `nuget`.

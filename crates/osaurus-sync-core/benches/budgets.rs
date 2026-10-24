@@ -7,7 +7,7 @@
 //! | Cold start with 100 scopes, to the first view | under 300 ms |
 //!
 //! Each benchmark prints its median against the budget. With `OSAURUS_BUDGETS=enforce` a median
-//! over budget fails the run.
+//! over budget fails the run; `OSAURUS_BUDGET_SLACK` multiplies every budget (CI uses 3).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,6 +28,9 @@ fn check_budget(name: &str, limit: Duration, samples: &mut [Duration]) {
     }
     samples.sort();
     let median = samples[samples.len() / 2];
+    // Shared CI runners are noisy; they enforce a multiple of the budget, and nightly the budget.
+    let slack: f64 = std::env::var("OSAURUS_BUDGET_SLACK").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let limit = limit.mul_f64(slack.max(1.0));
     let ok = median <= limit;
     eprintln!("budget {name}: median {median:?}, limit {limit:?}: {}", if ok { "ok" } else { "OVER BUDGET" });
     assert!(ok || std::env::var("OSAURUS_BUDGETS").as_deref() != Ok("enforce"), "{name} is over budget");

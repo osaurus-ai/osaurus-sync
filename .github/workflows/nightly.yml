@@ -1,0 +1,42 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  budgets:
+    name: Performance budgets (strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      # The documented budgets, without the headroom push CI allows. On a shared runner, re-run a
+      # failure once before treating it as a regression.
+      - name: Local budgets
+        run: cargo bench -p osaurus-sync-core --bench budgets --locked -- --warm-up-time 2 --measurement-time 10
+        env:
+          OSAURUS_BUDGETS: enforce
+      - name: Network budgets
+        run: cargo bench -p osaurus-sync-net --bench network --locked -- --warm-up-time 2
+        env:
+          OSAURUS_BUDGETS: enforce
+
+  simulation:
+    name: Simulation (many seeds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p osaurus-sync-sim --release --locked --test invariants
+        env:
+          SIM_SEEDS: "2000"

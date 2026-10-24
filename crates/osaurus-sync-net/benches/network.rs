@@ -7,7 +7,8 @@
 //!
 //! Catch-up is timed from resuming a suspended device to the last message reaching its view, so
 //! it includes reconnecting. Each benchmark prints its median against the budget. With
-//! `OSAURUS_BUDGETS=enforce` a median over budget fails the run.
+//! `OSAURUS_BUDGETS=enforce` a median over budget fails the run; `OSAURUS_BUDGET_SLACK`
+//! multiplies every budget (CI uses 3).
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,9 @@ fn check_budget(name: &str, limit: Duration, samples: &mut [Duration]) {
     }
     samples.sort();
     let median = samples[samples.len() / 2];
+    // Shared CI runners are noisy; they enforce a multiple of the budget, and nightly the budget.
+    let slack: f64 = std::env::var("OSAURUS_BUDGET_SLACK").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let limit = limit.mul_f64(slack.max(1.0));
     let ok = median <= limit;
     eprintln!("budget {name}: median {median:?}, limit {limit:?}: {}", if ok { "ok" } else { "OVER BUDGET" });
     assert!(ok || std::env::var("OSAURUS_BUDGETS").as_deref() != Ok("enforce"), "{name} is over budget");
