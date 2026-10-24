@@ -779,7 +779,7 @@ impl Replica {
             )?;
             match v {
                 Verdict::Valid => self.apply_content(&e, hash, &acting)?,
-                Verdict::Rejected(_) if e.kind == kind::TOMBSTONE => {
+                Verdict::Rejected(_) if kind::causal_only(e.kind) => {
                     let acting = self.auth_mut(scope)?.causal_acting(e.author, &e.control_parents, e.epoch);
                     if !acting.is_empty() {
                         self.apply_content(&e, hash, &acting)?;

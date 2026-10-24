@@ -435,7 +435,7 @@ impl Replica {
             if st == status::VALID {
                 let acting = self.auth_mut(scope)?.state_at(&e.control_parents).acting(&e.author);
                 self.apply_content(&e, hash, &acting)?;
-            } else if e.kind == kind::TOMBSTONE {
+            } else if kind::causal_only(e.kind) {
                 let acting = self.auth_mut(scope)?.causal_acting(e.author, &e.control_parents, e.epoch);
                 if !acting.is_empty() {
                     self.apply_content(&e, hash, &acting)?;

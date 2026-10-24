@@ -251,7 +251,8 @@ directory. A lock file makes sure only one process opens a data directory at a t
   - evicts decrypted attachments (`blobs/plain`) by least-recent use, above
     `plain_cache_bytes` (512 MiB by default). Opening an attachment also enforces this cap.
 - **Session budgets.** Within each one-minute window, a session may receive 500k events or
-  2 GiB in total, but only 20k events or 256 MiB of those as unsolicited pushes. It may also send
+  2 GiB in total, but only 20k events or 256 MiB of those as unsolicited pushes. Events count as
+  solicited only under the tag of a `Want` this device sent. It may also send
   1,000 invalid events per session. An untrusted session (one that is redeeming an invite) may
   send 16 messages. A peer that goes over any of these is sent `Bye` and disconnected.
 
@@ -288,8 +289,12 @@ Every rule is order independent, which is what makes invariant 4 hold (see
 - **Messages** form a grow-only set.
 - **Edits** are last-writer-wins by `(hlc, author)`, among the author's own edits.
 - **Tombstones** win over the message and all its edits. A tombstone purges the payload; the
-  envelope stays so the DAG remains intact. Purging can't be undone, so deletions are checked
-  against their causal past only.
+  envelope stays so the DAG remains intact.
+- **Purges are causal.** A deletion purges its target for good, and compaction purges the edits
+  a newer edit superseded. So deletions and edits count if their author could write given
+  their own causal past, even when a concurrent removal later rejects the event. Otherwise a
+  removal arriving after a compaction would bring back an edit that one device had purged and
+  another hadn't, and their views would differ.
 - **Reactions** are an observed-remove set. A remove names the adds its author had seen, so a
   concurrent add survives.
 - **Conversation metadata** (title, pinned, archived, sort order) and agent state live in one
@@ -360,10 +365,15 @@ sequenceDiagram
 5. **Acknowledge.** `Ack` lets the sender clear those events from its outbox. Outbox events are
    retried on every connection until acknowledged, which is how writes made offline or while
    suspended get delivered.
-6. **Live push and gossip.** After catch-up, every new event, whether local or received, is
-   pushed to every other connected peer that may read the scope. Duplicates are dropped by hash.
+6. **Live push and gossip.** Local writes, and events received as pushes, are pushed on to
+   every other connected peer that may read the scope. Duplicates are dropped by hash.
    Membership is checked before anything is sent. The engine does this itself rather than using
    `iroh-gossip`, so forwarding stays inside the deterministic engine.
+7. **Offer on.** Events this device fetched are not pushed on: in a mesh, every device would
+   resend a whole catch-up to every neighbour, and trip their push budgets. Instead, once a
+   scope that gained fetched events has nothing left to fetch, it is offered again to the
+   connected peers it wasn't fetched from, and they reconcile it. A held event is routed by the
+   peer it came from once its parents arrive.
 
 ### Gradual sync
 

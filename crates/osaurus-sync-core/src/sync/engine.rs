@@ -4,10 +4,11 @@
 //! Each side pulls: after `Hello` both peers send an `Offer` of the scopes the other may read,
 //! then each runs its own reconciliation schedule as initiator and requests what it lacks. The
 //! schedule reconciles the control layer first, then content in windows from newest to oldest so
-//! recent conversations become usable first. New events, local or received, are pushed to every
-//! other connected peer that may read the scope.
+//! recent conversations become usable first. Local writes and pushed events are pushed on to
+//! every other connected peer that may read the scope. Fetched events are not: once a scope has
+//! nothing left to fetch, it is offered again to the other peers, which fetch only what they lack.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::proto::{Layer, Msg, PROTOCOL_VERSION, ScopeOffer};
 use super::recon::{self, Key, KeySource, MAX_KEY, MIN_KEY, Range};
@@ -42,6 +43,8 @@ pub const MAX_PUSHED_BYTES_PER_WINDOW: usize = 256 << 20;
 pub const MAX_INVALID_PER_SESSION: usize = 1_000;
 /// Messages an untrusted session may send while redeeming an invite.
 pub const MAX_UNTRUSTED_MSGS: usize = 16;
+/// Held events whose sender is remembered. Past this, forgotten ones are pushed to every peer.
+const HELD_FROM_MAX: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Out {
@@ -207,6 +210,8 @@ struct Session {
     running: BTreeMap<u32, Running>,
     /// Want tag -> recon tag.
     wants: HashMap<u32, u32>,
+    /// Tags of wants for the missing parents of held events.
+    fetches: HashSet<u32>,
     budget: Budget,
 }
 
@@ -246,6 +251,11 @@ impl Budget {
 }
 
 impl Session {
+    /// Events with this tag answer a want this device sent; any others count as pushed.
+    fn solicited(&self, tag: u32) -> bool {
+        tag != 0 && (self.wants.contains_key(&tag) || self.fetches.contains(&tag))
+    }
+
     fn new() -> Self {
         Session {
             cert: None,
@@ -264,6 +274,7 @@ impl Session {
             parked: vec![],
             running: BTreeMap::new(),
             wants: HashMap::new(),
+            fetches: HashSet::new(),
             budget: Budget::default(),
         }
     }
@@ -306,8 +317,15 @@ pub struct Engine {
     pairing: Option<PairingState>,
     backfill_paused: bool,
     on_demand: Vec<Job>,
-    /// Which peer an event was just received from, so it is not echoed back.
-    came_from: HashMap<EventHash, DeviceKey>,
+    /// Which peer an event was just received from, so it is not echoed back, and whether this
+    /// device fetched it.
+    came_from: HashMap<EventHash, (DeviceKey, bool)>,
+    /// Scopes that gained fetched events, with the peers they came from. Pushing every fetched
+    /// event on to every peer would make a catch-up cost a multiple of itself in a mesh, and trip
+    /// the receivers' push budgets.
+    caught_up: BTreeMap<ScopeId, BTreeSet<DeviceKey>>,
+    /// `came_from` for held events, used once their parents arrive and they are stored.
+    held_from: HashMap<EventHash, (DeviceKey, bool)>,
     counters: Counters,
 }
 
@@ -471,7 +489,9 @@ impl Engine {
                 Msg::Events { tag, events, .. } => {
                     self.counters.events_received += events.len() as u64;
                     self.counters.event_bytes_received += events.iter().map(|e| e.len() as u64).sum::<u64>();
-                    self.sessions.get_mut(&peer).unwrap().budget.charge(r.env().now_ms(), events, *tag == 0)
+                    let s = self.sessions.get_mut(&peer).unwrap();
+                    let pushed = !s.solicited(*tag);
+                    s.budget.charge(r.env().now_ms(), events, pushed)
                 }
                 _ => None,
             }
@@ -658,10 +678,22 @@ impl Engine {
                 }
                 _ => {}
             }
-            let (control_heads, heads) = r.scope_heads(scope)?;
-            scopes.push(ScopeOffer { scope, control_heads, heads });
+            scopes.push(scope);
             full.push(now_full);
         }
+        self.offer(r, peer, scopes, full, out)
+    }
+
+    /// Offers scopes at their current heads. `full` says whether the peer may read each one's
+    /// content.
+    fn offer(&mut self, r: &mut Replica, peer: DeviceKey, scopes: Vec<ScopeId>, full: Vec<bool>, out: &mut Vec<Out>) -> Result<()> {
+        let scopes = scopes
+            .into_iter()
+            .map(|scope| {
+                let (control_heads, heads) = r.scope_heads(scope)?;
+                Ok(ScopeOffer { scope, control_heads, heads })
+            })
+            .collect::<Result<Vec<_>>>()?;
         if scopes.is_empty() {
             return Ok(());
         }
@@ -817,6 +849,7 @@ impl Engine {
     }
 
     fn on_events(&mut self, r: &mut Replica, peer: DeviceKey, tag: u32, events: Vec<Vec<u8>>, last: bool, out: &mut Vec<Out>) -> Result<()> {
+        let fetched = self.sessions[&peer].solicited(tag);
         let mut acks = Vec::new();
         let mut missing: HashMap<ScopeId, Vec<EventHash>> = HashMap::new();
         // One transaction per chunk: committing per event dominates the cost of a catch-up.
@@ -829,15 +862,19 @@ impl Engine {
                     } else {
                         self.counters.rejected += 1;
                     }
-                    self.came_from.insert(hash, peer);
+                    self.came_from.insert(hash, (peer, fetched));
                     acks.push(hash);
                 }
                 IngestOutcome::Duplicate { hash } => {
                     self.counters.duplicates += 1;
                     acks.push(hash);
                 }
-                IngestOutcome::Held { scope, missing: m, .. } => {
+                IngestOutcome::Held { scope, hash, missing: m } => {
                     self.counters.held += 1;
+                    if self.held_from.len() >= HELD_FROM_MAX {
+                        self.held_from.clear();
+                    }
+                    self.held_from.insert(hash, (peer, fetched));
                     let v = missing.entry(scope).or_default();
                     for h in m {
                         if !v.contains(&h) {
@@ -867,11 +904,13 @@ impl Engine {
         }
         for (scope, hashes) in missing {
             let wt = self.tag();
+            self.sessions.get_mut(&peer).unwrap().fetches.insert(wt);
             out.push(Out::Send(peer, Msg::Want { scope, tag: wt, ids: vec![], hashes }));
         }
         if tag != 0
             && last
             && let Some(s) = self.sessions.get_mut(&peer)
+            && !s.fetches.remove(&tag)
             && let Some(rt) = s.wants.remove(&tag)
         {
             if let Some(j) = s.running.get_mut(&rt) {
@@ -1096,7 +1135,14 @@ impl Engine {
             if !touched.contains(&scope) {
                 touched.push(scope);
             }
-            let from = self.came_from.get(&hash).copied();
+            let held = self.held_from.remove(&hash);
+            let from = match self.came_from.get(&hash).copied().or(held) {
+                Some((src, true)) => {
+                    self.caught_up.entry(scope).or_default().insert(src);
+                    continue;
+                }
+                from => from.map(|(p, _)| p),
+            };
             for p in &peers {
                 if Some(*p) == from {
                     continue;
@@ -1153,6 +1199,7 @@ impl Engine {
             }
         }
 
+        self.offer_caught_up(r, &peers, &mut out)?;
         for p in peers {
             loop {
                 let s = self.sessions.get_mut(&p).unwrap();
@@ -1171,6 +1218,30 @@ impl Engine {
             out.extend(self.poll(r)?);
         }
         Ok(out)
+    }
+
+    /// Offers scopes whose fetching has finished to the peers they were not fetched from.
+    fn offer_caught_up(&mut self, r: &mut Replica, peers: &[DeviceKey], out: &mut Vec<Out>) -> Result<()> {
+        let busy = |e: &Engine, scope: ScopeId| {
+            e.sessions.values().any(|s| s.running.values().any(|j| j.job.scope == scope) || s.queue.iter().any(|j| j.scope == scope))
+        };
+        let settled: Vec<ScopeId> = self.caught_up.keys().copied().filter(|s| !busy(self, *s)).collect();
+        let mut offers: BTreeMap<DeviceKey, (Vec<ScopeId>, Vec<bool>)> = BTreeMap::new();
+        for scope in settled {
+            let sources = self.caught_up.remove(&scope).unwrap_or_default();
+            for p in peers {
+                if sources.contains(p) || !self.sessions.contains_key(p) || !r.may_read_control(scope, p)? {
+                    continue;
+                }
+                let o = offers.entry(*p).or_default();
+                o.0.push(scope);
+                o.1.push(r.is_authorized(scope, p)?);
+            }
+        }
+        for (p, (scopes, full)) in offers {
+            self.offer(r, p, scopes, full, out)?;
+        }
+        Ok(())
     }
 }
 

@@ -653,8 +653,9 @@ impl ScopeAuth {
         (Verdict::Valid, acting)
     }
 
-    /// Who the author acts for if only its causal past is considered. Deletions use this: purging
-    /// a payload cannot be undone, so it must not depend on removals that arrive later.
+    /// Who the author acts for if only its causal past is considered. Deletions and edits use
+    /// this: purging a payload cannot be undone, so it must not depend on removals that arrive
+    /// later.
     pub fn causal_acting(&mut self, author: DeviceKey, control_parents: &[EventHash], epoch: u64) -> Vec<(Principal, Role)> {
         let st = self.state_at(control_parents);
         if st.owner.is_none() || epoch == 0 || st.revoked.contains(&author) {

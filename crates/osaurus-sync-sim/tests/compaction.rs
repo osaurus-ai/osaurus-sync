@@ -1,5 +1,5 @@
 use osaurus_sync_core::identity::Platform;
-use osaurus_sync_core::ids::ScopeId;
+use osaurus_sync_core::ids::{Principal, Role, ScopeId};
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
 use osaurus_sync_core::types::NewMessage;
 use osaurus_sync_sim::{Sim, snapshot};
@@ -127,6 +127,59 @@ fn offline_change_merges_after_others_fold_their_history() {
         assert_eq!(title(&mut sim, i, scope), want, "node {i}");
         sim.r(i).rebuild_all_views().unwrap();
         assert_eq!(title(&mut sim, i, scope), want, "node {i} after rebuild");
+    }
+}
+
+#[test]
+fn a_removal_arriving_after_compaction_does_not_split_views() {
+    let mut sim = Sim::new(24);
+    let mac = sim.add_node("Alice Mac", Platform::MacOs);
+    let pc = sim.add_node("Alice PC", Platform::Windows);
+    let server = sim.add_storage_node("Alice Server");
+    let carol = sim.add_node("Carol", Platform::MacOs);
+    sim.pair(mac, pc);
+    sim.run(50_000);
+    sim.pair(mac, server);
+    sim.run(50_000);
+    let scope = sim.r(mac).create_scope(ScopeKind::Workspace, "Team").unwrap();
+    sim.poll(mac);
+    sim.invite(mac, carol, scope, Role::Member);
+    sim.run(50_000);
+    let id = sim.r(carol).send_message(scope, NewMessage::text(MessageRole::User, "draft")).unwrap();
+    sim.advance(1000);
+    sim.r(carol).edit_message(id, "first").unwrap();
+    sim.poll(carol);
+    sim.heal(&[]);
+    sim.run(100_000);
+
+    // Carol edits again where the Mac can't see it. The PC compacts the first edit.
+    for n in [mac, pc, server, carol] {
+        sim.disconnect_all(n);
+    }
+    sim.advance(1000);
+    sim.r(carol).edit_message(id, "second").unwrap();
+    sim.connect(carol, server);
+    sim.run(50_000);
+    sim.disconnect_all(carol);
+    sim.connect(pc, server);
+    sim.run(50_000);
+    sim.disconnect_all(pc);
+    sim.connect(pc, server);
+    sim.run(50_000);
+    assert!(sim.r(pc).compacted_events(scope).unwrap() > 0);
+    assert_eq!(contents(&mut sim, pc, scope), vec!["second"]);
+
+    // The Mac, which never saw the second edit, removes Carol. The removal cuts that edit off,
+    // but the first one is gone on the PC; edits count by their own causal past instead.
+    let carol_user = sim.r(carol).user_key();
+    sim.r(mac).remove_member(scope, Principal::User(carol_user)).unwrap();
+    sim.poll(mac);
+    sim.heal(&[carol]);
+    sim.run(100_000);
+    for n in [mac, pc, server] {
+        assert_eq!(contents(&mut sim, n, scope), vec!["second"], "node {n}");
+        sim.r(n).rebuild_all_views().unwrap();
+        assert_eq!(contents(&mut sim, n, scope), vec!["second"], "node {n} after rebuild");
     }
 }
 

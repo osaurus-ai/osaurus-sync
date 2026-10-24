@@ -192,6 +192,11 @@ external review.
   Before a storage server ships, the role should be limited to the user's own devices or to
   certified servers.
 - **Removed members keep what they had.** Removal stops future access only.
+- **Edits, deletions and metadata changes count by their own causal past.** A removed member
+  that hasn't yet seen its removal can still edit or delete its own messages, and change
+  conversation metadata, until no connected member device accepts its sessions. Removal
+  rejects its new messages. Purges can't be undone, so judging these by removals that arrive
+  later would leave devices that compacted and devices that didn't with different views.
 - **Denial of service** by trusted peers is bounded but not prevented.
 
 ## Verification

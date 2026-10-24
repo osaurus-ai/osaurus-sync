@@ -2,7 +2,7 @@ use osaurus_sync_core::identity::Platform;
 use osaurus_sync_core::ids::{Principal, Role, ScopeId};
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
 use osaurus_sync_core::replica::SUCCESSION_GRACE_MS;
-use osaurus_sync_core::sync::engine::{MAX_INVALID_PER_SESSION, MAX_UNTRUSTED_MSGS};
+use osaurus_sync_core::sync::engine::{MAX_INVALID_PER_SESSION, MAX_PUSHED_PER_WINDOW, MAX_UNTRUSTED_MSGS};
 use osaurus_sync_core::sync::proto::{PROTOCOL_VERSION, ScopeOffer};
 use osaurus_sync_core::sync::{Msg, Notice, Out};
 use osaurus_sync_core::types::{DeliveryStatus, HistoryMode, ImportedMessage, NewMessage};
@@ -206,6 +206,52 @@ fn events_are_forwarded_through_a_middle_peer() {
 }
 
 #[test]
+fn fetched_events_are_offered_on_rather_than_pushed() {
+    let mut sim = Sim::new(8);
+    let a = sim.add_node("A", Platform::MacOs);
+    let b = sim.add_node("B", Platform::Server);
+    let c = sim.add_node("C", Platform::Windows);
+    let d = sim.add_node("D", Platform::Windows);
+    sim.pair(a, b);
+    sim.run(10_000);
+    sim.pair(b, c);
+    sim.run(10_000);
+    sim.pair(b, d);
+    sim.run(10_000);
+    for n in [a, b, c, d] {
+        sim.disconnect_all(n);
+    }
+    let scope = sim.r(a).create_scope(ScopeKind::Conversation, "offline").unwrap();
+    for i in 0..300 {
+        sim.r(a).send_message(scope, text(&format!("m{i}"))).unwrap();
+    }
+    // Nobody is connected, so nothing is pushed: B can only fetch these.
+    sim.poll(a);
+
+    // C is connected to B before B catches up from A; it gets everything once B is done.
+    sim.connect(b, c);
+    sim.run(10_000);
+    let before = sim.nodes[c].engine.counters();
+    sim.connect(a, b);
+    sim.run(100_000);
+    assert!(!sim.is_linked(a, c));
+    assert_eq!(contents(&mut sim, c, scope).len(), 300);
+    // A few of B's own new events (joining the scope) are pushed while C reconciles.
+    let dups = sim.nodes[c].engine.counters().duplicates - before.duplicates;
+    assert!(dups < 30, "{dups} duplicates");
+
+    // In a mesh, nobody pushes on what it fetched, so no push budget trips.
+    sim.connect(a, d);
+    sim.connect(c, d);
+    sim.connect(b, d);
+    sim.run(100_000);
+    assert_eq!(contents(&mut sim, d, scope).len(), 300);
+    for n in [a, b, c, d] {
+        assert_eq!(sim.nodes[n].engine.counters().limit_hits, 0, "node {n}");
+    }
+}
+
+#[test]
 fn revoked_device_is_refused() {
     let mut sim = Sim::new(8);
     let mac = sim.add_node("Mac", Platform::MacOs);
@@ -344,6 +390,20 @@ fn peers_over_budget_are_disconnected() {
     inject(&mut sim, pc, mac, Msg::Events { scope: ScopeId([1; 16]), tag: 0, events: garbage, last: true });
     sim.run(10_000);
     assert!(!sim.is_linked(mac, pc));
+
+    // Events under a tag this device never asked for count as pushed.
+    sim.connect(mac, pc);
+    sim.run(10_000);
+    let unasked = vec![vec![0u8; 8]; MAX_PUSHED_PER_WINDOW + 1];
+    let peer = sim.nodes[pc].device();
+    let n = &mut sim.nodes[mac];
+    let before = n.engine.counters();
+    let outs = n.engine.handle(n.replica.as_mut().unwrap(), peer, Msg::Events { scope: ScopeId([1; 16]), tag: 777, events: unasked, last: true }).unwrap();
+    assert!(outs.iter().any(|o| matches!(o, Out::Close(..))));
+    let after = n.engine.counters();
+    assert_eq!(after.limit_hits, before.limit_hits + 1);
+    assert_eq!(after.invalid, before.invalid, "cut off before ingesting");
+    sim.disconnect(mac, pc);
 
     // An untrusted peer gets a handful of messages to redeem an invite, then is cut off.
     let mallory = sim.add_node("Mallory", Platform::Windows);

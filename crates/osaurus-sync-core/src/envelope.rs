@@ -66,6 +66,13 @@ pub mod kind {
         matches!(kind, 1..=5 | 16..=24)
     }
 
+    /// Content whose effect gets purged for good: a tombstone removes its target and compaction
+    /// drops the edits a newer edit superseded. These count by their author's causal past, so a
+    /// removal that arrives later can't bring back what they replaced.
+    pub fn causal_only(kind: u16) -> bool {
+        matches!(kind, MESSAGE_EDIT | TOMBSTONE)
+    }
+
     pub fn name(kind: u16) -> &'static str {
         match kind {
             MESSAGE => "message",
