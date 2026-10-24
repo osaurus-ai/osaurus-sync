@@ -8,6 +8,24 @@ mod checkpoint;
 mod compact;
 mod data;
 mod loro_docs;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::loro_docs::{ScopeMeta, import_payload, meta_of};
+    use crate::payload::LoroUpdatePayload;
+
+    /// Imports an update the way a received `loro_update` event is applied, into a document
+    /// that already has local state, then reads the scope metadata and snapshots it.
+    pub fn apply_loro_update(p: &LoroUpdatePayload) -> ScopeMeta {
+        let mut doc = loro::LoroDoc::new();
+        let _ = doc.set_peer_id(1);
+        let _ = doc.get_map("meta").insert("title", "local");
+        doc.commit();
+        import_payload(&mut doc, 1, p);
+        let _ = doc.export(loro::ExportMode::Snapshot);
+        meta_of(&doc)
+    }
+}
 mod maintain;
 mod ops;
 mod read;

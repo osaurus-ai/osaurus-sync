@@ -70,8 +70,10 @@ core.SendMessage(scope, OsaurusSync.Text("Book the flights"));
   threading, DPAPI and the firewall prompt.
 - **[Architecture](docs/architecture.md):** the data model, envelope format, keys, membership
   rules, storage, merge rules, the sync protocol, networking, compaction and testing.
+- **[Threat model](docs/threat-model.md):** what is protected against whom, trust boundaries,
+  known limits and the scope of the external review.
 - **[Development](docs/development.md):** building, testing, the simulation harness,
-  benchmarks, compatibility rules, CI and releasing.
+  benchmarks, fuzzing, device validation, dependencies, CI and releasing.
 
 ## Repository layout
 
@@ -85,6 +87,7 @@ core.SendMessage(scope, OsaurusSync.Text("Book the flights"));
 | [`bindings/csharp`](bindings/csharp) | .NET 8 package and tests |
 | [`scripts`](scripts) | Building the XCFramework, generating bindings, packing NuGet and the release Swift package |
 | [`tests/fixtures`](tests/fixtures) | Signed events from earlier builds, for compatibility tests |
+| [`fuzz`](fuzz) | cargo-fuzz targets for the decoders and reconciliation |
 
 ## Building
 

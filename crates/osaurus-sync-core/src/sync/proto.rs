@@ -72,7 +72,9 @@ pub enum Msg {
     },
     PairingGrant {
         sealed_user: Vec<u8>,
-        cert: DeviceCert,
+        cert: Box<DeviceCert>,
+        /// The host's proof that it knows the pairing code.
+        proof: [u8; 32],
     },
     PairDenied {
         reason: String,

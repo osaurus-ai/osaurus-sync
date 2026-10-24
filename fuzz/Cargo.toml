@@ -1,0 +1,69 @@
+[package]
+name = "osaurus-sync-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "UNLICENSED"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+osaurus-sync-core = { path = "../crates/osaurus-sync-core", features = ["fuzzing"] }
+
+# Separate from the main workspace: it builds with nightly and sanitizers.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "msg"
+path = "fuzz_targets/msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_frame"
+path = "fuzz_targets/stream_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "payload"
+path = "fuzz_targets/payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "loro_update"
+path = "fuzz_targets/loro_update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recon"
+path = "fuzz_targets/recon.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invite"
+path = "fuzz_targets/invite.rs"
+test = false
+doc = false
+bench = false

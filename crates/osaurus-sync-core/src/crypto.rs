@@ -114,6 +114,9 @@ pub fn seal_to_device(env: &dyn Env, recipient: &[u8; 32], pt: &[u8]) -> Result<
     let eph = x25519_dalek::StaticSecret::from(random_array::<32>(env));
     let eph_pub = x25519_dalek::PublicKey::from(&eph);
     let shared = eph.diffie_hellman(&their);
+    if !shared.was_contributory() {
+        return Err(Error::Crypto("device key is a low-order point".into()));
+    }
     let key = seal_key(shared.as_bytes(), eph_pub.as_bytes(), recipient);
     let nonce: [u8; 24] = random_array(env);
     let mut out = Vec::with_capacity(56 + pt.len() + 16);
@@ -131,6 +134,10 @@ pub fn unseal(device: &SigningKey, sealed: &[u8]) -> Result<Vec<u8>> {
     let nonce: [u8; 24] = sealed[32..56].try_into().unwrap();
     let mine = x25519_dalek::StaticSecret::from(device.to_scalar_bytes());
     let shared = mine.diffie_hellman(&x25519_dalek::PublicKey::from(eph));
+    // A low-order ephemeral key gives a shared secret anyone can compute.
+    if !shared.was_contributory() {
+        return Err(Error::Crypto("sealed box uses a low-order key".into()));
+    }
     let recipient = device.verifying_key().to_bytes();
     let key = seal_key(shared.as_bytes(), &eph, &recipient);
     aead_open(&key, &nonce, &recipient, &sealed[56..])
@@ -280,6 +287,25 @@ mod tests {
         assert_eq!(unseal(&sk, &sealed).unwrap(), b"scope key");
         let other = SigningKey::from_bytes(&random_array(&env));
         assert!(unseal(&other, &sealed).is_err());
+    }
+
+    #[test]
+    fn low_order_keys_are_refused() {
+        let env = TestEnv::new(3, 0);
+        let sk = SigningKey::from_bytes(&random_array(&env));
+        let recipient = sk.verifying_key().to_bytes();
+        // With an all-zero ephemeral key the shared secret is zero, so anyone could build this box.
+        let key = seal_key(&[0; 32], &[0; 32], &recipient);
+        let nonce = [9u8; 24];
+        let mut forged = vec![0u8; 32];
+        forged.extend_from_slice(&nonce);
+        forged.extend_from_slice(&aead_seal(&key, &nonce, &recipient, b"chosen"));
+        assert!(unseal(&sk, &forged).is_err());
+
+        // The Ed25519 identity point maps to a low-order X25519 key.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        assert!(seal_to_device(&env, &identity, b"scope key").is_err());
     }
 
     #[test]

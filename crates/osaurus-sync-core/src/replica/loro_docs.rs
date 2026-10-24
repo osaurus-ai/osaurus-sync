@@ -80,6 +80,23 @@ pub(crate) fn import_payload(doc: &mut LoroDoc, peer_id: u64, p: &LoroUpdatePayl
     *doc = base;
 }
 
+pub(crate) fn meta_of(doc: &LoroDoc) -> ScopeMeta {
+    let m = doc.get_map("meta");
+    ScopeMeta {
+        title: match value(&m, "title") {
+            Some(LoroValue::String(s)) => s.to_string(),
+            _ => String::new(),
+        },
+        pinned: matches!(value(&m, "pinned"), Some(LoroValue::Bool(true))),
+        sort_order: match value(&m, "order") {
+            Some(LoroValue::Double(d)) => Some(d),
+            Some(LoroValue::I64(i)) => Some(i as f64),
+            _ => None,
+        },
+        archived: matches!(value(&m, "archived"), Some(LoroValue::Bool(true))),
+    }
+}
+
 fn value(m: &loro::LoroMap, key: &str) -> Option<LoroValue> {
     match m.get(key)? {
         ValueOrContainer::Value(v) => Some(v),
@@ -197,21 +214,7 @@ impl Replica {
     }
 
     pub(crate) fn scope_meta(&mut self, scope: ScopeId) -> Result<ScopeMeta> {
-        let entry = self.loro_doc(scope)?;
-        let m = entry.doc.get_map("meta");
-        Ok(ScopeMeta {
-            title: match value(&m, "title") {
-                Some(LoroValue::String(s)) => s.to_string(),
-                _ => String::new(),
-            },
-            pinned: matches!(value(&m, "pinned"), Some(LoroValue::Bool(true))),
-            sort_order: match value(&m, "order") {
-                Some(LoroValue::Double(d)) => Some(d),
-                Some(LoroValue::I64(i)) => Some(i as f64),
-                _ => None,
-            },
-            archived: matches!(value(&m, "archived"), Some(LoroValue::Bool(true))),
-        })
+        Ok(meta_of(&self.loro_doc(scope)?.doc))
     }
 
     /// Applies a local change to the scope's Loro document and records it as a `loro_update` event.

@@ -115,8 +115,19 @@ pub fn normalize_code(code: &str) -> String {
     if c.len() == 12 { format!("{}-{}-{}", &c[..4], &c[4..8], &c[8..]) } else { c }
 }
 
+/// The new device's proof that it knows the code.
 fn pairing_proof(code: &str, joiner: &DeviceKey, host: &DeviceKey) -> [u8; 32] {
-    let key = blake3::derive_key("osaurus-sync/pairing/v1", normalize_code(code).as_bytes());
+    proof("osaurus-sync/pairing/v1", code, joiner, host)
+}
+
+/// The existing device's proof that it knows the code. Without it, a device the joiner was
+/// pointed at by mistake (a spoofed device id next to a typed code) could hand it an identity.
+fn host_proof(code: &str, joiner: &DeviceKey, host: &DeviceKey) -> [u8; 32] {
+    proof("osaurus-sync/pairing-host/v1", code, joiner, host)
+}
+
+fn proof(context: &str, code: &str, joiner: &DeviceKey, host: &DeviceKey) -> [u8; 32] {
+    let key = blake3::derive_key(context, normalize_code(code).as_bytes());
     let mut msg = Vec::with_capacity(64);
     msg.extend_from_slice(&joiner.0);
     msg.extend_from_slice(&host.0);
@@ -507,7 +518,7 @@ impl Engine {
                 }
             }
             Msg::PairRequest { cert, proof } => self.on_pair_request(r, peer, cert, proof, &mut out)?,
-            Msg::PairingGrant { sealed_user, cert } => self.on_pairing_grant(r, peer, sealed_user, cert, &mut out)?,
+            Msg::PairingGrant { sealed_user, cert, proof } => self.on_pairing_grant(r, peer, sealed_user, *cert, proof, &mut out)?,
             Msg::PairDenied { reason } => {
                 self.counters.pairing_failures += 1;
                 tracing::info!(?peer, %reason, "pairing denied by the other device");
@@ -944,14 +955,15 @@ impl Engine {
 
     fn on_pair_request(&mut self, r: &mut Replica, peer: DeviceKey, cert: DeviceCert, proof: [u8; 32], out: &mut Vec<Out>) -> Result<()> {
         let now = r.env().now_ms();
-        let ok = match self.pairing.as_mut() {
+        let code = match self.pairing.as_mut() {
             Some(p) if p.expires_ms >= now && p.attempts < PAIRING_ATTEMPTS => {
                 p.attempts += 1;
-                cert.device == peer && cert.verify() && crypto_eq(&pairing_proof(&p.code, &peer, &r.device_key()), &proof)
+                let ok = cert.device == peer && cert.verify() && crypto_eq(&pairing_proof(&p.code, &peer, &r.device_key()), &proof);
+                ok.then(|| p.code.clone())
             }
-            _ => false,
+            _ => None,
         };
-        if !ok {
+        let Some(code) = code else {
             self.counters.pairing_failures += 1;
             tracing::info!(?peer, open = self.pairing.is_some(), "pairing request refused");
             if self.pairing.as_ref().is_some_and(|p| p.attempts >= PAIRING_ATTEMPTS) {
@@ -961,7 +973,7 @@ impl Engine {
             out.push(Out::Close(peer, "pairing denied".into()));
             self.sessions.remove(&peer);
             return Ok(());
-        }
+        };
         self.pairing = None;
         let user = r.user_secret().entropy();
         let new_cert = DeviceCert::issue(r.user_secret(), peer, &cert.name, cert.platform, now);
@@ -969,13 +981,20 @@ impl Engine {
         r.admit_device(&new_cert)?;
         self.counters.pairings += 1;
         tracing::info!(?peer, platform = ?cert.platform, "paired a new device");
-        out.push(Out::Send(peer, Msg::PairingGrant { sealed_user, cert: new_cert }));
+        let proof = host_proof(&code, &peer, &r.device_key());
+        out.push(Out::Send(peer, Msg::PairingGrant { sealed_user, cert: Box::new(new_cert), proof }));
         out.push(Out::Notify(Notice::Paired { device: peer }));
         Ok(())
     }
 
-    fn on_pairing_grant(&mut self, r: &mut Replica, peer: DeviceKey, sealed: Vec<u8>, cert: DeviceCert, out: &mut Vec<Out>) -> Result<()> {
-        if self.sessions.get(&peer).and_then(|s| s.joining.as_ref()).is_none() {
+    fn on_pairing_grant(&mut self, r: &mut Replica, peer: DeviceKey, sealed: Vec<u8>, cert: DeviceCert, proof: [u8; 32], out: &mut Vec<Out>) -> Result<()> {
+        let Some(code) = self.sessions.get(&peer).and_then(|s| s.joining.clone()) else { return Ok(()) };
+        if !crypto_eq(&host_proof(&code, &r.device_key(), &peer), &proof) {
+            self.counters.pairing_failures += 1;
+            tracing::warn!(?peer, "pairing grant from a device that doesn't know the code");
+            out.push(Out::Notify(Notice::PairingFailed("the other device didn't prove it knows the code".into())));
+            out.push(Out::Close(peer, "pairing proof".into()));
+            self.sessions.remove(&peer);
             return Ok(());
         }
         let entropy: [u8; 32] = crypto::unseal(r.device_secret().signing_key(), &sealed)?.try_into().map_err(|_| Error::Pairing("bad grant".into()))?;

@@ -174,6 +174,34 @@ installed device, so changes need care:
   next open.
 - Add a fixture for the new format, and keep the old fixtures passing.
 
+## Fuzzing
+
+`fuzz/` is a separate cargo-fuzz crate (it needs nightly) with a target for each decoder of
+untrusted input:
+
+| Target | Input |
+| --- | --- |
+| `envelope` | Event envelopes: decode, re-encode, verify, purge |
+| `msg` | Sync protocol messages, and slicing of `Events` |
+| `stream_frame` | Ephemeral stream frames |
+| `payload` | Control and content payloads of every kind, certificates and agent bindings |
+| `loro_update` | Loro updates imported into a document with local state |
+| `recon` | `recon::respond` against hostile ranges |
+| `invite` | Invite links and pairing codes |
+
+```sh
+rustup toolchain install nightly --profile minimal
+cargo install cargo-fuzz
+scripts/fuzz.sh 60                 # every target for 60 seconds
+scripts/fuzz.sh 600 loro_update    # one target for longer
+cargo +nightly fuzz run envelope fuzz/artifacts/envelope/crash-...   # reproduce a crash
+```
+
+The envelope corpus is seeded with `tests/fixtures`. Add a fuzz target with any new decoder of
+data from peers, and turn every crash into a regular unit test when fixing it. The targets use
+`osaurus-sync-core`'s `fuzzing` feature for internals such as Loro import; it isn't part of the
+API.
+
 ## Dependencies and licenses
 
 `deny.toml` configures `cargo deny check`, which runs in CI on every push and checks:
@@ -261,7 +289,8 @@ store.
 
 | Job | Runner | What it does |
 | --- | --- | --- |
-| Rust | Ubuntu | fmt, clippy, workspace tests, 200 simulation seeds in release |
+| Rust | Ubuntu | fmt, clippy, workspace tests, 200 simulation seeds in release, and a check that the fuzz targets compile |
+| Dependencies | Ubuntu | `cargo deny check`: licenses, advisories, bans and sources |
 | Performance budgets | Ubuntu | Both benchmark suites, enforced at three times the budgets |
 | Swift | macOS 15 | Builds the XCFramework; Swift tests on macOS and the iOS Simulator |
 | C# (win-x64) | Windows x64 | Builds the DLL, generates bindings, runs xUnit tests |
@@ -275,6 +304,8 @@ store.
 | Performance budgets (strict) | Both benchmark suites against the budgets themselves, with longer measurement |
 | Simulation | 2,000 simulation seeds in release |
 | Scale | The scale tests at full size; metrics go to the job summary |
+| Security advisories | `cargo deny check advisories` against the latest RustSec database |
+| Fuzzing | Every fuzz target for two minutes, with the corpus kept between nights; crashes are uploaded as `fuzz-crashes` |
 
 A strict budget failure on a shared runner is worth one re-run before treating it as a regression.
 

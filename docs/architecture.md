@@ -417,8 +417,10 @@ Pairing adds a new device to the user's identity:
    BLAKE3 hash of both device keys, keyed by the code. The code itself never crosses the wire.
 3. The existing device checks the proof (5 attempts, then the offer is cancelled), issues a
    device certificate, seals the user secret to the new device's key, and adds the device to its
-   scopes.
-4. The new device adopts the user identity and syncs everything.
+   scopes. Its `PairingGrant` carries its own proof of the code, under a separate key context.
+4. The new device checks that proof, so a device it was pointed at by mistake (a spoofed
+   device id next to a typed code) can't give it an identity. It then adopts the user identity
+   and syncs everything.
 
 **Recovery from the phrase** is the fallback when no other device is at hand. The recovered
 device has the user identity, and through the recovery grants it can read every scope whose
@@ -551,6 +553,8 @@ membership changes. Every seeded run asserts four invariants:
 Other layers of testing:
 
 - Unit and property tests cover the envelope, crypto, reconciliation and the permission engine.
+- cargo-fuzz targets (`fuzz/`) cover every decoder of peer input and reconciliation, and run
+  nightly. The [threat model](threat-model.md) lists what they and the other tests defend.
 - `osaurus-sync-net` has loopback tests with two real endpoints: pairing, catch-up, live push,
   streaming, blob transfer, and suspend and resume.
 - The Swift and C# binding tests call every exported API, including callbacks, from each language.

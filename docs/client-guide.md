@@ -283,6 +283,11 @@ try await core.pairWithOffer(payload: scannedPayload)
 The code expires after `ttlMs` and allows 5 attempts. Once paired, the new device has the same
 user identity and syncs every conversation. `cancelPairing()` withdraws an open offer.
 
+Both sides prove they know the code, so if a typed code is combined with the wrong device id
+(for example from a spoofed entry in a list of nearby devices), pairing fails with
+`pairingFailed` rather than joining someone else's account. Prefer the QR payload, which
+carries the device id.
+
 Managing devices:
 
 ```swift

@@ -57,6 +57,42 @@ fn wrong_pairing_code_is_refused() {
 }
 
 #[test]
+fn a_device_that_does_not_know_the_code_cannot_grant_an_identity() {
+    use osaurus_sync_core::crypto;
+    use osaurus_sync_core::identity::DeviceCert;
+    use osaurus_sync_core::keys::UserSecret;
+    use osaurus_sync_core::replica::USER_SECRET;
+
+    let mut sim = Sim::new(4);
+    let mac = sim.add_node("Mac", Platform::MacOs);
+    let evil = sim.add_node("Evil", Platform::MacOs);
+    let pc = sim.add_node("PC", Platform::Windows);
+    // A typed code next to a spoofed device id: the joiner dials the wrong device.
+    let mut invite = {
+        let n = &mut sim.nodes[mac];
+        n.engine.start_pairing(n.replica.as_ref().unwrap(), 300_000)
+    };
+    invite.device = sim.nodes[evil].device();
+    sim.link(pc, evil);
+    let n = &mut sim.nodes[pc];
+    n.engine.connect_pairing(n.replica.as_mut().unwrap(), &invite).unwrap();
+
+    // The impostor answers with a well-formed grant for its own identity, but can't prove the code.
+    let pc_key = sim.nodes[pc].device();
+    let entropy: [u8; 32] = sim.nodes[evil].secrets.get(USER_SECRET).unwrap().try_into().unwrap();
+    let user = UserSecret::from_entropy(entropy);
+    let now = sim.r(evil).env().now_ms();
+    let cert = DeviceCert::issue(&user, pc_key, "PC", Platform::Windows, now);
+    let sealed_user = crypto::seal_to_device(sim.r(evil).env().as_ref(), &pc_key.0, &entropy).unwrap();
+    sim.process(evil, vec![Out::Send(pc_key, Msg::PairingGrant { sealed_user, cert: Box::new(cert), proof: [7; 32] })]);
+    sim.run(100);
+
+    assert!(sim.nodes[pc].notices.iter().any(|n| matches!(n, Notice::PairingFailed(_))));
+    assert!(!sim.nodes[pc].notices.iter().any(|n| matches!(n, Notice::Paired { .. })));
+    assert_ne!(sim.r(pc).user_key(), user.public());
+}
+
+#[test]
 fn live_push_and_acknowledgement() {
     let mut sim = Sim::new(3);
     let mac = sim.add_node("Mac", Platform::MacOs);

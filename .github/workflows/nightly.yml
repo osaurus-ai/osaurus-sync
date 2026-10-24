@@ -40,6 +40,33 @@ jobs:
       # New RustSec advisories land without a push; this catches them within a day.
       - run: cargo deny --locked check advisories
 
+  fuzz:
+    name: Fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      # Corpora carry over between nights, so coverage keeps growing.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - run: scripts/fuzz.sh 120
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+
   simulation:
     name: Simulation (many seeds)
     runs-on: ubuntu-latest
