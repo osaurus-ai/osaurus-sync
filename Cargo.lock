@@ -3211,14 +3211,17 @@ name = "osaurus-sync-ffi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "futures",
  "libc",
  "osaurus-sync-core",
  "osaurus-sync-net",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uniffi",
 ]
 

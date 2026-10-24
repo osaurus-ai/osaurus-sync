@@ -126,3 +126,11 @@ permission, so add to the app's Info.plist:
 Without these keys, or if the user declines, set `network.mdns = false`; devices still connect
 through discovery and relays. On cellular, connections are usually relayed rather than direct;
 that is expected, and `diagnostics()` reports it per peer.
+
+## Logging
+
+```swift
+SyncLogging.useOSLog(level: .info)   // before opening the core; subsystem ai.osaurus.sync
+```
+
+Attach `core.supportBundle()` (redacted JSON with counters and recent logs) to support requests.

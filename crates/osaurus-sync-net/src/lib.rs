@@ -28,7 +28,7 @@ use osaurus_sync_core::Replica;
 use osaurus_sync_core::identity::AgentBinding;
 use osaurus_sync_core::ids::{AgentId, DeviceKey, EventId, ScopeId};
 use osaurus_sync_core::replica::InviteToken;
-use osaurus_sync_core::sync::{Engine, Msg, Notice, Out, PairingInvite};
+use osaurus_sync_core::sync::{Counters, Engine, Msg, Notice, Out, PairingInvite};
 use osaurus_sync_core::types::{Change, IdentityRotation, PeerStatus, StreamState, SyncStatus};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
@@ -120,6 +120,10 @@ pub struct Diagnostics {
     pub backfill_paused: bool,
     pub peers: Vec<PeerDiag>,
     pub scopes: Vec<SyncStatus>,
+    pub counters: Counters,
+    /// Sync protocol frame bytes since the node started.
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 enum Cmd {
@@ -153,6 +157,8 @@ pub(crate) struct Inner {
     me: DeviceKey,
     wake: Notify,
     next_conn: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
     memory: MemoryLookup,
     agent_record: Mutex<Option<AgentBinding>>,
     pub(crate) streams: streams::Incoming,
@@ -233,6 +239,8 @@ impl SyncNode {
             me,
             wake: Notify::new(),
             next_conn: AtomicU64::new(1),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
             memory: MemoryLookup::new(),
             agent_record: Mutex::new(None),
             streams: streams::Incoming::default(),
@@ -495,6 +503,7 @@ impl Inner {
         *net = Some(Net { endpoint, router, tasks });
         drop(net);
         self.apply_agent_record();
+        tracing::info!(relays = ?self.cfg.relays, dns = ?self.cfg.dns, mdns = self.cfg.mdns, "networking started");
         Ok(())
     }
 
@@ -505,6 +514,7 @@ impl Inner {
             return Ok(());
         };
         *lock(&self.endpoint) = None;
+        tracing::info!("networking suspended");
         for t in &n.tasks {
             t.abort();
         }
@@ -574,7 +584,9 @@ impl Inner {
             match out {
                 Out::Send(peer, msg) => {
                     if let Some(p) = peers.get(&peer) {
-                        let _ = p.tx.send(Cmd::Frame(msg.encode()));
+                        let b = msg.encode();
+                        self.bytes_sent.fetch_add(b.len() as u64, Ordering::Relaxed);
+                        let _ = p.tx.send(Cmd::Frame(b));
                     }
                 }
                 Out::Close(peer, why) => {
@@ -699,6 +711,7 @@ impl Inner {
 
     async fn read_loop(self: Arc<Self>, peer: DeviceKey, recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
         while let Some(bytes) = frame::read(recv).await? {
+            self.bytes_received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             let msg = Msg::decode(&bytes)?;
             let me = self.clone();
             let res = tokio::task::spawn_blocking(move || {
@@ -826,6 +839,7 @@ impl Inner {
         let st = lock(&self.state);
         let sessions = st.engine.sessions();
         let backfill_paused = st.engine.backfill_paused();
+        let counters = st.engine.counters();
         let mut peers = Vec::new();
         for s in sessions {
             let (relayed, rtt_ms) = conns.get(&s.device).copied().unwrap_or((false, None));
@@ -843,7 +857,18 @@ impl Inner {
         let scopes_ids = st.replica.scope_ids().unwrap_or_default();
         drop(st);
         let scopes = scopes_ids.into_iter().filter_map(|s| self.sync_status(s).ok()).collect();
-        Diagnostics { device: self.me, running: ep.is_some(), home_relays, local_addrs, backfill_paused, peers, scopes }
+        Diagnostics {
+            device: self.me,
+            running: ep.is_some(),
+            home_relays,
+            local_addrs,
+            backfill_paused,
+            peers,
+            scopes,
+            counters,
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+        }
     }
 }
 

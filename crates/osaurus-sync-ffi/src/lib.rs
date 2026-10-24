@@ -5,6 +5,7 @@
 
 mod error;
 mod hub;
+mod logs;
 mod types;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +22,7 @@ use tokio::runtime::{Handle, Runtime};
 
 pub use error::SyncError;
 pub use hub::Subscription;
+pub use logs::{LogLevel, LogListener, LogRecord, set_log_listener};
 pub use types::*;
 
 uniffi::setup_scaffolding!();
@@ -133,6 +135,7 @@ impl SyncCore {
         if config.api_version != API_VERSION {
             return Err(osaurus_sync_core::Error::IncompatibleVersion { core: API_VERSION, bindings: config.api_version }.into());
         }
+        logs::install();
         let net_cfg = config.network.to_net()?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -523,6 +526,92 @@ impl SyncCore {
 
     pub fn diagnostics(&self) -> Diagnostics {
         self.node.diagnostics().into()
+    }
+
+    /// A JSON report to attach to support requests: versions, connection state, counters and
+    /// recent log records. Device and scope ids, addresses and device names are replaced with
+    /// tokens (the same id gets the same token within one report). Message content, titles and
+    /// keys are never in it.
+    pub fn support_bundle(&self) -> String {
+        let d: Diagnostics = self.node.diagnostics().into();
+        let red = logs::Redactor::new(random_array(&SystemEnv));
+        let c = &d.counters;
+        let peers: Vec<_> = d
+            .peers
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "device": red.id(&p.device),
+                    "connected": p.connected,
+                    "established": p.established,
+                    "relayed": p.relayed,
+                    "rtt_ms": p.rtt_ms,
+                    "syncing": p.syncing,
+                    "storage_role": p.storage_role,
+                })
+            })
+            .collect();
+        let scopes: Vec<_> = d
+            .scopes
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "scope": red.id(&s.scope),
+                    "pending_outbox": s.pending_outbox,
+                    "last_sync_ms": s.last_sync_ms,
+                    "backfill_complete": s.backfill_complete,
+                    "known_peers": s.peers.len(),
+                    "connected_peers": s.peers.iter().filter(|p| p.connected).count(),
+                })
+            })
+            .collect();
+        let logs: Vec<_> = logs::recent()
+            .into_iter()
+            .map(|l| {
+                let fields: serde_json::Map<String, serde_json::Value> = l.fields.iter().map(|(k, v)| (k.clone(), red.text(v).into())).collect();
+                serde_json::json!({
+                    "time_ms": l.time_ms,
+                    "level": l.level.name(),
+                    "target": l.target,
+                    "message": red.text(&l.message),
+                    "fields": fields,
+                })
+            })
+            .collect();
+        let bundle = serde_json::json!({
+            "generated_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_millis() as u64),
+            "core_version": env!("CARGO_PKG_VERSION"),
+            "api_version": API_VERSION,
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "device": red.id(&d.device),
+            "online": d.running,
+            "backfill_paused": d.backfill_paused,
+            "home_relays": d.home_relays.iter().map(|r| serde_json::json!({ "url": r.url, "connected": r.connected })).collect::<Vec<_>>(),
+            "local_addresses": d.local_addrs.len(),
+            "peers": peers,
+            "scopes": scopes,
+            "counters": {
+                "sessions_established": c.sessions_established,
+                "sessions_ended": c.sessions_ended,
+                "peers_rejected": c.peers_rejected,
+                "events_received": c.events_received,
+                "event_bytes_received": c.event_bytes_received,
+                "applied": c.applied,
+                "rejected": c.rejected,
+                "held": c.held,
+                "duplicates": c.duplicates,
+                "invalid": c.invalid,
+                "limit_hits": c.limit_hits,
+                "pairings": c.pairings,
+                "pairing_failures": c.pairing_failures,
+                "bytes_sent": c.bytes_sent,
+                "bytes_received": c.bytes_received,
+            },
+            "logs_dropped": logs::dropped(),
+            "recent_logs": logs,
+        });
+        serde_json::to_string_pretty(&bundle).unwrap_or_default()
     }
 }
 

@@ -223,6 +223,31 @@ public sealed class BindingTests : IDisposable
     }
 
     [Fact]
+    public async Task LogsAndSupportBundle()
+    {
+        var records = new ConcurrentQueue<(LogRecord, int)>();
+        var me = Environment.CurrentManagedThreadId;
+        SyncLogging.SetHandler(r => records.Enqueue((r, Environment.CurrentManagedThreadId)), LogLevel.Info);
+        try
+        {
+            using var core = Open("logs", online: true);
+            WaitUntil("networking log", () => records.Any(r => r.Item1.Message == "networking started"));
+            Assert.All(records, r => Assert.NotEqual(me, r.Item2));
+
+            var bundle = core.SupportBundle();
+            using var json = System.Text.Json.JsonDocument.Parse(bundle);
+            Assert.True(json.RootElement.GetProperty("counters").GetProperty("sessions_established").GetUInt64() >= 0);
+            Assert.DoesNotContain(core.DeviceKey()[..12], bundle);
+            Assert.Contains("networking started", bundle);
+            await core.Close();
+        }
+        finally
+        {
+            SyncLogging.Disable();
+        }
+    }
+
+    [Fact]
     public void DpapiKeyStoreRoundTrip()
     {
         if (!OperatingSystem.IsWindows()) return;

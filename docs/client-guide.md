@@ -431,6 +431,42 @@ diag.peers                  // connected, relayed, rttMs, syncing, storageRole
 `relayed` is true when traffic goes through a relay rather than a direct path. On cellular this
 is normal. Use it for a connection indicator or a support screen.
 
+`diag.counters` holds running totals since the core opened: sessions established and ended,
+peers rejected, events received, applied, rejected, held, duplicate and invalid, limit hits,
+pairings, and protocol bytes sent and received.
+
+## Logging and support bundles
+
+The core logs through a process-wide listener, so install it once at startup, before opening a
+core. Records arrive on a dedicated thread, in order. If the app falls behind, records are
+dropped rather than slowing sync down.
+
+```swift
+SyncLogging.useOSLog(level: .info)                     // os.Logger, one category per module
+SyncLogging.setHandler(level: .debug) { record in … }  // or handle records yourself
+```
+
+```csharp
+SyncLogging.UseLogger(loggerFactory, LogLevel.Info);   // ILogger, one category per module
+SyncLogging.SetHandler(record => …, LogLevel.Debug);
+```
+
+Each `LogRecord` has a `level`, the Rust module as `target`, a `message`, structured `fields` and
+`timeMs`. Debug and trace records come only from the sync crates; the networking stack adds
+warnings and errors. Ids in fields appear as their first 12 hex digits. Message content,
+titles and keys are never logged. With `os_log`, messages are public and fields are hashed
+outside a debugger.
+
+Typical messages: `session established` and `session ended` (per peer), `peer rejected` (with
+`why`), `limit hit; disconnecting peer`, `pairing window opened`, `paired a new device`,
+`pairing request refused`, `invite redemption`, and `networking started` and `networking
+suspended`.
+
+`supportBundle()` returns a JSON report to attach to a support request: versions, OS,
+connection state per peer and scope, the counters, and the last 500 info-level records. Device
+and scope ids become tokens (the same id gets the same token within one report), and addresses
+and device names are left out. The recent records are kept even without a listener.
+
 ## Network configuration
 
 ```swift

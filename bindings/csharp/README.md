@@ -90,6 +90,14 @@ first launch may show a Windows Firewall prompt for UDP on private networks. Acc
 devices on the same LAN can connect directly. Otherwise they connect through a relay, which
 works but is slower. `core.Diagnostics()` shows whether each connection is direct or relayed.
 
+## Logging
+
+```csharp
+SyncLogging.UseLogger(loggerFactory, LogLevel.Info);   // before opening the core
+```
+
+Attach `core.SupportBundle()` (redacted JSON with counters and recent logs) to support requests.
+
 ## Building from source
 
 Requirements: the Rust toolchain from `rust-toolchain.toml`, the .NET 8 SDK, and

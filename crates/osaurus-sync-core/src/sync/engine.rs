@@ -270,6 +270,24 @@ pub struct SessionInfo {
     pub syncing: bool,
 }
 
+/// Running totals since the engine was created, for support bundles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+    pub sessions_established: u64,
+    pub sessions_ended: u64,
+    pub peers_rejected: u64,
+    pub events_received: u64,
+    pub event_bytes_received: u64,
+    pub applied: u64,
+    pub rejected: u64,
+    pub held: u64,
+    pub duplicates: u64,
+    pub invalid: u64,
+    pub limit_hits: u64,
+    pub pairings: u64,
+    pub pairing_failures: u64,
+}
+
 #[derive(Default)]
 pub struct Engine {
     sessions: BTreeMap<DeviceKey, Session>,
@@ -279,6 +297,7 @@ pub struct Engine {
     on_demand: Vec<Job>,
     /// Which peer an event was just received from, so it is not echoed back.
     came_from: HashMap<EventHash, DeviceKey>,
+    counters: Counters,
 }
 
 struct ScopeKeys<'a> {
@@ -323,6 +342,10 @@ impl Engine {
 
     pub fn backfill_paused(&self) -> bool {
         self.backfill_paused
+    }
+
+    pub fn counters(&self) -> Counters {
+        self.counters
     }
 
     /// Pauses or resumes reconciling windows older than a week (for battery or metered networks).
@@ -384,6 +407,10 @@ impl Engine {
 
     pub fn disconnect(&mut self, peer: &DeviceKey) {
         if let Some(s) = self.sessions.remove(peer) {
+            if s.established {
+                self.counters.sessions_ended += 1;
+                tracing::info!(?peer, "session ended");
+            }
             // Unfinished on-demand requests move to the next peer.
             for j in s.queue.into_iter().chain(s.running.into_values().map(|r| r.job)) {
                 if j.kind == JobKind::OnDemand {
@@ -408,6 +435,7 @@ impl Engine {
     /// Opens a pairing window on this (existing) device.
     pub fn start_pairing(&mut self, r: &Replica, ttl_ms: u64) -> PairingInvite {
         let code = generate_code(r);
+        tracing::info!(ttl_ms, "pairing window opened");
         self.pairing = Some(PairingState { code: code.clone(), expires_ms: r.env().now_ms() + ttl_ms, attempts: 0 });
         PairingInvite { device: r.device_key(), code }
     }
@@ -429,7 +457,11 @@ impl Engine {
         let trusted = self.sessions.get(&peer).is_some_and(|s| s.established && s.trusted);
         let over = if trusted {
             match &msg {
-                Msg::Events { tag, events, .. } => self.sessions.get_mut(&peer).unwrap().budget.charge(r.env().now_ms(), events, *tag == 0),
+                Msg::Events { tag, events, .. } => {
+                    self.counters.events_received += events.len() as u64;
+                    self.counters.event_bytes_received += events.iter().map(|e| e.len() as u64).sum::<u64>();
+                    self.sessions.get_mut(&peer).unwrap().budget.charge(r.env().now_ms(), events, *tag == 0)
+                }
                 _ => None,
             }
         } else if handshake {
@@ -441,7 +473,8 @@ impl Engine {
             (s.budget.untrusted_msgs > MAX_UNTRUSTED_MSGS).then_some("too many messages before admission")
         };
         if let Some(why) = over {
-            tracing::warn!(?peer, why, "disconnecting peer");
+            self.counters.limit_hits += 1;
+            tracing::warn!(?peer, why, "limit hit; disconnecting peer");
             out.push(Out::Send(peer, Msg::Bye { reason: why.into() }));
             out.push(Out::Close(peer, why.into()));
             self.disconnect(&peer);
@@ -476,6 +509,8 @@ impl Engine {
             Msg::PairRequest { cert, proof } => self.on_pair_request(r, peer, cert, proof, &mut out)?,
             Msg::PairingGrant { sealed_user, cert } => self.on_pairing_grant(r, peer, sealed_user, cert, &mut out)?,
             Msg::PairDenied { reason } => {
+                self.counters.pairing_failures += 1;
+                tracing::info!(?peer, %reason, "pairing denied by the other device");
                 out.push(Out::Notify(Notice::PairingFailed(reason)));
                 out.push(Out::Close(peer, "pairing denied".into()));
                 self.sessions.remove(&peer);
@@ -489,6 +524,7 @@ impl Engine {
                     r.admit_invitee(scope, token, &cert)
                 };
                 let error = res.err().map(|e| e.to_string());
+                tracing::info!(?peer, ?scope, error, "invite redemption");
                 out.push(Out::Send(peer, Msg::InviteResult { scope, error: error.clone() }));
                 if error.is_none() {
                     self.sessions.get_mut(&peer).unwrap().trusted = true;
@@ -517,6 +553,7 @@ impl Engine {
 
     fn on_hello(&mut self, r: &mut Replica, peer: DeviceKey, version: u32, cert: DeviceCert, storage_role: bool, out: &mut Vec<Out>) -> Result<()> {
         if version != PROTOCOL_VERSION {
+            tracing::warn!(?peer, version, ours = PROTOCOL_VERSION, "peer speaks another protocol version");
             out.push(Out::Notify(Notice::Incompatible { device: peer, version }));
             out.push(Out::Send(peer, Msg::Bye { reason: format!("protocol {PROTOCOL_VERSION} required") }));
             out.push(Out::Close(peer, "incompatible protocol".into()));
@@ -524,15 +561,15 @@ impl Engine {
             return Ok(());
         }
         if cert.device != peer || !cert.verify() {
+            self.reject(peer, "bad certificate");
             out.push(Out::Close(peer, "bad certificate".into()));
-            self.sessions.remove(&peer);
             return Ok(());
         }
         if r.is_device_revoked(&peer)? {
+            self.reject(peer, "revoked");
             out.push(Out::Notify(Notice::PeerRevoked(peer)));
             out.push(Out::Send(peer, Msg::Bye { reason: "revoked".into() }));
             out.push(Out::Close(peer, "revoked".into()));
-            self.sessions.remove(&peer);
             return Ok(());
         }
         // Admission: this user's devices and members' devices sync. The inviter of a queued
@@ -547,10 +584,10 @@ impl Engine {
         let trusted = was_trusted || vouched || successor.is_some() || r.is_trusted_peer(&cert)?;
         let own_device = r.is_own_device(&peer)?;
         if !trusted && !r.has_open_invites()? {
+            self.reject(peer, "not a member");
             out.push(Out::Notify(Notice::PeerRejected(peer)));
             out.push(Out::Send(peer, Msg::Bye { reason: "not a member".into() }));
             out.push(Out::Close(peer, "not a member".into()));
-            self.sessions.remove(&peer);
             return Ok(());
         }
         let send_hello = {
@@ -563,6 +600,8 @@ impl Engine {
             s.offered.clear();
             !std::mem::replace(&mut s.hello_sent, true)
         };
+        self.counters.sessions_established += 1;
+        tracing::info!(?peer, trusted, own_device, storage_role, "session established");
         if send_hello {
             out.push(Out::Send(peer, self.hello(r)));
         }
@@ -581,6 +620,12 @@ impl Engine {
             out.push(Out::Send(peer, Msg::InviteRedeem { scope: t.scope, token: t.token, cert: r.cert().clone() }));
         }
         self.offer_new(r, peer, out)
+    }
+
+    fn reject(&mut self, peer: DeviceKey, why: &'static str) {
+        self.counters.peers_rejected += 1;
+        tracing::info!(?peer, why, "peer rejected");
+        self.sessions.remove(&peer);
     }
 
     /// Offers every scope the peer may read that has not been offered in this session, or that
@@ -762,12 +807,21 @@ impl Engine {
         let mut missing: HashMap<ScopeId, Vec<EventHash>> = HashMap::new();
         for b in events {
             match r.ingest_from(&b, Some(peer))? {
-                IngestOutcome::Stored { hash, .. } => {
+                IngestOutcome::Stored { hash, valid, .. } => {
+                    if valid {
+                        self.counters.applied += 1;
+                    } else {
+                        self.counters.rejected += 1;
+                    }
                     self.came_from.insert(hash, peer);
                     acks.push(hash);
                 }
-                IngestOutcome::Duplicate { hash } => acks.push(hash),
+                IngestOutcome::Duplicate { hash } => {
+                    self.counters.duplicates += 1;
+                    acks.push(hash);
+                }
                 IngestOutcome::Held { scope, missing: m, .. } => {
+                    self.counters.held += 1;
                     let v = missing.entry(scope).or_default();
                     for h in m {
                         if !v.contains(&h) {
@@ -777,11 +831,13 @@ impl Engine {
                 }
                 IngestOutcome::NotJoined { scope } => tracing::debug!(?scope, "dropped event for a scope not joined"),
                 IngestOutcome::Invalid(reason) => {
-                    tracing::debug!(%reason, "dropped invalid event");
+                    self.counters.invalid += 1;
+                    tracing::debug!(?peer, %reason, "dropped invalid event");
                     let s = self.sessions.get_mut(&peer).unwrap();
                     s.budget.invalid += 1;
                     if s.budget.invalid > MAX_INVALID_PER_SESSION {
-                        tracing::warn!(?peer, "disconnecting peer: too many invalid events");
+                        self.counters.limit_hits += 1;
+                        tracing::warn!(?peer, "limit hit; disconnecting peer: too many invalid events");
                         out.push(Out::Send(peer, Msg::Bye { reason: "too many invalid events".into() }));
                         out.push(Out::Close(peer, "too many invalid events".into()));
                         self.disconnect(&peer);
@@ -891,6 +947,8 @@ impl Engine {
             _ => false,
         };
         if !ok {
+            self.counters.pairing_failures += 1;
+            tracing::info!(?peer, open = self.pairing.is_some(), "pairing request refused");
             if self.pairing.as_ref().is_some_and(|p| p.attempts >= PAIRING_ATTEMPTS) {
                 self.pairing = None;
             }
@@ -904,6 +962,8 @@ impl Engine {
         let new_cert = DeviceCert::issue(r.user_secret(), peer, &cert.name, cert.platform, now);
         let sealed_user = crypto::seal_to_device(r.env().as_ref(), &peer.0, &user)?;
         r.admit_device(&new_cert)?;
+        self.counters.pairings += 1;
+        tracing::info!(?peer, platform = ?cert.platform, "paired a new device");
         out.push(Out::Send(peer, Msg::PairingGrant { sealed_user, cert: new_cert }));
         out.push(Out::Notify(Notice::Paired { device: peer }));
         Ok(())
@@ -916,10 +976,14 @@ impl Engine {
         let entropy: [u8; 32] = crypto::unseal(r.device_secret().signing_key(), &sealed)?.try_into().map_err(|_| Error::Pairing("bad grant".into()))?;
         let user = UserSecret::from_entropy(entropy);
         if cert.user != user.public() || cert.device != r.device_key() || !cert.verify() {
+            self.counters.pairing_failures += 1;
+            tracing::warn!(?peer, "pairing grant does not match");
             out.push(Out::Notify(Notice::PairingFailed("grant does not match".into())));
             return Ok(());
         }
         r.adopt_user(user)?;
+        self.counters.pairings += 1;
+        tracing::info!(?peer, "joined through pairing");
         let s = self.sessions.get_mut(&peer).unwrap();
         s.joining = None;
         s.hello_sent = true;

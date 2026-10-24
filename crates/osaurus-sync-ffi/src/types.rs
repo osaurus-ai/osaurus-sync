@@ -548,6 +548,33 @@ pub struct Diagnostics {
     pub backfill_paused: bool,
     pub peers: Vec<PeerConnection>,
     pub scopes: Vec<SyncStatus>,
+    pub counters: SyncCounters,
+}
+
+/// Running totals since the core opened.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SyncCounters {
+    pub sessions_established: u64,
+    pub sessions_ended: u64,
+    /// Peers turned away: not members, revoked, or with a bad certificate.
+    pub peers_rejected: u64,
+    pub events_received: u64,
+    pub event_bytes_received: u64,
+    pub applied: u64,
+    /// Stored but rejected by the membership rules.
+    pub rejected: u64,
+    /// Waiting for control events they depend on.
+    pub held: u64,
+    pub duplicates: u64,
+    /// Failed to verify or decode.
+    pub invalid: u64,
+    /// Peers disconnected for exceeding a limit.
+    pub limit_hits: u64,
+    pub pairings: u64,
+    pub pairing_failures: u64,
+    /// Sync protocol bytes.
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 impl From<net::Diagnostics> for Diagnostics {
@@ -573,6 +600,23 @@ impl From<net::Diagnostics> for Diagnostics {
                 })
                 .collect(),
             scopes: d.scopes.into_iter().map(Into::into).collect(),
+            counters: SyncCounters {
+                sessions_established: d.counters.sessions_established,
+                sessions_ended: d.counters.sessions_ended,
+                peers_rejected: d.counters.peers_rejected,
+                events_received: d.counters.events_received,
+                event_bytes_received: d.counters.event_bytes_received,
+                applied: d.counters.applied,
+                rejected: d.counters.rejected,
+                held: d.counters.held,
+                duplicates: d.counters.duplicates,
+                invalid: d.counters.invalid,
+                limit_hits: d.counters.limit_hits,
+                pairings: d.counters.pairings,
+                pairing_failures: d.counters.pairing_failures,
+                bytes_sent: d.bytes_sent,
+                bytes_received: d.bytes_received,
+            },
         }
     }
 }

@@ -474,6 +474,11 @@ or isn't synced in recent-only mode.
   and `open` rejects a mismatch. This catches a stale native library shipped with new bindings.
 - **Key stores** are a callback interface. The Swift package ships `KeychainKeyStore`, the C#
   package ships `DpapiKeyStore`, and both ship an in-memory store for tests.
+- **Logging** is a `tracing` layer installed as the process-wide subscriber (unless the host
+  installed one first). It forwards records to the app's `LogListener` through a bounded queue
+  on its own thread (`osaurus-sync-logs`), dropping and counting records when the app falls
+  behind, and keeps the last 500 info-level records for `support_bundle`. Callsite interest is
+  rebuilt when the listener's level changes, so disabled levels cost nothing.
 
 ## Compatibility and versioning
 

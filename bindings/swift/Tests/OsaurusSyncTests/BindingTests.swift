@@ -247,6 +247,22 @@ final class BindingTests: XCTestCase {
         try await phone.close()
     }
 
+    func testLogsAndSupportBundle() async throws {
+        let records = Recorder<LogRecord>()
+        SyncLogging.setHandler(level: .info) { records.append([$0]) }
+        defer { SyncLogging.useOSLog() }
+        let core = try open("logs", online: true)
+        try waitUntil("networking log") { records.all.contains { $0.message == "networking started" } }
+        XCTAssertTrue(records.threadNames.allSatisfy { $0 == "osaurus-sync-logs" })
+
+        let bundle = core.supportBundle()
+        let json = try JSONSerialization.jsonObject(with: Data(bundle.utf8)) as? [String: Any]
+        XCTAssertNotNil(json?["counters"] as? [String: Any])
+        XCTAssertFalse(bundle.contains(String(core.deviceKey().prefix(12))))
+        XCTAssertTrue(bundle.contains("networking started"))
+        try await core.close()
+    }
+
     func testKeychainKeyStoreRoundTrip() throws {
         #if os(macOS)
         let store = KeychainKeyStore(service: "ai.osaurus.sync.tests.\(UUID().uuidString)", useDataProtectionKeychain: false)
