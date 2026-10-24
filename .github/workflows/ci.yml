@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  UNIFFI_BINDGEN_CS_TAG: v0.11.1+v0.31.0
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, tests, simulation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Simulation seeds
+        run: cargo test -p osaurus-sync-sim --release --locked --test invariants
+        env:
+          SIM_SEEDS: "200"
+
+  benchmarks:
+    name: Performance budgets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Local budgets
+        run: cargo bench -p osaurus-sync-core --bench budgets --locked -- --warm-up-time 1 --measurement-time 3
+        env:
+          OSAURUS_BUDGETS: enforce
+      - name: Network budgets
+        run: cargo bench -p osaurus-sync-net --bench network --locked -- --warm-up-time 1
+        env:
+          OSAURUS_BUDGETS: enforce
+
+  apple:
+    name: Swift (macOS and iOS Simulator)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build XCFramework (macOS, iOS, iOS Simulator)
+        run: scripts/build-xcframework.sh
+      - name: Swift tests on macOS
+        working-directory: bindings/swift
+        run: swift test
+      - name: Swift tests on the iOS Simulator
+        working-directory: bindings/swift
+        run: |
+          UDID=$(../../scripts/ios-simulator.sh)
+          SCHEME=$(xcodebuild -list -json | python3 -c '
+          import json, sys
+          schemes = json.load(sys.stdin)["workspace"]["schemes"]
+          print(next((s for s in schemes if s.endswith("-Package")), schemes[0]))')
+          xcodebuild test -scheme "$SCHEME" -destination "platform=iOS Simulator,id=$UDID" -skipPackagePluginValidation
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist/osx-arm64
+          cp target/aarch64-apple-darwin/release/libosaurus_sync_ffi.dylib dist/osx-arm64/
+          (cd bindings/swift && zip -qry ../../dist/OsaurusSyncFFI.xcframework.zip OsaurusSyncFFI.xcframework)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osx-arm64
+          path: dist/osx-arm64/libosaurus_sync_ffi.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcframework
+          path: dist/OsaurusSyncFFI.xcframework.zip
+
+  csharp-windows:
+    name: C# (Windows ${{ matrix.rid }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            target: x86_64-pc-windows-msvc
+            test: true
+          # Cross-compiled on the x64 runner; tested on arm64 hardware outside CI.
+          - rid: win-arm64
+            target: aarch64-pc-windows-msvc
+            test: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install || rustup show
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build native library
+        run: cargo build -p osaurus-sync-ffi --lib --release --locked --target ${{ matrix.target }}
+      - uses: actions/setup-dotnet@v4
+        if: matrix.test
+        with:
+          dotnet-version: 8.0.x
+      - name: Cache uniffi-bindgen-cs
+        if: matrix.test
+        id: bindgen-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/uniffi-bindgen-cs.exe
+          key: uniffi-bindgen-cs-${{ env.UNIFFI_BINDGEN_CS_TAG }}-${{ runner.os }}
+      - name: Install uniffi-bindgen-cs
+        if: matrix.test && steps.bindgen-cache.outputs.cache-hit != 'true'
+        run: cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag "$UNIFFI_BINDGEN_CS_TAG"
+      - name: Generate C# bindings
+        if: matrix.test
+        run: scripts/gen-csharp.sh
+        env:
+          TARGET: ${{ matrix.target }}
+      - name: xUnit tests
+        if: matrix.test
+        run: dotnet test bindings/csharp/OsaurusSync.Tests -c Release
+      - name: Stage native library
+        run: |
+          mkdir -p dist/${{ matrix.rid }}
+          cp target/${{ matrix.target }}/release/osaurus_sync_ffi.dll dist/${{ matrix.rid }}/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.rid }}
+          path: dist/${{ matrix.rid }}/osaurus_sync_ffi.dll
+      - uses: actions/upload-artifact@v4
+        if: matrix.test
+        with:
+          name: csharp-bindings
+          path: bindings/csharp/OsaurusSync/Generated/
+
+  nuget:
+    name: NuGet package
+    runs-on: ubuntu-latest
+    needs: [csharp-windows, apple]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "{win-x64,win-arm64,osx-arm64}"
+          path: dist/native
+      - uses: actions/download-artifact@v4
+        with:
+          name: csharp-bindings
+          path: bindings/csharp/OsaurusSync/Generated
+      - name: Pack
+        run: scripts/pack-nuget.sh dist/native
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nuget
+          path: dist/nuget/*.nupkg

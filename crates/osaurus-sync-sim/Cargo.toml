@@ -1,0 +1,17 @@
+[package]
+name = "osaurus-sync-sim"
+description = "Deterministic simulation harness for Osaurus sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+osaurus-sync-core.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

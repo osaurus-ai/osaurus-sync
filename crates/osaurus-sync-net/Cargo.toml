@@ -1,0 +1,31 @@
+[package]
+name = "osaurus-sync-net"
+description = "Iroh endpoints, discovery, relay configuration, gossip and blob transfer for Osaurus sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+iroh.workspace = true
+iroh-mdns-address-lookup = "0.6"
+n0-future = "0.3"
+osaurus-sync-core.workspace = true
+postcard.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[[bench]]
+name = "network"
+harness = false
+
+[lints]
+workspace = true

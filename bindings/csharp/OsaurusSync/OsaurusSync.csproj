@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Osaurus.Sync</RootNamespace>
+    <AssemblyName>Osaurus.Sync</AssemblyName>
+    <PackageId>Osaurus.Sync</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Osaurus</Authors>
+    <Description>Osaurus sync core: local-first, end-to-end encrypted sync of conversations across devices.</Description>
+    <IncludeSymbols>false</IncludeSymbols>
+    <!-- The generated bindings use lowercase identifiers and omit XML docs on internals. -->
+    <NoWarn>$(NoWarn);CS1591;CS8981;CS0108;CS0114</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Native libraries per runtime identifier, placed by scripts/gen-csharp.sh or CI. -->
+    <None Include="runtimes/**/native/*" Pack="true" PackagePath="runtimes/" />
+    <!-- Local builds and tests load the host library from the output directory. -->
+    <None Include="runtimes/$(NETCoreSdkRuntimeIdentifier)/native/*" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Pack="false" Visible="false" />
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+</Project>

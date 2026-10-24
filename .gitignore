@@ -1,0 +1,11 @@
+target/
+.build/
+*.xcframework
+dist/
+bindings/csharp/**/bin/
+bindings/csharp/**/obj/
+.DS_Store
+bindings/swift/Sources/OsaurusSync/Generated/
+bindings/swift/.swiftpm/
+bindings/csharp/**/Generated/
+bindings/csharp/**/runtimes/

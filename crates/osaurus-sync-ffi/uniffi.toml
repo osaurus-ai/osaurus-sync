@@ -1,0 +1,9 @@
+[bindings.swift]
+module_name = "OsaurusSync"
+ffi_module_name = "OsaurusSyncFFI"
+ffi_module_filename = "OsaurusSyncFFI"
+
+[bindings.csharp]
+namespace = "Osaurus.Sync"
+cdylib_name = "osaurus_sync_ffi"
+access_modifier = "public"
