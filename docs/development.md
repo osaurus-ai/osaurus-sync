@@ -205,6 +205,10 @@ scripts/fuzz.sh 600 loro_update    # one target for longer
 cargo +nightly fuzz run envelope fuzz/artifacts/envelope/crash-...   # reproduce a crash
 ```
 
+A prebuilt `cargo-fuzz` on Linux targets musl by default, which the sanitizers don't support.
+Pass `--target x86_64-unknown-linux-gnu` when running `cargo fuzz` by hand there; the script
+already passes the host triple.
+
 The envelope corpus is seeded with `tests/fixtures`. Add a fuzz target with any new decoder of
 data from peers, and turn every crash into a regular unit test when fixing it. The targets use
 `osaurus-sync-core`'s `fuzzing` feature for internals such as Loro import; it isn't part of the

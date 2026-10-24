@@ -19,11 +19,14 @@ fi
 mkdir -p corpus/envelope
 cp "$ROOT"/tests/fixtures/*.bin corpus/envelope/
 
-cargo +nightly fuzz build -O
+# cargo-fuzz defaults to the triple it was itself built for (musl for prebuilt Linux binaries).
+HOST="$(rustc +nightly -vV | sed -n 's/^host: //p')"
+
+cargo +nightly fuzz build -O --target "$HOST"
 failed=()
 for t in "${TARGETS[@]}"; do
   echo "==> $t (${SECS}s)"
-  if ! cargo +nightly fuzz run -O "$t" -- -max_total_time="$SECS" -max_len=65536 -rss_limit_mb=2048; then
+  if ! cargo +nightly fuzz run -O --target "$HOST" "$t" -- -max_total_time="$SECS" -max_len=65536 -rss_limit_mb=2048; then
     failed+=("$t")
   fi
 done
