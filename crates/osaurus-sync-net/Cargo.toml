@@ -22,6 +22,7 @@ tracing.workspace = true
 criterion.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "network"

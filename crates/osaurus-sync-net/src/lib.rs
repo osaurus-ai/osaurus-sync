@@ -669,8 +669,10 @@ impl Inner {
             let simultaneous = existing.dialed != dialed && existing.since.elapsed() < SIMULTANEOUS_DIAL;
             let existing_wins = existing.conn.close_reason().is_none() && simultaneous && existing.dialed == preferred;
             if existing_wins {
+                debug!(?peer, dialed, "kept the existing connection");
                 return None;
             }
+            debug!(?peer, dialed, existing_dialed = existing.dialed, simultaneous, "replaced the existing connection");
             let old = peers.remove(&peer).expect("present");
             old.conn.close(0u32.into(), b"duplicate");
             st.engine.disconnect(&peer);

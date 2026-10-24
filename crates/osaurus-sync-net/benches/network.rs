@@ -10,9 +10,14 @@
 //! it includes reconnecting. Each benchmark prints its median against the budget. With
 //! `OSAURUS_BUDGETS=enforce` a median over budget fails the run; `OSAURUS_BUDGET_SLACK`
 //! multiplies every budget (CI uses 3).
+//!
+//! When a message does not arrive, the run fails with both nodes' diagnostics and their recent
+//! network log.
 
+use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -26,8 +31,43 @@ use osaurus_sync_core::types::{Change, NewMessage};
 use osaurus_sync_core::{Replica, ReplicaConfig};
 use osaurus_sync_net::{Listener, NetConfig, SyncNode};
 use tokio::runtime::Runtime;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+const LOG_LINES: usize = 400;
+
+/// The last `LOG_LINES` debug records from the network crate and info records from the rest.
+fn recent_log() -> &'static Mutex<VecDeque<String>> {
+    static LOG: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+    LOG.get_or_init(Default::default)
+}
+
+struct Recent;
+
+impl<S: Subscriber> Layer<S> for Recent {
+    fn enabled(&self, m: &tracing::Metadata<'_>, _: Context<'_, S>) -> bool {
+        m.is_event() && (*m.level() <= Level::INFO || m.target().starts_with("osaurus_sync_net"))
+    }
+
+    fn on_event(&self, e: &Event<'_>, _: Context<'_, S>) {
+        struct Fields(String);
+        impl Visit for Fields {
+            fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, " {}={v:?}", f.name());
+            }
+        }
+        let m = e.metadata();
+        let mut line = Fields(format!("{:?} {} {}:", std::time::SystemTime::now(), m.level(), m.target()));
+        e.record(&mut line);
+        let mut log = recent_log().lock().unwrap();
+        if log.len() == LOG_LINES {
+            log.pop_front();
+        }
+        log.push_back(line.0);
+    }
+}
 
 fn check_budget(name: &str, limit: Duration, samples: &mut [Duration]) {
     check_percentile(name, 50, limit, samples);
@@ -88,6 +128,7 @@ fn node(rt: &Runtime, dir: &std::path::Path, name: &str, platform: Platform) -> 
 }
 
 fn paired() -> Pair {
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Recent));
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let (mac, _, _) = node(&rt, dir.path(), "mac", Platform::MacOs);
@@ -100,12 +141,17 @@ fn paired() -> Pair {
     Pair { rt, mac, pc, pc_added, _dir: dir }
 }
 
-fn wait_for(rx: &Receiver<EventId>, id: EventId) {
+fn wait_for(p: &Pair, id: EventId) {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        if rx.recv_timeout(left).expect("message did not arrive") == id {
-            return;
+        match p.pc_added.recv_timeout(left) {
+            Ok(got) if got == id => return,
+            Ok(_) => {}
+            Err(_) => {
+                let log: Vec<String> = recent_log().lock().unwrap().iter().cloned().collect();
+                panic!("message did not arrive\nmac: {:#?}\npc: {:#?}\nrecent log:\n{}", p.mac.diagnostics(), p.pc.diagnostics(), log.join("\n"));
+            }
         }
     }
 }
@@ -132,7 +178,7 @@ fn catch_up(c: &mut Criterion) {
                 p.pc.add_peer_addr(p.mac.addr().unwrap());
                 p.mac.add_peer_addr(p.pc.addr().unwrap());
                 p.pc.sync_now();
-                wait_for(&p.pc_added, last.unwrap());
+                wait_for(&p, last.unwrap());
                 let d = t.elapsed();
                 samples.push(d);
                 total += d;
@@ -148,7 +194,7 @@ fn live_delivery(c: &mut Criterion) {
     let p = paired();
     let scope = p.mac.write(|r| r.create_scope(ScopeKind::Conversation, "Live")).unwrap();
     let warm = p.mac.write(|r| r.send_message(scope, NewMessage::text(MessageRole::User, "warm up"))).unwrap();
-    wait_for(&p.pc_added, warm);
+    wait_for(&p, warm);
     let mut samples = Vec::new();
     let mut group = c.benchmark_group("live delivery");
     group.sample_size(50);
@@ -158,7 +204,7 @@ fn live_delivery(c: &mut Criterion) {
             for _ in 0..iters {
                 let t = Instant::now();
                 let id = p.mac.write(|r| r.send_message(scope, NewMessage::text(MessageRole::User, "ping"))).unwrap();
-                wait_for(&p.pc_added, id);
+                wait_for(&p, id);
                 let d = t.elapsed();
                 samples.push(d);
                 total += d;
