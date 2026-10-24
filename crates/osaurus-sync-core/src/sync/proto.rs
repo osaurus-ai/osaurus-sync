@@ -112,20 +112,25 @@ impl Msg {
     /// back whole), so a receiver can apply a large chunk in steps and let other work in
     /// between. Only the final slice keeps `last`.
     pub fn into_slices(self, n: usize) -> Vec<Msg> {
+        let mut out = Vec::new();
+        let mut rest = Some(self);
+        while let Some(m) = rest {
+            let (slice, r) = m.split_front(n);
+            out.push(slice);
+            rest = r;
+        }
+        out
+    }
+
+    /// The first slice of `into_slices(n)` and the rest of the message, for a receiver that
+    /// picks each slice's size as it goes.
+    pub fn split_front(self, n: usize) -> (Msg, Option<Msg>) {
         match self {
-            Msg::Events { scope, tag, events, last } if events.len() > n.max(1) => {
-                let mut events = events.into_iter().peekable();
-                let mut out = Vec::new();
-                while events.peek().is_some() {
-                    let slice: Vec<Vec<u8>> = events.by_ref().take(n.max(1)).collect();
-                    out.push(Msg::Events { scope, tag, events: slice, last: false });
-                }
-                if let Some(Msg::Events { last: l, .. }) = out.last_mut() {
-                    *l = last;
-                }
-                out
+            Msg::Events { scope, tag, mut events, last } if events.len() > n.max(1) => {
+                let rest = events.split_off(n.max(1));
+                (Msg::Events { scope, tag, events, last: false }, Some(Msg::Events { scope, tag, events: rest, last }))
             }
-            m => vec![m],
+            m => (m, None),
         }
     }
 

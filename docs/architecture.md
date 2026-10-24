@@ -276,8 +276,10 @@ and applied by exactly the same code. A local write runs in one SQLite transacti
 
 Subscribers only hear about committed state, and a crash can't leave the views half-updated.
 
-Received events are applied in slices of at most 16 per lock hold, each slice in one
-transaction, so a local write waits at most for one slice during a large catch-up. An event
+Received events are applied in slices, one lock hold and one transaction each, so a local
+write waits at most for one slice during a large catch-up. Slices start at 16 events and are
+resized after each hold toward what this device applies in 2 ms (at most 128), so a slow
+device takes smaller steps instead of longer holds. An event
 whose hash is already stored is acknowledged as a duplicate before its signature is checked:
 the hash covers the signed bytes, so the stored copy is the authentic one, and peers resending
 what they have to every neighbour would otherwise spend most of a catch-up verifying

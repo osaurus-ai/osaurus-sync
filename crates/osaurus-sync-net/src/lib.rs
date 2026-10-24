@@ -44,8 +44,12 @@ const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const MAINTAIN_EVERY: Duration = Duration::from_secs(3600);
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
-/// Events applied per state-lock hold when a received chunk is large.
+/// Received events are applied in slices, one state-lock hold each, so a local write waits
+/// for at most one slice during a catch-up. Slices start at `APPLY_SLICE` events and are
+/// resized after each hold toward what fits in `APPLY_HOLD` on this device.
 const APPLY_SLICE: usize = 16;
+const APPLY_SLICE_MAX: usize = 128;
+const APPLY_HOLD: Duration = Duration::from_millis(2);
 /// Received events applied between checkpoints during a catch-up. A once-a-second checkpoint
 /// can't keep up with one: the log only restarts when a write begins after a checkpoint has
 /// caught up, so it would grow until a commit behind the lock checkpoints it inline.
@@ -199,6 +203,7 @@ pub(crate) struct Inner {
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
     applied_since_checkpoint: AtomicUsize,
+    apply_slice: AtomicUsize,
     memory: MemoryLookup,
     agent_record: Mutex<Option<AgentBinding>>,
     pub(crate) streams: streams::Incoming,
@@ -283,6 +288,7 @@ impl SyncNode {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             applied_since_checkpoint: AtomicUsize::new(0),
+            apply_slice: AtomicUsize::new(APPLY_SLICE),
             memory: MemoryLookup::new(),
             agent_record: Mutex::new(None),
             streams: streams::Incoming::default(),
@@ -688,6 +694,15 @@ impl Inner {
         Some(id)
     }
 
+    /// Sizes the next slice from a full one that applied `n` events in `held`: down in
+    /// proportion when it ran over `APPLY_HOLD`, up by at most a quarter when it ran under.
+    fn resize_slice(&self, n: usize, held: Duration) {
+        let fits = (n as u128 * APPLY_HOLD.as_nanos() / held.as_nanos().max(1)).min(APPLY_SLICE_MAX as u128) as usize;
+        let cur = self.apply_slice.load(Ordering::Relaxed);
+        let next = if fits < cur { fits.max(1) } else { fits.min(cur + cur / 4 + 1) };
+        self.apply_slice.store(next, Ordering::Relaxed);
+    }
+
     /// Whether connection `id` is still the one registered for `peer`. Only meaningful while
     /// the caller holds the state lock, which `register` holds across a replacement. Anything
     /// else must not reach the engine: sessions are keyed by peer, so a late frame or Hello
@@ -779,9 +794,11 @@ impl Inner {
     async fn read_loop(self: Arc<Self>, peer: DeviceKey, id: u64, recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
         while let Some(bytes) = frame::read(recv).await? {
             self.bytes_received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            // Large chunks are applied in slices, releasing the state lock in between so local
-            // writes and reads don't wait for a whole catch-up chunk.
-            for msg in Msg::decode(&bytes)?.into_slices(APPLY_SLICE) {
+            let mut rest = Some(Msg::decode(&bytes)?);
+            while let Some(m) = rest.take() {
+                let size = self.apply_slice.load(Ordering::Relaxed);
+                let (msg, more) = m.split_front(size);
+                rest = more;
                 let me = self.clone();
                 let res = tokio::task::spawn_blocking(move || {
                     let n = if let Msg::Events { events, .. } = &msg { events.len() } else { 0 };
@@ -790,9 +807,14 @@ impl Inner {
                         if !me.is_current(&peer, id) {
                             return None;
                         }
+                        let held = Instant::now();
                         let State { replica, engine } = &mut *st;
                         let res = engine.handle(replica, peer, msg).map(|outs| me.route(outs));
-                        (res, replica.take_changes())
+                        let res = (res, replica.take_changes());
+                        if n == size {
+                            me.resize_slice(n, held.elapsed());
+                        }
+                        res
                     };
                     if let Some(cp) = &me.checkpointer
                         && me.applied_since_checkpoint.fetch_add(n, Ordering::Relaxed) + n >= CHECKPOINT_AFTER
