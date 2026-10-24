@@ -46,6 +46,10 @@ const MAINTAIN_EVERY: Duration = Duration::from_secs(3600);
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
 /// Events applied per state-lock hold when a received chunk is large.
 const APPLY_SLICE: usize = 16;
+/// Two connections between the same pair, in opposite directions, opened within this window
+/// are a simultaneous dial and settled by a tie-break. Past it, the newer one wins: the peer
+/// only dials while it has no working connection, so the older one is stale.
+const SIMULTANEOUS_DIAL: Duration = Duration::from_secs(5);
 
 /// A discovery server: a pkarr relay that devices publish signed records to, and the DNS
 /// origin those records are served under.
@@ -164,6 +168,7 @@ struct Peer {
     id: u64,
     conn: Connection,
     dialed: bool,
+    since: Instant,
     tx: mpsc::UnboundedSender<Cmd>,
 }
 
@@ -659,8 +664,10 @@ impl Inner {
         let mut st = lock(&self.state);
         let mut peers = lock(&self.peers);
         if let Some(existing) = peers.get(&peer) {
+            // In a simultaneous dial, both ends keep the connection the lower device id dialed.
             let preferred = self.me < peer;
-            let existing_wins = existing.conn.close_reason().is_none() && (existing.dialed == preferred || dialed != preferred);
+            let simultaneous = existing.dialed != dialed && existing.since.elapsed() < SIMULTANEOUS_DIAL;
+            let existing_wins = existing.conn.close_reason().is_none() && simultaneous && existing.dialed == preferred;
             if existing_wins {
                 return None;
             }
@@ -669,7 +676,7 @@ impl Inner {
             st.engine.disconnect(&peer);
         }
         let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
-        peers.insert(peer, Peer { id, conn: conn.clone(), dialed, tx });
+        peers.insert(peer, Peer { id, conn: conn.clone(), dialed, since: Instant::now(), tx });
         Some(id)
     }
 
