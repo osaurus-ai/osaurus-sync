@@ -106,6 +106,27 @@ pub enum Msg {
 }
 
 impl Msg {
+    /// Splits an `Events` message into messages of at most `n` events (other messages come
+    /// back whole), so a receiver can apply a large chunk in steps and let other work in
+    /// between. Only the final slice keeps `last`.
+    pub fn into_slices(self, n: usize) -> Vec<Msg> {
+        match self {
+            Msg::Events { scope, tag, events, last } if events.len() > n.max(1) => {
+                let mut events = events.into_iter().peekable();
+                let mut out = Vec::new();
+                while events.peek().is_some() {
+                    let slice: Vec<Vec<u8>> = events.by_ref().take(n.max(1)).collect();
+                    out.push(Msg::Events { scope, tag, events: slice, last: false });
+                }
+                if let Some(Msg::Events { last: l, .. }) = out.last_mut() {
+                    *l = last;
+                }
+                out
+            }
+            m => vec![m],
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         postcard::to_allocvec(self).expect("encoding to a Vec cannot fail")
     }
@@ -158,4 +179,29 @@ pub enum BlobResponse {
     Ok { size: u64 },
     NotFound,
     Denied,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slices_keep_order_and_last() {
+        let scope = ScopeId([1; 16]);
+        let events: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i]).collect();
+        let slices = Msg::Events { scope, tag: 7, events: events.clone(), last: true }.into_slices(4);
+        let mut seen = Vec::new();
+        let mut lasts = Vec::new();
+        for m in &slices {
+            let Msg::Events { tag, events, last, .. } = m else { panic!("not events") };
+            assert_eq!(*tag, 7);
+            assert!(events.len() <= 4);
+            seen.extend(events.iter().cloned());
+            lasts.push(*last);
+        }
+        assert_eq!(seen, events);
+        assert_eq!(lasts, [false, false, true]);
+        assert_eq!(Msg::Ack { hashes: vec![] }.into_slices(4).len(), 1);
+        assert_eq!(Msg::Events { scope, tag: 0, events: vec![vec![1]], last: false }.into_slices(4).len(), 1);
+    }
 }

@@ -70,7 +70,8 @@ impl DeviceCert {
     }
 
     pub fn verify(&self) -> bool {
-        crypto::verify(&self.user.0, &self.body(), &self.sig)
+        let body = self.body();
+        crypto::verify_memo(&[b"device-cert", &self.user.0, &body, &self.sig], || crypto::verify(&self.user.0, &body, &self.sig))
     }
 }
 
@@ -121,9 +122,12 @@ impl AgentBinding {
 
     pub fn verify(&self) -> bool {
         use k256::ecdsa::signature::Verifier;
-        let Ok(vk) = k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.agent.0) else { return false };
-        let Ok(sig) = k256::ecdsa::Signature::from_slice(&self.sig) else { return false };
-        vk.verify(&self.body(), &sig).is_ok()
+        let body = self.body();
+        crypto::verify_memo(&[b"agent-binding", &self.agent.0, &body, &self.sig], || {
+            let Ok(vk) = k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.agent.0) else { return false };
+            let Ok(sig) = k256::ecdsa::Signature::from_slice(&self.sig) else { return false };
+            vk.verify(&body, &sig).is_ok()
+        })
     }
 }
 

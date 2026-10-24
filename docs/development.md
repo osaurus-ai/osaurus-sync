@@ -72,11 +72,37 @@ Only regenerate the fixtures for a deliberate format change, and treat it as a b
 REGENERATE_FIXTURES=1 cargo test -p osaurus-sync-sim --test fixtures
 ```
 
+`crates/osaurus-sync-core/tests/fixtures/store-v1` is a data directory written by the last
+commit at store version 1, with its key store entries. `tests/upgrade.rs` opens it with the
+current code and checks that conversations, edits, reactions and attachments survive the
+migrations. When you add a migration (see `store.rs`), first freeze the outgoing version: check
+out the last commit at that version and run
+
+```sh
+OSAURUS_FIXTURE_OUT=/tmp/store-vN cargo test -p osaurus-sync-core --test upgrade write_fixture -- --ignored
+```
+
+then copy `/tmp/store-vN` (without `data/.lock`) to `tests/fixtures/store-vN` and add a test for
+it next to `opens_a_version_1_database`.
+
+### Scale tests
+
+```sh
+cargo test -p osaurus-sync-sim --release --test scale -- --ignored --nocapture --test-threads=1
+OSAURUS_SCALE=0.05 cargo test -p osaurus-sync-sim --release --test scale -- --ignored --nocapture
+```
+
+`scale.rs` syncs 100,000 messages in 1,000 conversations to 10 devices and stores 1 GB of
+attachments, printing write and sync times, memory, time to first view after a restart, search
+time and disk use. The assertions are loose (first view under 5 seconds, the attachment cache
+under its cap); the numbers are for watching trends in the nightly job summary. The full run
+takes about 10 minutes; `OSAURUS_SCALE` shrinks every count.
+
 ### Benchmarks
 
 ```sh
 cargo bench -p osaurus-sync-core --bench budgets    # local send, open conversation, cold start
-cargo bench -p osaurus-sync-net --bench network     # catch-up of 1,000 events, live delivery
+cargo bench -p osaurus-sync-net --bench network     # catch-up, live delivery, send during catch-up
 ```
 
 Each benchmark prints its median next to its budget. With `OSAURUS_BUDGETS=enforce`, a median over
@@ -167,6 +193,7 @@ installed device, so changes need care:
 | --- | --- |
 | Performance budgets (strict) | Both benchmark suites against the budgets themselves, with longer measurement |
 | Simulation | 2,000 simulation seeds in release |
+| Scale | The scale tests at full size; metrics go to the job summary |
 
 A strict budget failure on a shared runner is worth one re-run before treating it as a regression.
 

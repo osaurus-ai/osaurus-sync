@@ -34,6 +34,10 @@ pub enum SyncError {
     KeyStore { code: u32, detail: String },
     #[error("internal error: {detail}")]
     Internal { code: u32, detail: String },
+    #[error("the database is corrupt: {detail}")]
+    Corrupt { code: u32, detail: String },
+    #[error("the database is from a newer release: {detail}")]
+    NewerDatabase { code: u32, detail: String },
 }
 
 pub const KEY_STORE_CODE: u32 = 113;
@@ -55,7 +59,9 @@ impl SyncError {
             | SyncError::Pairing { code, .. }
             | SyncError::Closed { code, .. }
             | SyncError::KeyStore { code, .. }
-            | SyncError::Internal { code, .. } => *code,
+            | SyncError::Internal { code, .. }
+            | SyncError::Corrupt { code, .. }
+            | SyncError::NewerDatabase { code, .. } => *code,
         }
     }
 
@@ -84,7 +90,8 @@ impl From<CoreError> for SyncError {
             | CoreError::Malformed(s)
             | CoreError::Network(s)
             | CoreError::Pairing(s)
-            | CoreError::Internal(s) => s.clone(),
+            | CoreError::Internal(s)
+            | CoreError::Corrupt(s) => s.clone(),
             other => other.to_string(),
         };
         match e {
@@ -102,6 +109,8 @@ impl From<CoreError> for SyncError {
             CoreError::Pairing(_) => SyncError::Pairing { code, detail },
             CoreError::Closed => SyncError::Closed { code, detail },
             CoreError::Internal(_) => SyncError::Internal { code, detail },
+            CoreError::Corrupt(_) => SyncError::Corrupt { code, detail },
+            CoreError::NewerDatabase { .. } => SyncError::NewerDatabase { code, detail },
         }
     }
 }

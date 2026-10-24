@@ -40,3 +40,15 @@ jobs:
       - run: cargo test -p osaurus-sync-sim --release --locked --test invariants
         env:
           SIM_SEEDS: "2000"
+
+  scale:
+    name: Scale (100k messages, 1,000 scopes, 10 devices, 1 GB of attachments)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      # Metrics go to the job summary.
+      - run: cargo test -p osaurus-sync-sim --release --locked --test scale -- --ignored --nocapture --test-threads=1

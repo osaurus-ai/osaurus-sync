@@ -156,6 +156,10 @@ fn held_until_parents_arrive_and_garbage_rejected() {
     let control = a.events_by_ids(scope, &ids(true)).unwrap();
     assert!(matches!(b.ingest(&content[0]).unwrap(), IngestOutcome::NotJoined { .. }), "events for unjoined scopes are refused");
     b.join_scope(scope).unwrap();
+    let mut tampered = control[0].clone();
+    let n = tampered.len();
+    tampered[n - 1] ^= 1;
+    assert!(matches!(b.ingest(&tampered).unwrap(), IngestOutcome::Invalid(_)));
     for e in &content {
         assert!(matches!(b.ingest(e).unwrap(), IngestOutcome::Held { .. }));
     }
@@ -167,11 +171,9 @@ fn held_until_parents_arrive_and_garbage_rejected() {
     assert_eq!(b.all_hashes(scope).unwrap(), hashes);
 
     assert!(matches!(b.ingest(b"garbage").unwrap(), IngestOutcome::Invalid(_)));
-    let mut tampered = events[0].clone();
-    let n = tampered.len();
-    tampered[n - 1] ^= 1;
-    assert!(matches!(b.ingest(&tampered).unwrap(), IngestOutcome::Invalid(_)));
     assert!(matches!(b.ingest(&events[0]).unwrap(), IngestOutcome::Duplicate { .. }));
+    // A copy with a broken signature of an event already stored changes nothing.
+    assert!(matches!(b.ingest(&tampered).unwrap(), IngestOutcome::Duplicate { .. }));
 }
 
 #[test]

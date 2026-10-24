@@ -43,7 +43,7 @@ impl Replica {
             }
             Some(Control::DeviceRevoke(p)) => {
                 if p.device == self.device_key() {
-                    crate::store::set_meta(&self.db, "self_revoked", &[1])?;
+                    self.mark_self_revoked()?;
                     self.emit(Change::SelfRevoked);
                 }
                 let mine = self.db.query_row(

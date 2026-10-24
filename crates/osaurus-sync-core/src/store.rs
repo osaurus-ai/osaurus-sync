@@ -1,11 +1,16 @@
 //! SQLite schema. `events` is the source of truth; every view table is a cache rebuilt from it
 //! when `VIEW_VERSION` changes.
+//!
+//! Base tables can't be rebuilt, so they change only through numbered migrations: version 1 is
+//! `BASE_SCHEMA_V1`, and `MIGRATIONS[i]` takes a database from version `i + 1` to `i + 2`. A
+//! new database runs the same steps as an upgraded one. Never edit a shipped step; append one,
+//! bump `STORE_VERSION`, and freeze a fixture of the old version for `tests/upgrade.rs`.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
-pub const STORE_VERSION: i64 = 1;
+pub const STORE_VERSION: i64 = 1 + MIGRATIONS.len() as i64;
 pub const VIEW_VERSION: i64 = 1;
 
 pub mod status {
@@ -30,7 +35,7 @@ pub mod delivery {
     pub const REJECTED: i64 = 2;
 }
 
-const BASE_SCHEMA: &str = r#"
+const BASE_SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 
 CREATE TABLE IF NOT EXISTS events (
@@ -137,10 +142,6 @@ CREATE TABLE IF NOT EXISTS revoked_devices (device BLOB PRIMARY KEY, revoked_ms 
 -- User identities this device has rotated away from. Their certificates are no longer trusted.
 CREATE TABLE IF NOT EXISTS retired_users (user BLOB PRIMARY KEY, successor BLOB NOT NULL, retired_ms INTEGER NOT NULL);
 
--- Scopes this device left. Kept after the scope is purged so offers don't bring it back; an
--- invite clears it.
-CREATE TABLE IF NOT EXISTS left_scopes (scope BLOB PRIMARY KEY, left_ms INTEGER NOT NULL);
-
 CREATE TABLE IF NOT EXISTS blobs (
     hash BLOB PRIMARY KEY,
     size INTEGER NOT NULL,
@@ -171,6 +172,12 @@ CREATE TABLE IF NOT EXISTS invites_issued (
     expires_ms INTEGER NOT NULL
 );
 "#;
+
+const MIGRATIONS: &[&str] = &[
+    // 2: scopes this device left. Kept after the scope is purged so offers don't bring it back;
+    // an invite clears it.
+    "CREATE TABLE left_scopes (scope BLOB PRIMARY KEY, left_ms INTEGER NOT NULL);",
+];
 
 const VIEW_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS messages_view (
@@ -265,20 +272,58 @@ pub fn open(path: Option<&std::path::Path>) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Creates tables. Returns true when view tables were (re)created and must be rebuilt.
+/// The base-table version of a database, if it has one.
+pub fn store_version(conn: &Connection) -> Result<Option<i64>> {
+    if !has_table(conn, "meta")? {
+        return Ok(None);
+    }
+    meta_i64(conn, "store_version")
+}
+
+/// Creates or upgrades tables. Returns true when view tables were (re)created and must be
+/// rebuilt.
 pub fn migrate(conn: &Connection) -> Result<bool> {
-    let had_held = has_table(conn, "held")?;
-    let had_needs = has_table(conn, "held_needs")?;
-    if had_held && !has_column(conn, "held", "peer")? {
-        conn.execute_batch("ALTER TABLE held ADD COLUMN peer BLOB;")?;
+    let found = store_version(conn)?.unwrap_or(0);
+    if found > STORE_VERSION {
+        return Err(Error::NewerDatabase { found, supported: STORE_VERSION });
     }
-    conn.execute_batch(BASE_SCHEMA)?;
-    if !has_column(conn, "scopes", "tentative")? {
-        conn.execute_batch("ALTER TABLE scopes ADD COLUMN tentative INTEGER NOT NULL DEFAULT 0;")?;
+    if found <= 1 {
+        let had_held = has_table(conn, "held")?;
+        let had_needs = has_table(conn, "held_needs")?;
+        // Development databases from before version 1 was frozen.
+        if had_held && !has_column(conn, "held", "peer")? {
+            conn.execute_batch("ALTER TABLE held ADD COLUMN peer BLOB;")?;
+        }
+        conn.execute_batch(BASE_SCHEMA_V1)?;
+        if !has_column(conn, "scopes", "tentative")? {
+            conn.execute_batch("ALTER TABLE scopes ADD COLUMN tentative INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        if !had_needs {
+            // Held rows from before the index can't be released; peers send them again.
+            conn.execute_batch("DELETE FROM held;")?;
+        }
+        set_meta(conn, "store_version", &1i64.to_le_bytes())?;
     }
-    if !had_needs {
-        // Held rows from before the index can't be released; peers send them again.
-        conn.execute_batch("DELETE FROM held;")?;
+    for (i, step) in MIGRATIONS.iter().enumerate() {
+        let to = i as i64 + 2;
+        if found >= to {
+            continue;
+        }
+        // Each step commits with its version, so an interrupted upgrade resumes where it stopped.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let res = conn.execute_batch(step).and_then(|()| {
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('store_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [&to.to_le_bytes()[..]],
+            )
+        });
+        match res {
+            Ok(_) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
+        }
     }
     let view_version: Option<i64> = meta_i64(conn, "view_version")?;
     let rebuild = view_version != Some(VIEW_VERSION);
@@ -288,10 +333,45 @@ pub fn migrate(conn: &Connection) -> Result<bool> {
         }
     }
     conn.execute_batch(VIEW_SCHEMA)?;
-    set_meta(conn, "store_version", &STORE_VERSION.to_le_bytes())?;
     set_meta(conn, "view_version", &VIEW_VERSION.to_le_bytes())?;
     let had_events: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM events)", [], |r| r.get(0))?;
     Ok(rebuild && had_events)
+}
+
+/// Checks a database that may have been left mid-write. A damaged one is repaired when the
+/// damage is confined to view tables, which are caches: they're unlinked from the schema
+/// without reading their pages, `VACUUM` copies the base tables into a fresh file, and
+/// `migrate` rebuilds the views from `events`. Damage anywhere else is `Corrupt`. Returns the
+/// connection to use from then on.
+pub fn check_and_repair(conn: Connection, path: &std::path::Path) -> Result<Connection> {
+    let problems = integrity_problems(&conn)?;
+    if problems.is_empty() {
+        return Ok(conn);
+    }
+    tracing::warn!(?problems, "database failed its integrity check; rebuilding views");
+    let mut names: Vec<String> = VIEW_TABLES.iter().map(|t| format!("'{t}'")).collect();
+    names.push("'messages_fts_data'".into());
+    names.extend(["idx", "content", "docsize", "config"].iter().map(|s| format!("'messages_fts_{s}'")));
+    conn.execute_batch(&format!(
+        "PRAGMA writable_schema = ON; DELETE FROM sqlite_master WHERE tbl_name IN ({}); PRAGMA writable_schema = OFF;",
+        names.join(", ")
+    ))?;
+    drop(conn);
+    // A fresh connection, so the schema without the views is the one in use.
+    let conn = open(Some(path))?;
+    conn.execute_batch("VACUUM;")?;
+    let left = integrity_problems(&conn)?;
+    if !left.is_empty() {
+        return Err(Error::Corrupt(left.join("; ")));
+    }
+    set_meta(&conn, "view_version", &0i64.to_le_bytes())?;
+    Ok(conn)
+}
+
+fn integrity_problems(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA integrity_check(20)")?;
+    let rows: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    Ok(if rows.len() == 1 && rows[0] == "ok" { Vec::new() } else { rows })
 }
 
 fn has_table(conn: &Connection, table: &str) -> Result<bool> {

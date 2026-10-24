@@ -27,7 +27,7 @@ use n0_future::StreamExt;
 use osaurus_sync_core::Replica;
 use osaurus_sync_core::identity::AgentBinding;
 use osaurus_sync_core::ids::{AgentId, DeviceKey, EventId, ScopeId};
-use osaurus_sync_core::replica::InviteToken;
+use osaurus_sync_core::replica::{Checkpointer, InviteToken};
 use osaurus_sync_core::sync::{Counters, Engine, Msg, Notice, Out, PairingInvite};
 use osaurus_sync_core::types::{Change, IdentityRotation, PeerStatus, StreamState, SyncStatus};
 use tokio::sync::{Notify, mpsc};
@@ -43,6 +43,9 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const MAINTAIN_EVERY: Duration = Duration::from_secs(3600);
+const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
+/// Events applied per state-lock hold when a received chunk is large.
+const APPLY_SLICE: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Relays {
@@ -152,6 +155,7 @@ pub(crate) struct Inner {
     net: tokio::sync::Mutex<Option<Net>>,
     endpoint: Mutex<Option<Endpoint>>,
     listener: Arc<dyn Listener>,
+    checkpointer: Option<Checkpointer>,
     cfg: NetConfig,
     secret: [u8; 32],
     me: DeviceKey,
@@ -223,7 +227,8 @@ impl SyncNode {
 
     /// Wraps the replica without binding an endpoint. `resume` brings networking up. Network
     /// tasks run on `rt`, so every method may be called from any thread.
-    pub fn offline(replica: Replica, cfg: NetConfig, listener: Arc<dyn Listener>, rt: tokio::runtime::Handle) -> Self {
+    pub fn offline(mut replica: Replica, cfg: NetConfig, listener: Arc<dyn Listener>, rt: tokio::runtime::Handle) -> Self {
+        let checkpointer = replica.checkpointer().inspect_err(|e| warn!("background checkpoints unavailable: {e}")).ok();
         let secret = replica.device_secret().to_bytes();
         let me = replica.device_key();
         let inner = Arc::new(Inner {
@@ -244,6 +249,7 @@ impl SyncNode {
             memory: MemoryLookup::new(),
             agent_record: Mutex::new(None),
             streams: streams::Incoming::default(),
+            checkpointer,
             rt,
         });
         SyncNode { inner }
@@ -499,6 +505,9 @@ impl Inner {
         tasks.push(tokio::spawn(async move { me.dial_loop().await }));
         let me = self.clone();
         tasks.push(tokio::spawn(async move { me.maintain_loop().await }));
+        if let Some(cp) = self.checkpointer.clone() {
+            tasks.push(tokio::spawn(checkpoint_loop(cp)));
+        }
         *lock(&self.endpoint) = Some(endpoint.clone());
         *net = Some(Net { endpoint, router, tasks });
         drop(net);
@@ -712,21 +721,24 @@ impl Inner {
     async fn read_loop(self: Arc<Self>, peer: DeviceKey, recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
         while let Some(bytes) = frame::read(recv).await? {
             self.bytes_received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            let msg = Msg::decode(&bytes)?;
-            let me = self.clone();
-            let res = tokio::task::spawn_blocking(move || {
-                let mut st = lock(&me.state);
-                let State { replica, engine } = &mut *st;
-                let res = engine.handle(replica, peer, msg).map(|outs| me.route(outs));
-                (res, replica.take_changes())
-            })
-            .await?;
-            match res {
-                (Ok(notices), changes) => self.deliver(notices, changes),
-                (Err(e), changes) => {
-                    self.deliver(Vec::new(), changes);
-                    warn!(?peer, "protocol error: {e}");
-                    bail!("protocol error: {e}");
+            // Large chunks are applied in slices, releasing the state lock in between so local
+            // writes and reads don't wait for a whole catch-up chunk.
+            for msg in Msg::decode(&bytes)?.into_slices(APPLY_SLICE) {
+                let me = self.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    let mut st = lock(&me.state);
+                    let State { replica, engine } = &mut *st;
+                    let res = engine.handle(replica, peer, msg).map(|outs| me.route(outs));
+                    (res, replica.take_changes())
+                })
+                .await?;
+                match res {
+                    (Ok(notices), changes) => self.deliver(notices, changes),
+                    (Err(e), changes) => {
+                        self.deliver(Vec::new(), changes);
+                        warn!(?peer, "protocol error: {e}");
+                        bail!("protocol error: {e}");
+                    }
                 }
             }
         }
@@ -882,5 +894,16 @@ impl ProtocolHandler for SyncProtocol {
             debug!(?peer, "inbound session ended: {e:#}");
         }
         Ok(())
+    }
+}
+
+/// Checkpoints the WAL outside the state lock, so the fsync doesn't stall local writes.
+async fn checkpoint_loop(cp: Checkpointer) {
+    loop {
+        tokio::time::sleep(CHECKPOINT_EVERY).await;
+        let cp = cp.clone();
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || cp.run()).await {
+            debug!("checkpoint failed: {e}");
+        }
     }
 }

@@ -20,6 +20,8 @@ use rand_core::{RngCore, SeedableRng};
 
 pub const START_MS: u64 = 1_750_000_000_000;
 
+const APPLY_SLICE: usize = 3;
+
 pub struct Node {
     pub name: String,
     pub platform: Platform,
@@ -321,10 +323,16 @@ impl Sim {
         let msg = Msg::decode(&bytes).expect("frames decode");
         let close_after = self.closing.contains(&(from, to)) && self.queues[&(from, to)].is_empty();
         let peer = self.nodes[from].device();
-        let n = &mut self.nodes[to];
-        let outs = n.engine.handle(n.replica.as_mut().unwrap(), peer, msg).unwrap();
+        // Like the network node, apply large chunks in slices (small here, to exercise it).
+        for msg in msg.into_slices(APPLY_SLICE) {
+            if !self.is_linked(from, to) {
+                break;
+            }
+            let n = &mut self.nodes[to];
+            let outs = n.engine.handle(n.replica.as_mut().unwrap(), peer, msg).unwrap();
+            self.process(to, outs);
+        }
         self.delivered += 1;
-        self.process(to, outs);
         if close_after {
             self.disconnect(from, to);
         }

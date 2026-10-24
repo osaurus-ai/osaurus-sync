@@ -808,8 +808,10 @@ impl Engine {
     fn on_events(&mut self, r: &mut Replica, peer: DeviceKey, tag: u32, events: Vec<Vec<u8>>, last: bool, out: &mut Vec<Out>) -> Result<()> {
         let mut acks = Vec::new();
         let mut missing: HashMap<ScopeId, Vec<EventHash>> = HashMap::new();
-        for b in events {
-            match r.ingest_from(&b, Some(peer))? {
+        // One transaction per chunk: committing per event dominates the cost of a catch-up.
+        let outcomes = r.tx(|r| events.iter().map(|b| r.ingest_from(b, Some(peer))).collect::<Result<Vec<_>>>())?;
+        for outcome in outcomes {
+            match outcome {
                 IngestOutcome::Stored { hash, valid, .. } => {
                     if valid {
                         self.counters.applied += 1;
@@ -1053,20 +1055,25 @@ impl Engine {
             self.sessions.clear();
             return Ok(out);
         }
-        // Peers revoked while connected.
-        let revoked: Vec<DeviceKey> = self.sessions.keys().copied().filter(|p| r.is_device_revoked(p).unwrap_or(false)).collect();
-        for p in revoked {
-            out.push(Out::Send(p, Msg::Bye { reason: "revoked".into() }));
-            out.push(Out::Close(p, "revoked".into()));
-            self.sessions.remove(&p);
+        let fresh = r.take_new_events();
+        // Only control events change who may read what.
+        let control: Vec<bool> = fresh.iter().map(|(_, _, b)| is_control_event(b)).collect();
+        let membership_changed = control.contains(&true);
+        if membership_changed {
+            // Peers revoked while connected.
+            let revoked: Vec<DeviceKey> = self.sessions.keys().copied().filter(|p| r.is_device_revoked(p).unwrap_or(false)).collect();
+            for p in revoked {
+                out.push(Out::Send(p, Msg::Bye { reason: "revoked".into() }));
+                out.push(Out::Close(p, "revoked".into()));
+                self.sessions.remove(&p);
+            }
         }
 
-        let fresh = r.take_new_events();
         let mut touched: Vec<ScopeId> = Vec::new();
         let peers: Vec<DeviceKey> = self.sessions.iter().filter(|(_, s)| s.established && s.trusted).map(|(d, _)| *d).collect();
         let mut batches: BTreeMap<(DeviceKey, ScopeId), Vec<Vec<u8>>> = BTreeMap::new();
         let mut auth_cache: HashMap<(DeviceKey, ScopeId), bool> = HashMap::new();
-        for (scope, hash, bytes) in fresh {
+        for ((scope, hash, bytes), is_control) in fresh.into_iter().zip(control) {
             if !touched.contains(&scope) {
                 touched.push(scope);
             }
@@ -1083,7 +1090,7 @@ impl Engine {
                         v
                     }
                 };
-                if full || (is_control_event(&bytes) && r.may_read_control(scope, p)?) {
+                if full || (is_control && r.may_read_control(scope, p)?) {
                     batches.entry((*p, scope)).or_default().push(bytes.clone());
                 }
             }
@@ -1111,7 +1118,7 @@ impl Engine {
             out.push(Out::Send(p, Msg::Events { scope, tag: 0, events, last: true }));
         }
         // Membership may have changed: offer newly readable scopes.
-        if !touched.is_empty() {
+        if membership_changed || admitted {
             for p in &peers {
                 self.offer_new(r, *p, &mut out)?;
             }

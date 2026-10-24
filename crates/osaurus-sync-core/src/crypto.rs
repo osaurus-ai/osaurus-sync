@@ -26,6 +26,34 @@ pub fn verify(public: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
     vk.verify_strict(msg, &Signature::from_bytes(sig)).is_ok()
 }
 
+/// Signatures checked again and again (device certificates, every time a scope's membership
+/// is evaluated) are verified once per process. Only successes are remembered.
+pub fn verify_memo(digest_input: &[&[u8]], check: impl FnOnce() -> bool) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    const CAP: usize = 4096;
+    static SEEN: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
+    let mut h = blake3::Hasher::new();
+    for part in digest_input {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    let key = *h.finalize().as_bytes();
+    let seen = SEEN.get_or_init(Default::default);
+    if seen.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+        return true;
+    }
+    let ok = check();
+    if ok {
+        let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if s.len() >= CAP {
+            s.clear();
+        }
+        s.insert(key);
+    }
+    ok
+}
+
 fn cipher(key: &[u8; 32]) -> XChaCha20Poly1305 {
     XChaCha20Poly1305::new_from_slice(key).expect("32-byte key")
 }

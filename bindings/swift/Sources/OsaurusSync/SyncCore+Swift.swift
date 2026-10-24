@@ -16,6 +16,8 @@ public enum SyncErrorCode {
     public static let pairing: UInt32 = 111
     public static let closed: UInt32 = 112
     public static let keyStore: UInt32 = 113
+    public static let corrupt: UInt32 = 114
+    public static let newerDatabase: UInt32 = 115
     public static let internalError: UInt32 = 199
 }
 
@@ -26,7 +28,8 @@ extension SyncError {
              let .PermissionDenied(code, _), let .Crypto(code, _), let .Malformed(code, _),
              let .AlreadyOpen(code, _), let .DeviceRevoked(code, _), let .NoKey(code, _),
              let .Network(code, _), let .IncompatibleVersion(code, _), let .Pairing(code, _),
-             let .Closed(code, _), let .KeyStore(code, _), let .Internal(code, _):
+             let .Closed(code, _), let .KeyStore(code, _), let .Internal(code, _),
+             let .Corrupt(code, _), let .NewerDatabase(code, _):
             return code
         }
     }

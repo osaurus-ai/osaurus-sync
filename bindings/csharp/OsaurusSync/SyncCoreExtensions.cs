@@ -20,6 +20,8 @@ public static class SyncErrorCode
     public const uint Pairing = 111;
     public const uint Closed = 112;
     public const uint KeyStore = 113;
+    public const uint Corrupt = 114;
+    public const uint NewerDatabase = 115;
     public const uint Internal = 199;
 
     /// <summary>The stable code of any sync exception.</summary>
@@ -40,6 +42,8 @@ public static class SyncErrorCode
         SyncException.Closed x => x.code,
         SyncException.KeyStore x => x.code,
         SyncException.Internal x => x.code,
+        SyncException.Corrupt x => x.code,
+        SyncException.NewerDatabase x => x.code,
         _ => Internal,
     };
 }

@@ -208,6 +208,22 @@ directory. A lock file makes sure only one process opens a data directory at a t
 - **Every other table is a cache** rebuilt from `events`. When the view schema version changes,
   the view tables are dropped and replayed. The views are `messages_view`, `messages_fts`,
   `edits`, `tombstones`, `reactions` and `conversations_view`.
+- **Base tables change only through numbered migrations** (`store.rs`). Version 1 is the
+  original schema, and each later step runs in its own transaction that also records the new
+  version, so an interrupted upgrade resumes. New databases run the same steps. A database
+  from a newer release is refused with `NewerDatabase` rather than opened. A frozen version 1
+  data directory in `tests/fixtures/store-v1` is upgraded in CI.
+- **Crash check.** A `.unclean` marker file exists whenever the replica may have unflushed
+  writes; `flush` (on suspend and close) removes it, and the next write recreates it. Opening
+  with the marker present runs `PRAGMA integrity_check`. If it fails, the view tables are
+  unlinked from the schema without reading their pages, `VACUUM` copies the base tables into a
+  fresh file, and the views are rebuilt from `events`. If the base tables are damaged too,
+  opening fails with `Corrupt` and the app can offer `reset` and a fresh sync.
+- **Checkpoints.** SQLite's automatic WAL checkpoint runs inside whichever commit crosses the
+  threshold and ends in an fsync, which would stall local writes behind the replica's lock.
+  The network node instead runs a passive checkpoint every second from a second connection,
+  which doesn't block writers, and raises the automatic threshold to about 40 MB as a
+  backstop.
 - Supporting tables track DAG heads, held events, the outbox, peers, storage peers, known and
   revoked devices, retired users, blobs, Loro snapshots and read state. `left_scopes` remembers
   scopes this device left, so offers from its own devices don't bring them back; redeeming an
@@ -255,6 +271,14 @@ and applied by exactly the same code. A local write runs in one SQLite transacti
 5. Commit, then notify subscribers.
 
 Subscribers only hear about committed state, and a crash can't leave the views half-updated.
+
+Received events are applied in slices of at most 16 per lock hold, each slice in one
+transaction, so a local write waits at most for one slice during a large catch-up. An event
+whose hash is already stored is acknowledged as a duplicate before its signature is checked:
+the hash covers the signed bytes, so the stored copy is the authentic one, and peers resending
+what they have to every neighbour would otherwise spend most of a catch-up verifying
+duplicates. Device certificate checks are memoized per process for the same reason, since every
+membership evaluation re-checks them.
 
 ### Merge rules
 
@@ -527,7 +551,8 @@ Other layers of testing:
 
 ### Performance budgets
 
-`criterion` benchmarks check each budget. In CI, a median over budget fails the run.
+`criterion` benchmarks check each budget. In CI, a median (or, where stated, a percentile) over
+budget fails the run.
 
 | Operation | Budget | Measured (Apple M-series, median) |
 | --- | --- | --- |
@@ -536,6 +561,7 @@ Other layers of testing:
 | Cold start with 100 scopes | under 300 ms | 1.1 ms |
 | Catch-up of 1,000 events on a LAN | under 1 s | 367 ms (loopback, including reconnect) |
 | Live delivery to a connected peer | one round trip plus 10 ms | 0.42 ms |
+| Local send while catching up 10,000 events | under 5 ms (95th percentile) | 4.6 ms; 1.1 ms median |
 
 ## Out of scope for Phase 1
 

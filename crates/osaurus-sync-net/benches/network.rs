@@ -4,6 +4,7 @@
 //! | --- | --- |
 //! | Catch-up of 1,000 events on a LAN | under 1 s |
 //! | Live delivery to a connected peer | one round trip plus 10 ms |
+//! | Local send while catching up 10,000 events | under 5 ms at the 95th percentile |
 //!
 //! Catch-up is timed from resuming a suspended device to the last message reaching its view, so
 //! it includes reconnecting. Each benchmark prints its median against the budget. With
@@ -29,16 +30,21 @@ use tokio::runtime::Runtime;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 fn check_budget(name: &str, limit: Duration, samples: &mut [Duration]) {
+    check_percentile(name, 50, limit, samples);
+}
+
+fn check_percentile(name: &str, pct: usize, limit: Duration, samples: &mut [Duration]) {
     if samples.is_empty() {
         return;
     }
     samples.sort();
-    let median = samples[samples.len() / 2];
+    let median = samples[(samples.len() * pct / 100).min(samples.len() - 1)];
     // Shared CI runners are noisy; they enforce a multiple of the budget, and nightly the budget.
     let slack: f64 = std::env::var("OSAURUS_BUDGET_SLACK").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let limit = limit.mul_f64(slack.max(1.0));
     let ok = median <= limit;
-    eprintln!("budget {name}: median {median:?}, limit {limit:?}: {}", if ok { "ok" } else { "OVER BUDGET" });
+    let what = if pct == 50 { "median".to_string() } else { format!("p{pct}") };
+    eprintln!("budget {name}: {what} {median:?} of {} samples, limit {limit:?}: {}", samples.len(), if ok { "ok" } else { "OVER BUDGET" });
     assert!(ok || std::env::var("OSAURUS_BUDGETS").as_deref() != Ok("enforce"), "{name} is over budget");
 }
 
@@ -165,5 +171,39 @@ fn live_delivery(c: &mut Criterion) {
     check_budget("live delivery to a connected peer", Duration::from_millis(11), &mut samples);
 }
 
-criterion_group!(benches, catch_up, live_delivery);
+/// Local sends on a device while it applies a large catch-up. Runs once rather than under
+/// criterion's sampling: the catch-up itself is the setup.
+fn send_during_catch_up(_: &mut Criterion) {
+    let p = paired();
+    let local = p.pc.write(|r| r.create_scope(ScopeKind::Conversation, "Local")).unwrap();
+    p.rt.block_on(p.pc.suspend()).unwrap();
+    let scope = p.mac.write(|r| r.create_scope(ScopeKind::Conversation, "Big")).unwrap();
+    let mut last = None;
+    for i in 0..10_000 {
+        last = Some(p.mac.write(|r| r.send_message(scope, NewMessage::text(MessageRole::User, format!("message {i}")))).unwrap());
+    }
+    while p.pc_added.try_recv().is_ok() {}
+    let last = last.unwrap();
+
+    p.rt.block_on(p.pc.resume()).unwrap();
+    p.pc.add_peer_addr(p.mac.addr().unwrap());
+    p.mac.add_peer_addr(p.pc.addr().unwrap());
+    p.pc.sync_now();
+    let mut samples = Vec::new();
+    let deadline = Instant::now() + TIMEOUT * 4;
+    let mut done = false;
+    while !done {
+        assert!(Instant::now() < deadline, "catch-up did not finish");
+        let t = Instant::now();
+        p.pc.write(|r| r.send_message(local, NewMessage::text(MessageRole::User, "typing"))).unwrap();
+        samples.push(t.elapsed());
+        while let Ok(id) = p.pc_added.try_recv() {
+            done |= id == last;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    check_percentile("local send while catching up 10,000 events", 95, Duration::from_millis(5), &mut samples);
+}
+
+criterion_group!(benches, catch_up, live_delivery, send_during_catch_up);
 criterion_main!(benches);

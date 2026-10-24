@@ -31,6 +31,12 @@ pub enum Error {
     Closed,
     #[error("internal error: {0}")]
     Internal(String),
+    /// The database failed its integrity check and couldn't be repaired from the event log.
+    #[error("the database is corrupt: {0}")]
+    Corrupt(String),
+    /// The data directory was written by a newer release; opening it would lose data.
+    #[error("the database is from a newer release (store version {found}, this release supports {supported})")]
+    NewerDatabase { found: i64, supported: i64 },
 }
 
 impl Error {
@@ -51,13 +57,19 @@ impl Error {
             Error::Pairing(_) => 111,
             Error::Closed => 112,
             Error::Internal(_) => 199,
+            Error::Corrupt(_) => 114,
+            Error::NewerDatabase { .. } => 115,
         }
     }
 }
 
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
-        Error::Storage(e.to_string())
+        use rusqlite::ErrorCode;
+        match e.sqlite_error_code() {
+            Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => Error::Corrupt(e.to_string()),
+            _ => Error::Storage(e.to_string()),
+        }
     }
 }
 

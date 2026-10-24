@@ -4,6 +4,7 @@
 //! are validated and applied by exactly the same code.
 
 mod apply;
+mod checkpoint;
 mod compact;
 mod data;
 mod loro_docs;
@@ -34,6 +35,7 @@ use crate::payload::{self, Content, Control};
 use crate::store::{self, status};
 use crate::types::{Change, HistoryMode};
 
+pub use checkpoint::Checkpointer;
 pub use compact::{Compaction, PointInTimeView};
 pub use data::{ExportSummary, StorageUsage};
 pub use loro_docs::LoroCache;
@@ -66,6 +68,9 @@ impl SecretStore for MemorySecretStore {
     }
 }
 
+/// Present while the replica may have unflushed writes. Found at open, it means the last run
+/// didn't shut down cleanly, and the database is checked before use.
+const UNCLEAN: &str = ".unclean";
 pub const DEVICE_SECRET: &str = "device-key";
 pub const USER_SECRET: &str = "user-secret";
 /// A rotated user secret, written before the rotation commits and promoted after.
@@ -171,6 +176,13 @@ pub struct Replica {
     pending_changes: Vec<Change>,
     new_events: Vec<(ScopeId, EventHash, Vec<u8>)>,
     pending_events: Vec<(ScopeId, EventHash, Vec<u8>)>,
+    checkpointer: Checkpointer,
+    /// Mirrors the `self_revoked` meta row, which every poll checks.
+    self_revoked: bool,
+    /// Whether the unclean-shutdown marker is on disk.
+    unclean_marked: bool,
+    /// Whether a scope this device left may still be waiting to be purged.
+    pub(crate) leaving: bool,
     _lock: Option<File>,
 }
 
@@ -202,7 +214,12 @@ impl Replica {
             }
         };
 
-        let db = store::open(Some(&db_path))?;
+        let mut db = store::open(Some(&db_path))?;
+        let unclean = cfg.data_dir.join(UNCLEAN);
+        if unclean.exists() {
+            db = store::check_and_repair(db, &db_path)?;
+        }
+        File::create(&unclean)?;
         let initialized: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')", [], |r| r.get(0))?;
         let restored = initialized && store::meta(&db, "device_pub")?.is_some_and(|stored| stored != device.public().0);
         let rebuild = store::migrate(&db)?;
@@ -275,8 +292,13 @@ impl Replica {
             pending_changes: Vec::new(),
             new_events: Vec::new(),
             pending_events: Vec::new(),
+            checkpointer: Checkpointer::new(db_path),
+            self_revoked: false,
+            unclean_marked: true,
+            leaving: true,
             _lock: Some(lock),
         };
+        r.self_revoked = store::meta(&r.db, "self_revoked")?.is_some();
         r.upsert_known_device(&r.cert.clone())?;
         if rebuild {
             r.rebuild_all_views()?;
@@ -353,8 +375,20 @@ impl Replica {
         self.user.phrase()
     }
 
+    /// The database connection, for tests that inspect or damage it.
+    #[doc(hidden)]
+    pub fn db_for_tests(&self) -> &Connection {
+        &self.db
+    }
+
     pub fn is_self_revoked(&self) -> bool {
-        store::meta(&self.db, "self_revoked").ok().flatten().is_some()
+        self.self_revoked
+    }
+
+    pub(crate) fn mark_self_revoked(&mut self) -> Result<()> {
+        store::set_meta(&self.db, "self_revoked", &[1])?;
+        self.self_revoked = true;
+        Ok(())
     }
 
     /// Drains view diffs produced by committed transactions.
@@ -376,6 +410,10 @@ impl Replica {
     pub(crate) fn tx<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if self.in_tx {
             return f(self);
+        }
+        if !self.unclean_marked {
+            File::create(self.cfg.data_dir.join(UNCLEAN))?;
+            self.unclean_marked = true;
         }
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         self.in_tx = true;
@@ -409,6 +447,7 @@ impl Replica {
         self.keys.clear();
         self.loro.clear();
         self.recovery_checked.clear();
+        self.self_revoked = store::meta(&self.db, "self_revoked").ok().flatten().is_some();
     }
 
     /// Flushes Loro snapshots and checkpoints the WAL. Called on clean shutdown and when an iOS
@@ -416,11 +455,16 @@ impl Replica {
     pub fn flush(&mut self) -> Result<()> {
         self.snapshot_all_loro()?;
         self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        match std::fs::remove_file(self.cfg.data_dir.join(UNCLEAN)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => self.unclean_marked = false,
+        }
         Ok(())
     }
 
     /// Flushes and releases the data directory lock so another instance may open it.
     pub fn close(&mut self) -> Result<()> {
+        self.checkpointer.close();
         self.flush()?;
         self._lock = None;
         Ok(())

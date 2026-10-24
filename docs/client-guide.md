@@ -541,6 +541,8 @@ a stable numeric code. Map codes to user-facing text, and use `detail` only for 
 | 111 | `pairing` | Pairing failed |
 | 112 | `closed` | The core was closed |
 | 113 | `keyStore` | The key store callback failed |
+| 114 | `corrupt` | The database is damaged beyond repair; offer `reset` and sync again from other devices |
+| 115 | `newerDatabase` | The data directory was written by a newer release; ask the user to update |
 | 199 | `internal` | A bug; please report it |
 
 ```swift

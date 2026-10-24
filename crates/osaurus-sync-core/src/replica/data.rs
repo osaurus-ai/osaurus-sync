@@ -80,6 +80,7 @@ impl Replica {
         }
         self.db.execute("INSERT OR REPLACE INTO left_scopes(scope, left_ms) VALUES (?, ?)", rusqlite::params![&scope.0[..], self.env.now_ms() as i64])?;
         if tell {
+            self.leaving = true;
             self.finish_leaving()?;
         } else {
             self.purge_scope(scope)?;
@@ -94,18 +95,25 @@ impl Replica {
 
     /// Purges left scopes whose removal another device has acknowledged. Returns how many.
     pub(crate) fn finish_leaving(&mut self) -> Result<u32> {
+        if !self.leaving {
+            return Ok(0);
+        }
         let scopes: Vec<Vec<u8>> = {
             let mut stmt = self.db.prepare_cached("SELECT scope FROM left_scopes WHERE scope IN (SELECT scope FROM scopes)")?;
             stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
         };
         let mut n = 0;
+        let mut waiting = false;
         for s in scopes {
             let Some(scope) = ScopeId::from_slice(&s) else { continue };
             if self.pending_outbox(scope)? == 0 {
                 self.purge_scope(scope)?;
                 n += 1;
+            } else {
+                waiting = true;
             }
         }
+        self.leaving = waiting;
         Ok(n)
     }
 
@@ -195,6 +203,7 @@ impl Replica {
     /// Signs this device out for good: deletes its key store entries and its data directory.
     /// The replica is unusable afterwards. Other devices keep their data.
     pub fn wipe(&mut self) -> Result<()> {
+        self.checkpointer.close();
         let _ = self.flush();
         // Release the database files so they can be deleted (Windows refuses open files).
         self.db = Connection::open_in_memory()?;
@@ -204,7 +213,7 @@ impl Replica {
             self.secrets.delete(name)?;
         }
         let dir = self.cfg.data_dir.clone();
-        for f in ["sync.db", "sync.db-wal", "sync.db-shm", ".lock"] {
+        for f in ["sync.db", "sync.db-wal", "sync.db-shm", super::UNCLEAN, ".lock"] {
             match fs::remove_file(dir.join(f)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
                 _ => {}

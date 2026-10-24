@@ -75,14 +75,20 @@ impl Replica {
             }
             Decoded::Known(e) => e,
         };
-        if !e.verify_signature() {
-            return Ok(IngestOutcome::Invalid("bad signature".into()));
-        }
         let hash = e.hash();
         let scope = e.scope;
         let author = e.author;
         if !self.scope_exists(scope)? {
             return Ok(IngestOutcome::NotJoined { scope });
+        }
+        // The hash covers the signed bytes, so a stored hash is this event, already verified.
+        // Peers resend what they have to every neighbour; skipping the check here is most of
+        // the cost of a catch-up among several devices.
+        if self.event_exists(&hash)? {
+            return Ok(IngestOutcome::Duplicate { hash });
+        }
+        if !e.verify_signature() {
+            return Ok(IngestOutcome::Invalid("bad signature".into()));
         }
         let held: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM held WHERE hash = ?)", [&hash.0[..]], |r| r.get(0))?;
         if held {
