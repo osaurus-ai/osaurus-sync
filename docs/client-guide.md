@@ -6,7 +6,8 @@ Swift and C# side by side. For package setup and platform-specific notes, see:
 - [Swift package (macOS and iOS)](../bindings/swift/README.md)
 - [C# package (Windows)](../bindings/csharp/README.md)
 
-For how the library works inside, see the [architecture](architecture.md) doc.
+For how the library works inside, see the [architecture](architecture.md) doc. For the servers
+the apps connect to, see [deployment](deployment.md).
 
 ## Concepts
 
@@ -19,6 +20,32 @@ For how the library works inside, see the [architecture](architecture.md) doc.
   cursors) and a `timestampMs` derived from it for display.
 - **Local first.** Reads and writes go to the local database and return right away. Sync happens
   in the background, and changes from other devices arrive through subscriptions.
+
+## Known limitations
+
+These hold for the current release. Design the UI around them rather than hiding them.
+
+- **Devices only sync while another device that has the changes is online.** There's no
+  always-on peer yet. With two devices, a message sent on the phone reaches the Mac only once
+  both are online at the same time. Show `delivery = pending` on messages that no other device
+  has acknowledged yet, and avoid copy that promises the message "synced". `syncStatus` reports
+  `pendingOutbox` per scope.
+- **History only grows.** Compaction waits for a storing peer, so nothing is compacted until a
+  storage server exists. Show `storageUsage()` in settings, and offer `leaveConversation` for
+  conversations the user wants gone from this device.
+- **Some extra traffic.** A device pulling from several peers at once can fetch some events more
+  than once. Duplicates are discarded and counted (`diagnostics().counters`); only bandwidth is
+  wasted.
+- **Views are stored in plaintext.** Events are encrypted on disk, but the views the app reads
+  (titles, message text, the search index) aren't. The protection is the OS: FileVault, iOS data
+  protection and BitLocker, plus per-user file permissions. Keep the data directory inside the
+  app's own container or the user's profile.
+- **iOS keeps recent history by default.** The last 90 days sync; older messages arrive when the
+  user scrolls past `atSyncBoundary` and the app calls `requestHistory`. Desktop apps keep
+  everything.
+- **No servers are configured by default.** Without relays and a discovery server, devices sync
+  only on the same network. See [Network configuration](#network-configuration) and the
+  [deployment](deployment.md) doc.
 
 ## Opening the core
 
@@ -535,8 +562,9 @@ let core = try SyncCore.open(dataDirectory: dir, deviceName: name, network: net)
 | `bindPort` | 0 picks any port |
 
 - **`n0PublicNetworkConfig()`** uses number0's public relays and discovery server. It's
-  convenient for development, but they're shared, rate limited and not run for Osaurus, so
-  don't ship it.
+  convenient for development and beta builds, but they're shared, rate limited and not run for
+  Osaurus, so don't ship it. The [deployment](deployment.md) doc covers running your own
+  servers and rolling them out.
 - **`localNetworkConfig()`** also turns off mDNS. Use it for tests, and connect devices with
   `localAddress()` and `addPeerAddress(address:)`.
 - Devices find each other by device id. Without a discovery server, a device that isn't on the
@@ -597,6 +625,78 @@ catch let e as SyncError where e.code == SyncErrorCode.permissionDenied { showRe
 try { core.SendMessage(scope, OsaurusSync.Text(text)); }
 catch (SyncException e) when (SyncErrorCode.CodeOf(e) == SyncErrorCode.PermissionDenied) { ShowReadOnlyBanner(); }
 ```
+
+## Integration checklist
+
+Before handing a build to testers, check that the app:
+
+- [ ] **Opens one core per process** at startup, keeps it for the life of the process, and calls
+      `close()` on exit. A second instance of the app gets `alreadyOpen`; handle it (for
+      example, by bringing the first instance forward on Windows).
+- [ ] **Uses the platform key store** (`KeychainKeyStore`, `DpapiKeyStore`), or a custom one
+      that throws `keyStore` on read errors and returns nil only for a missing item.
+- [ ] **Retries open after a `keyStore` error** on iOS once protected data becomes available,
+      rather than treating it as fatal.
+- [ ] **Follows the app lifecycle.** On iOS, start `SyncLifecycle`. On desktop, call `suspend()`
+      on sleep and `resume()` on wake.
+- [ ] **Calls `syncNow()`** when the network comes back and when the app becomes active.
+- [ ] **Reads the network configuration from remote configuration**, with a bundled default.
+      See the [deployment](deployment.md#client-configuration) doc.
+- [ ] **Sets the iOS Info.plist keys** for local network discovery, and sets `mdns = false` if the
+      user declines the permission.
+- [ ] **Shows the recovery phrase** during setup, and again after `revokeAndRotate`.
+- [ ] **Handles the core events:** reloads on `identityChanged`, stops sync UI on `selfRevoked`,
+      prompts for the phrase on `recoveryAvailable`, suggests updating on `incompatiblePeer`,
+      refreshes the device list on `devicesChanged` and `peerRevoked`, and reports
+      `pairingFailed` to the user.
+- [ ] **Reloads a scope on `reset`** changes, and hops to the UI thread in every callback.
+- [ ] **Maps error codes** to user-facing messages, and logs `detail` only.
+- [ ] **Shows connection state** from `diagnostics().peers` (connected, relayed) and pending
+      messages from `delivery`.
+- [ ] **Installs a log listener** at startup and offers `supportBundle()` from a settings or help
+      screen.
+- [ ] **Shows storage use** (`storageUsage()`) and offers sign-out with `reset()`.
+
+## Troubleshooting
+
+**Devices don't find each other.**
+
+- Check that they're paired: each device should list the other in `devices()`.
+- On the same network, discovery uses mDNS. On iOS, check the Info.plist keys and the local
+  network permission (**Settings > Privacy & Security > Local Network**). On Windows, check that
+  the firewall prompt was accepted for private networks. Some guest and corporate networks block
+  mDNS; relays still work there.
+- On different networks, both devices need relays and the same discovery server. Check
+  `diagnostics().homeRelays`: at least one should be `connected`. If the list is empty, no relays
+  are configured.
+
+**Connections are always relayed.** `relayed` is normal on cellular and behind some NATs. On a
+shared network, a relayed connection usually means a firewall is blocking UDP between the
+devices. Relayed sync works, with more latency.
+
+**Messages stay `pending`.** No other device has acknowledged them yet, usually because no other
+device of the user's is online. Check `syncStatus(scope:).peers` and `diagnostics().peers`.
+
+**Older history doesn't arrive.** Check `syncStatus(scope:).backfillComplete` and
+`diagnostics().backfillPaused`. `BackfillPolicyMonitor` pauses backfill in Low Power Mode and on
+cellular, hotspot and Low Data Mode connections. On iOS, older ranges also need
+`requestHistory` (see [History and backfill](#history-and-backfill)).
+
+**Open fails.**
+
+| Error | Likely cause | What to do |
+| --- | --- | --- |
+| `keyStore` | iOS before the first unlock after a reboot, or a DPAPI file from another Windows user | Open again after unlock; for DPAPI, see the [C# README](../bindings/csharp/README.md#keys) |
+| `alreadyOpen` | Another instance of the app, or an extension, has the data directory | Use one process per data directory |
+| `incompatibleVersion` | The bindings and the native library come from different builds | Use the Swift package or `.nupkg` from one release, unmodified |
+| `newerDatabase` | The data directory was written by a newer release | Ask the user to update |
+| `corrupt` | The database is damaged | Offer `reset()`; the data syncs back from other devices |
+
+**A device is turned away.** `peerRejected` means a device that isn't this user's, or a member's,
+tried to sync. After a `reset()` on one device, it's a new device: pair it again, and revoke the
+old entry from another device.
+
+For anything else, collect `supportBundle()` from each device involved.
 
 ## Testing your integration
 

@@ -9,6 +9,39 @@ development on a Mac, under `runtimes/<rid>/native`. .NET picks the right one at
 For the full API (reading, writing, subscriptions, streaming, pairing, errors), see the
 [client guide](https://github.com/osaurus-ai/osaurus-sync/blob/main/docs/client-guide.md).
 
+## Installing
+
+Final releases are pushed to NuGet as `Osaurus.Sync`:
+
+```sh
+dotnet add package Osaurus.Sync
+```
+
+Prereleases are only attached to the GitHub release. Download the `.nupkg` into a folder and add
+that folder as a package source:
+
+```sh
+gh release download v0.1.0-beta.1 -R osaurus-ai/osaurus-sync -p '*.nupkg' -D packages
+dotnet nuget add source "$PWD/packages" --name osaurus-local
+dotnet add package Osaurus.Sync --version 0.1.0-beta.1
+```
+
+To keep the source with the project, use a `nuget.config` next to the solution instead:
+
+```xml
+<configuration>
+  <packageSources>
+    <add key="osaurus-local" value="packages" />
+  </packageSources>
+</configuration>
+```
+
+NuGet caches packages by version, so a rebuilt package with the same version needs
+`dotnet nuget locals all --clear` before it's picked up.
+
+Prerelease DLLs aren't code-signed. Windows SmartScreen and some antivirus products may warn
+about an app that loads them; final releases are signed with Authenticode.
+
 ## Quick start
 
 ```csharp
@@ -86,7 +119,9 @@ catch (SyncException e) when (SyncErrorCode.CodeOf(e) == SyncErrorCode.AlreadyOp
 ## Networking
 
 Discovery uses mDNS on the LAN and, if the app sets a discovery server and relays in
-`NetworkConfig`, DNS for known devices elsewhere with relays as a fallback. The
+`NetworkConfig`, DNS for known devices elsewhere with relays as a fallback. For development and
+beta builds, `OsaurusSyncFfiMethods.N0PublicNetworkConfig()` uses number0's public servers;
+don't ship it (see [deployment](https://github.com/osaurus-ai/osaurus-sync/blob/main/docs/deployment.md)). The
 first launch may show a Windows Firewall prompt for UDP on private networks. Accept it so that
 devices on the same LAN can connect directly. Otherwise they connect through a relay, which
 works but is slower. `core.Diagnostics()` shows whether each connection is direct or relayed.

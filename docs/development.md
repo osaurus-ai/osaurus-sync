@@ -33,7 +33,7 @@ bindings/
 fuzz/                   cargo-fuzz targets (separate crate, nightly)
 scripts/                build, binding generation, packaging, notices, SBOM, fuzzing, simulator helpers
 tests/fixtures/         signed events from earlier builds (compatibility)
-docs/                   architecture, client guide, threat model, this file
+docs/                   architecture, client guide, deployment, threat model, this file
 deny.toml, about.toml   dependency policy and the notices configuration
 ```
 
@@ -178,9 +178,10 @@ installed device, so changes need care:
   next open.
 - Add a fixture for the new format, and keep the old fixtures passing.
 
-Until the first tagged release, `API_VERSION` and `PROTOCOL_VERSION` stay at 1 and
-incompatible changes don't bump them, since no installed build needs to interoperate. From the
-first release on, the rules above apply.
+The rules above, and the `API_VERSION` rule in [Changing the exported API](#changing-the-exported-api),
+apply from `v0.1.0-beta.1` on. Beta builds are installed on testers' devices, which must keep
+syncing with each other and opening their existing data directories, so prereleases follow the
+same rules as final releases. Both versions are 1 in `v0.1.0-beta.1`.
 
 ## Fuzzing
 
@@ -330,25 +331,43 @@ Releases are cut by pushing a tag. `.github/workflows/release.yml` then:
 
 1. Builds the XCFramework in release, runs the Swift tests, zips it and computes its SwiftPM
    checksum.
-2. Writes the distributable Swift package (`scripts/make-swift-package.sh`): the sources with
-   the generated bindings, and a `binaryTarget(url:checksum:)` pointing at the release asset.
+2. Writes two distributable Swift packages (`scripts/make-swift-package.sh`), both with the
+   sources and the generated bindings:
+   - `OsaurusSync-swift-<version>.zip`, with a `binaryTarget(url:checksum:)` pointing at the
+     release asset. This is what goes to the distribution repository.
+   - `OsaurusSync-swift-local-<version>.zip`, with the XCFramework inside and a
+     `binaryTarget(path:)`. CI builds it with `swift build` before zipping. Apps add it as a
+     local package, which works while the repository and its releases are private.
 3. Builds the `win-x64` and `win-arm64` DLLs on native runners, runs the xUnit tests on each,
    and signs both with Authenticode (`signtool`, SHA-256, RFC 3161 timestamp), verifying the
    signatures.
-4. Packs `Osaurus.Sync` with the tag's version and both signed DLLs plus `osx-arm64`.
-5. Creates the GitHub release with the XCFramework zip, its checksum, the Swift package zip and
-   the `.nupkg`; pushes the package to NuGet; and, if configured, commits the Swift package to
-   the distribution repository and tags it with the bare version (SwiftPM ignores a `v`
-   prefix).
+4. Packs `Osaurus.Sync` with the tag's version and both DLLs plus `osx-arm64`.
+5. Creates the GitHub release with the XCFramework zip, its checksum, both Swift package zips,
+   the `.nupkg`, the notices and the SBOMs; pushes the package to NuGet; and, if configured,
+   commits the Swift package to the distribution repository and tags it with the bare version
+   (SwiftPM ignores a `v` prefix).
+
+**Prereleases** are tags with a suffix, such as `v0.1.0-beta.1`. The GitHub release is marked
+as a prerelease, and two requirements are relaxed so a prerelease can be cut before the release
+secrets exist:
+
+- Without `WINDOWS_SIGNING_CERT`, the DLLs are published unsigned, with a warning.
+- Without `NUGET_API_KEY`, the NuGet push is skipped, with a warning; the `.nupkg` is still on
+  the GitHub release.
+
+A final release (no suffix) fails if either is missing. The Swift distribution job runs for
+both, and only when `SWIFT_DIST_REPO` is set.
 
 To cut a release:
 
 1. Check that CI and the latest nightly passed on the commit, and run the
    [device validation](#device-validation) checklists on its build.
-2. Update the crate versions in `Cargo.toml` if they changed, and note breaking API or wire
-   changes (`API_VERSION`, protocol version) in the release notes.
-3. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`. Use a suffix such as
-   `v0.2.0-beta.1` for a prerelease; the GitHub release is marked as one.
+2. Run the workflow by hand as a dry run on the commit (see below), and check its artifacts.
+3. Update the crate versions in `Cargo.toml` and the `<Version>` in `OsaurusSync.csproj` if
+   they changed, add an entry to [`CHANGELOG.md`](../CHANGELOG.md), and note breaking API or
+   wire changes (`API_VERSION`, protocol version) there.
+4. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`. Use a suffix such as
+   `v0.2.0-beta.1` for a prerelease.
 
 Run the workflow by hand (**Actions > Release > Run workflow**) for a dry run: it builds,
 tests and packs everything as workflow artifacts, signs only if the certificate is configured,
@@ -358,12 +377,31 @@ The publishing jobs run in the `release` environment, so it can require approval
 
 | Name | Kind | Purpose |
 | --- | --- | --- |
-| `WINDOWS_SIGNING_CERT` | Secret | Base64 of the code-signing `.pfx`. Required for a tagged release |
+| `WINDOWS_SIGNING_CERT` | Secret | Base64 of the code-signing `.pfx`. Required for a final release |
 | `WINDOWS_SIGNING_PASSWORD` | Secret | The `.pfx` password |
-| `NUGET_API_KEY` | Secret | Push key for `Osaurus.Sync` |
+| `NUGET_API_KEY` | Secret | Push key for `Osaurus.Sync`. Required for a final release |
 | `NUGET_SOURCE` | Variable | Optional feed URL; defaults to nuget.org |
 | `SWIFT_DIST_REPO` | Variable | Optional `owner/name` of the Swift distribution repository, such as `osaurus-ai/osaurus-sync-swift` |
 | `SWIFT_DIST_TOKEN` | Secret | A token that can push to that repository |
 
 If the signing key lives in an HSM or a cloud signing service rather than a `.pfx`, replace the
 Authenticode step with that service's signing action; the rest of the pipeline is unchanged.
+
+### Consuming a prerelease
+
+The repository is private, so client apps take prereleases from the GitHub release with the
+GitHub CLI rather than from a package registry:
+
+```sh
+gh release download v0.1.0-beta.1 -R osaurus-ai/osaurus-sync \
+  -p 'OsaurusSync-swift-local-*.zip' -p '*.nupkg'
+```
+
+- **Swift:** unzip the local package and add it as a local package. See
+  [Adding the package](../bindings/swift/README.md#adding-the-package).
+- **C#:** add the folder holding the `.nupkg` as a NuGet source. See
+  [Installing](../bindings/csharp/README.md#installing).
+
+The Swift package and the `.nupkg` from one release are built from the same commit, so the Mac,
+iOS and Windows apps should move to a new release together. Builds from different releases still
+sync as long as `PROTOCOL_VERSION` matches.

@@ -9,16 +9,39 @@ writing, subscriptions, streaming, pairing, errors), see the
 
 ## Adding the package
 
-**From a release.** Each release publishes the package with the generated bindings and a
-`binaryTarget` that downloads the XCFramework by URL and checksum. Add the distribution
-repository by version:
+**From a release, as a local package.** Each GitHub release has
+`OsaurusSync-swift-local-<version>.zip`: the package with the generated bindings and the
+XCFramework inside, so it needs no download at build time. This is the way to use prereleases,
+because the main repository is private and SwiftPM can't fetch its release assets.
+
+```sh
+gh release download v0.1.0-beta.1 -R osaurus-ai/osaurus-sync -p 'OsaurusSync-swift-local-*.zip'
+unzip OsaurusSync-swift-local-0.1.0-beta.1.zip -d Vendor     # creates Vendor/OsaurusSync
+```
+
+Add `Vendor/OsaurusSync` in Xcode with **File > Add Package Dependencies > Add Local**, or from
+another package:
+
+```swift
+.package(path: "Vendor/OsaurusSync")
+```
+
+and link the `OsaurusSync` library. The XCFramework is large (static libraries for three
+slices), so either keep `Vendor/OsaurusSync` out of the app's git history and fetch it in a
+setup script, or track it with Git LFS. To update, replace the folder with the new release's.
+
+**From the distribution repository.** Once a distribution repository is configured (see
+[Releasing](https://github.com/osaurus-ai/osaurus-sync/blob/main/docs/development.md#releasing)),
+the release workflow pushes each release's package to it, with a `binaryTarget` that downloads
+the XCFramework by URL and checksum. The XCFramework URL points at the main repository's
+release, so the download only works without credentials once those releases are public. Then
+depend on it by version:
 
 ```swift
 .package(url: "https://github.com/osaurus-ai/osaurus-sync-swift", from: "0.1.0")
 ```
 
-and link the `OsaurusSync` library. Without the distribution repository, unzip
-`OsaurusSync-swift-<version>.zip` from the GitHub release and add the folder as a local package.
+The `OsaurusSync-swift-<version>.zip` release asset is that same package.
 
 **From source.** The repository's own `bindings/swift` package expects
 `OsaurusSyncFFI.xcframework` next to `Package.swift`:
@@ -72,6 +95,11 @@ let core = try SyncCore.open(
 core.setListener { event in /* devices, pairing, identity changes */ }
 let sub = try core.subscribe(scope: conversationId) { changes in /* message diffs, streams */ }
 ```
+
+With the default `network`, devices sync only on the same network. Pass
+`network: n0PublicNetworkConfig()` for development and beta builds to sync over the internet
+through number0's public servers, and ship your own servers through remote configuration (see
+[deployment](https://github.com/osaurus-ai/osaurus-sync/blob/main/docs/deployment.md)).
 
 Callbacks arrive on the core's `osaurus-sync-callbacks` thread in commit order; hop to the main
 actor before touching UI. Keep `Subscription` objects alive; dropping one cancels it.
