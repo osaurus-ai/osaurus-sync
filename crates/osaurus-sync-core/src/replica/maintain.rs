@@ -24,6 +24,8 @@ pub struct Maintenance {
     pub attachments_evicted: usize,
     /// Scopes where this device sealed keys to its user's recovery key.
     pub recovery_grants_added: usize,
+    /// Scopes that still listed a retired user, taken over or left here.
+    pub successions_completed: usize,
 }
 
 impl Replica {
@@ -81,6 +83,7 @@ impl Replica {
             }
         }
 
+        m.successions_completed = self.complete_successions()?;
         for scope in self.scope_ids()? {
             m.recovery_grants_added += self.repair_recovery_grants(scope)? as usize;
         }

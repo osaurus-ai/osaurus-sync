@@ -419,9 +419,20 @@ impl SyncCore {
         self.read(|r| r.devices()).map(|v| v.into_iter().map(Into::into).collect())
     }
 
+    /// Revokes a lost or wiped device. A revoked device keeps the user secret, so for a stolen
+    /// device use `revoke_and_rotate`.
     pub fn revoke_device(&self, device: String) -> R<()> {
         let d = types::device_key(&device)?;
         self.write(|r| r.revoke_device(d))
+    }
+
+    /// Revokes `devices` (a stolen one, say) and replaces the user identity, so the old secret
+    /// they hold no longer admits anyone. This user's other devices take on the new identity
+    /// when they next connect to one that has it. The recovery phrase changes too.
+    pub fn revoke_and_rotate(&self, devices: Vec<String>) -> R<IdentityRotation> {
+        self.live()?;
+        let keys = devices.iter().map(|d| types::device_key(d)).collect::<Result<Vec<_>, _>>()?;
+        Ok(self.node.rotate_identity(&keys)?.into())
     }
 
     /// Starts pairing on this (existing) device. Show `payload` as a QR code or `code` for

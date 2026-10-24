@@ -125,6 +125,26 @@ impl Sim {
         self.nodes.len() - 1
     }
 
+    /// A new device holding node `i`'s user secret under a device key of its own, as a thief
+    /// who copied the secret off a stolen device would run.
+    pub fn add_node_with_user_of(&mut self, name: &str, platform: Platform, i: usize) -> usize {
+        let user = self.nodes[i].secrets.load(osaurus_sync_core::replica::USER_SECRET).expect("node has a user secret");
+        let j = self.add_node(name, platform);
+        let n = &mut self.nodes[j];
+        n.replica.take().unwrap().close().unwrap();
+        n.secrets.store(osaurus_sync_core::replica::USER_SECRET, &user).unwrap();
+        n.replica = Some(Replica::open(n.config(), n.env.clone(), n.secrets.clone()).unwrap());
+        j
+    }
+
+    /// Rotates node `i`'s identity, revoking `revoke`, and sends what the engine produces.
+    pub fn rotate_identity(&mut self, i: usize, revoke: &[DeviceKey]) -> osaurus_sync_core::types::IdentityRotation {
+        let n = &mut self.nodes[i];
+        let (report, outs) = n.engine.rotate_identity(n.replica.as_mut().unwrap(), revoke).unwrap();
+        self.process(i, outs);
+        report
+    }
+
     /// Adds a node with the storage role.
     pub fn add_storage_node(&mut self, name: &str) -> usize {
         let i = self.add_node(name, Platform::Server);

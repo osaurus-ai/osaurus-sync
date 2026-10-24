@@ -29,7 +29,7 @@ use osaurus_sync_core::identity::AgentBinding;
 use osaurus_sync_core::ids::{AgentId, DeviceKey, EventId, ScopeId};
 use osaurus_sync_core::replica::InviteToken;
 use osaurus_sync_core::sync::{Engine, Msg, Notice, Out, PairingInvite};
-use osaurus_sync_core::types::{Change, PeerStatus, StreamState, SyncStatus};
+use osaurus_sync_core::types::{Change, IdentityRotation, PeerStatus, StreamState, SyncStatus};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -323,6 +323,15 @@ impl SyncNode {
             self.inner.clone().dial_soon(inviter);
         }
         Ok(())
+    }
+
+    /// Revokes `revoke` and replaces the user identity; see `Replica::rotate_identity`.
+    /// Connected devices of this user receive the new identity right away, others when they
+    /// next connect.
+    pub fn rotate_identity(&self, revoke: &[DeviceKey]) -> osaurus_sync_core::Result<IdentityRotation> {
+        let report = self.inner.engine_op(|e, r| e.rotate_identity(r, revoke))?;
+        self.sync_now();
+        Ok(report)
     }
 
     pub fn set_backfill_paused(&self, paused: bool) -> osaurus_sync_core::Result<()> {

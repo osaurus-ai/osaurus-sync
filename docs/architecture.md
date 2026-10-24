@@ -140,8 +140,9 @@ Wall clocks never decide validity. They only order messages for display and pick
   a `key_update` adding them. That covers other members and scopes from before this scheme.
   `unseal_grants` tries the device key and then the recovery key.
 - **Consequence for revocation.** A revoked device that still has the user secret can derive
-  the recovery key, so it can read new epochs. A plain revoke is for lost or wiped devices; a
-  stolen device needs identity rotation, which replaces the user secret.
+  the recovery key, so it can read new epochs, and it can certify a fresh device key. A plain
+  revoke is for lost or wiped devices; a stolen device needs
+  [identity rotation](#identity-rotation), which replaces the user secret.
 - **Device keys never leave the device.** The core never writes private keys to SQLite. On Apple
   platforms the Keychain items are `ThisDeviceOnly`, so a restored or migrated device gets a fresh
   device key.
@@ -208,7 +209,7 @@ directory. A lock file makes sure only one process opens a data directory at a t
   the view tables are dropped and replayed. The views are `messages_view`, `messages_fts`,
   `edits`, `tombstones`, `reactions` and `conversations_view`.
 - Supporting tables track DAG heads, held events, the outbox, peers, storage peers, known and
-  revoked devices, blobs, Loro snapshots and read state.
+  revoked devices, retired users, blobs, Loro snapshots and read state.
 - **Retention.** `Replica::maintain`, which the network node runs at start and then hourly, does
   the following:
   - expires held events;
@@ -216,6 +217,8 @@ directory. A lock file makes sure only one process opens a data directory at a t
   - drops contact records for peers that are revoked or unseen for 90 days;
   - forgets other users' devices that are no longer certified in any scope;
   - purges tentatively joined scopes still unproven after a day;
+  - takes over scopes that still list a retired user (see [Identity rotation](#identity-rotation));
+  - seals keys to the user's recovery key where that grant is missing;
   - evicts decrypted attachments (`blobs/plain`) by least-recent use, above
     `plain_cache_bytes` (512 MiB by default). Opening an attachment also enforces this cap.
 - **Session budgets.** Within each one-minute window, a session may receive 500k events or
@@ -296,9 +299,11 @@ sequenceDiagram
    the storage role. A peer with a different major version gets `IncompatiblePeer`.
    **Admission** follows. A peer is trusted if its certificate belongs to this user, or to a
    user who is a member of (or certified in) a scope held here, and its device isn't revoked.
-   The inviter named in a queued invite is also trusted by the redeemer. An untrusted peer is
-   sent `Bye` and reported as `PeerRejected`. The one exception: while this device has an
-   unexpired invite open, an untrusted session stays up so its peer can send `InviteRedeem`.
+   A certificate of a user this device has retired by rotation is never trusted, except from
+   a device this user re-certified, which is owed the new identity. The inviter named in a
+   queued invite is also trusted by the redeemer. An untrusted peer is sent `Bye` and reported
+   as `PeerRejected`. The one exception: while this device has an unexpired, unused invite
+   open, an untrusted session stays up so its peer can send `InviteRedeem`.
    Nothing else from an untrusted peer is processed: offers, reconciliation, pushes, acks and
    `Seen` are all dropped.
 2. **Offer.** Each side lists the scopes it believes the other may read, with its heads for each
@@ -306,7 +311,9 @@ sequenceDiagram
    offered but not held here is joined *tentatively*. Once its control layer has synced, the
    scope is kept only if it lists this user (or this device). Otherwise it is purged, along with
    everything stored for it. Events for a scope this device never joined are refused.
-   `conversations()` lists only scopes where this user has a role.
+   `conversations()` lists only scopes where this user has a role. A peer that could read only
+   a scope's control layer when it was offered (a removed member, say) is offered the scope
+   again once it's admitted, so it fetches the content in the same session.
 3. **Reconcile.** Each side acts as initiator for its own pulls. Reconciliation is range-based
    over `(hlc, id)` keys (`recon.rs`). A range carries a fingerprint, the full id list, or
    nothing if it's already in sync. The responder answers with smaller ranges until every range
@@ -379,6 +386,45 @@ nothing can be recovered.
 
 **Invites** (`osaurus-invite:1:...`) are one-time tokens for adding someone to a scope with a
 role. The redeemer presents the token to a member device, which records the `member_add`.
+
+### Identity rotation
+
+Revoking a device doesn't take the user secret back. A thief with a stolen device can certify a
+fresh device key with it and be admitted again. `rotate_identity(revoke)` (`revoke_and_rotate`
+in the FFI) retires the old user:
+
+1. It revokes the listed devices in every scope this device acts in.
+2. It generates a new user secret and certifies this device and every other known, unrevoked
+   device of the user under it. The secret is staged in the key store as `user-secret-next`
+   before the transaction commits and promoted after; `open` finishes a promotion interrupted
+   by a crash.
+3. In every scope the old user **owned**, it adds the new user as Owner, publishes the new
+   certificates, removes the old user with cutoffs, and rotates to a new epoch. Its keys go to
+   the remaining devices and the new recovery key.
+4. In scopes **owned by someone else**, a Member can't add a user, so it rotates the key to the
+   other members and removes the old user (anyone may remove themselves). The result lists
+   these scopes, so the app can ask their owners to invite the new user key.
+5. The old user goes into `retired_users`. Certificates of a retired user aren't trusted.
+
+The new secret reaches the remaining devices like a pairing grant. When a device still on the
+retired identity connects, a device that holds the new identity and a certificate for it sends
+`IdentityHandoff`: the new user entropy sealed to the peer's device key, plus its new
+certificate. The receiver accepts it only from a device that was already one of its user's
+devices before the session, and only if the retired user is its own. It then switches identity,
+raises `IdentityChanged`, and sends a fresh `Hello` to every peer. Any device that has the new
+identity can pass it on.
+
+A scope only a remaining device held (one created while it was offline) still lists the retired
+user. `maintain` takes such scopes over, the same way, once the rotation is an hour old. The
+delay leaves time for the rotating device's own takeover to arrive, so two devices don't both
+do it.
+
+**What rotation can't do.** Holders of the same user secret can't be told apart. A thief who
+acts first, by revoking the user's other devices or by rotating on their own, wins that race,
+and so can a thief who reaches a remaining device with a handoff before the legitimate one. Old
+epochs stay readable to the stolen device, which already had them. Messages that remaining
+devices send concurrently with the rotation can be rejected by its cutoffs. Rotation also
+changes the recovery phrase; the old phrase is refused.
 
 ### Ephemeral streams
 

@@ -9,6 +9,7 @@ mod loro_docs;
 mod maintain;
 mod ops;
 mod read;
+mod rotate;
 mod sync;
 
 use std::collections::{BTreeMap, HashMap};
@@ -36,6 +37,7 @@ pub use compact::{Compaction, PointInTimeView};
 pub use loro_docs::LoroCache;
 pub use maintain::{Maintenance, PEER_TTL_MS, TENTATIVE_TTL_MS};
 pub use ops::InviteToken;
+pub use rotate::SUCCESSION_GRACE_MS;
 pub use sync::{HELD_MAX_BYTES, HELD_MAX_EVENTS, HELD_TTL_MS, IngestOutcome, ReconKey};
 
 /// Where device and user secrets live: the Keychain on Apple platforms, DPAPI on Windows.
@@ -64,6 +66,8 @@ impl SecretStore for MemorySecretStore {
 
 pub const DEVICE_SECRET: &str = "device-key";
 pub const USER_SECRET: &str = "user-secret";
+/// A rotated user secret, written before the rotation commits and promoted after.
+pub const USER_SECRET_NEXT: &str = "user-secret-next";
 
 #[derive(Clone, Debug)]
 pub struct ReplicaConfig {
@@ -213,7 +217,7 @@ impl Replica {
             )?;
         }
 
-        let user = match secrets.load(USER_SECRET) {
+        let mut user = match secrets.load(USER_SECRET) {
             Some(b) => UserSecret::from_entropy(b.try_into().map_err(|_| Error::Crypto("bad user secret".into()))?),
             None => {
                 let u = UserSecret::generate(env.as_ref());
@@ -221,6 +225,20 @@ impl Replica {
                 u
             }
         };
+        // An identity rotation that stopped between committing and storing its secret.
+        if let Some(b) = secrets.load(USER_SECRET_NEXT) {
+            let next = UserSecret::from_entropy(b.try_into().map_err(|_| Error::Crypto("bad user secret".into()))?);
+            let committed: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM retired_users WHERE user = ? AND successor = ?)",
+                rusqlite::params![&user.public().0[..], &next.public().0[..]],
+                |r| r.get(0),
+            )?;
+            if committed {
+                secrets.store(USER_SECRET, &next.entropy())?;
+                user = next;
+            }
+            secrets.delete(USER_SECRET_NEXT)?;
+        }
 
         store::set_meta(&db, "device_pub", &device.public().0)?;
         let cert = Self::load_or_issue_cert(&db, &cfg, &user, &device, env.as_ref())?;

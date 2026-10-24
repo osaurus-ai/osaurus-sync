@@ -330,3 +330,69 @@ impl LoadEntropy for MemorySecretStore {
         self.load("user-secret").unwrap().try_into().unwrap()
     }
 }
+
+#[test]
+fn rotation_locks_a_stolen_device_out_of_new_epochs() {
+    let env = Arc::new(TestEnv::new(31, 1_700_000_000_000));
+    let mut a = open("Mac", env.clone());
+    let mut b = open("Stolen phone", env.clone());
+    let old = UserSecret::from_entropy(a.secrets.load_entropy());
+    b.replica.adopt_user(old.clone()).unwrap();
+    let scope = a.replica.create_scope(ScopeKind::Conversation, "").unwrap();
+    a.replica.send_message(scope, text("before")).unwrap();
+    a.replica.admit_device(b.replica.cert()).unwrap();
+    copy_scope(&a.replica, &mut b.replica, scope);
+    assert_eq!(contents(&b.replica, scope), vec!["before"]);
+
+    env.advance(5);
+    let report = a.replica.rotate_identity(&[b.replica.device_key()]).unwrap();
+    assert_eq!(report.rotated, vec![scope]);
+    assert_ne!(a.replica.user_key(), old.public());
+    assert!(a.replica.is_retired(&old.public()).unwrap());
+    assert!(a.replica.take_changes().contains(&Change::IdentityChanged));
+    // The secret store holds the new identity; nothing is left staged.
+    assert_eq!(UserSecret::from_entropy(a.secrets.load_entropy()).public(), a.replica.user_key());
+    assert!(a.secrets.load(osaurus_sync_core::replica::USER_SECRET_NEXT).is_none());
+
+    env.advance(5);
+    a.replica.send_message(scope, text("after")).unwrap();
+    copy_scope(&a.replica, &mut b.replica, scope);
+    assert_eq!(contents(&b.replica, scope), vec!["before"]);
+    // The old identity can't be brought back from its phrase.
+    assert!(a.replica.adopt_user(old).is_err());
+    let users: Vec<_> = a.replica.devices().unwrap().into_iter().map(|d| d.user).collect();
+    assert!(users.iter().all(|u| *u == a.replica.user_key()));
+}
+
+#[test]
+fn rotation_interrupted_before_storing_the_secret_completes_on_open() {
+    let env = Arc::new(TestEnv::new(32, 1_700_000_000_000));
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(MemorySecretStore::default());
+    let cfg = || ReplicaConfig::new(dir.path(), "Mac", Platform::MacOs);
+    let mut r = Replica::open(cfg(), env.clone(), secrets.clone()).unwrap();
+    let scope = r.create_scope(ScopeKind::Conversation, "").unwrap();
+    let old = secrets.load_entropy();
+    r.rotate_identity(&[]).unwrap();
+    let new = r.user_key();
+    r.close().unwrap();
+    drop(r);
+
+    // As if the process died after the commit: the old secret is current, the new one staged.
+    let next = secrets.load_entropy();
+    secrets.store("user-secret", &old).unwrap();
+    secrets.store(osaurus_sync_core::replica::USER_SECRET_NEXT, &next).unwrap();
+    let mut r = Replica::open(cfg(), env.clone(), secrets.clone()).unwrap();
+    assert_eq!(r.user_key(), new);
+    assert!(secrets.load(osaurus_sync_core::replica::USER_SECRET_NEXT).is_none());
+    r.send_message(scope, text("still mine")).unwrap();
+    r.close().unwrap();
+    drop(r);
+
+    // A staged secret whose rotation never committed is discarded.
+    let stray = UserSecret::generate(env.as_ref());
+    secrets.store(osaurus_sync_core::replica::USER_SECRET_NEXT, &stray.entropy()).unwrap();
+    let r = Replica::open(cfg(), env, secrets.clone()).unwrap();
+    assert_eq!(r.user_key(), new);
+    assert!(secrets.load(osaurus_sync_core::replica::USER_SECRET_NEXT).is_none());
+}

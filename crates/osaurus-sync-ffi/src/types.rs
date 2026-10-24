@@ -457,6 +457,24 @@ pub struct LegacyMessage {
     pub created_ms: u64,
 }
 
+/// Result of `revoke_and_rotate`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct IdentityRotation {
+    /// The new user key. Show the new recovery phrase; the old one no longer works.
+    pub user: String,
+    /// Conversations this user owned, now owned by the new identity.
+    pub rotated: Vec<String>,
+    /// Conversations owned by others that the old identity left. Their owners have to invite
+    /// the new user key.
+    pub left: Vec<String>,
+}
+
+impl From<ct::IdentityRotation> for IdentityRotation {
+    fn from(r: ct::IdentityRotation) -> Self {
+        IdentityRotation { user: r.user.to_hex(), rotated: r.rotated.iter().map(ScopeId::to_hex).collect(), left: r.left.iter().map(ScopeId::to_hex).collect() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PairingOffer {
     /// Encode as a QR code. Contains the code.

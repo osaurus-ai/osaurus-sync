@@ -134,6 +134,9 @@ CREATE TABLE IF NOT EXISTS known_devices (
 
 CREATE TABLE IF NOT EXISTS revoked_devices (device BLOB PRIMARY KEY, revoked_ms INTEGER NOT NULL);
 
+-- User identities this device has rotated away from. Their certificates are no longer trusted.
+CREATE TABLE IF NOT EXISTS retired_users (user BLOB PRIMARY KEY, successor BLOB NOT NULL, retired_ms INTEGER NOT NULL);
+
 CREATE TABLE IF NOT EXISTS blobs (
     hash BLOB PRIMARY KEY,
     size INTEGER NOT NULL,

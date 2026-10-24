@@ -51,7 +51,7 @@ impl Replica {
     }
 
     /// Devices of my user that I know and that are not revoked, excluding this one.
-    fn my_other_devices(&self) -> Result<Vec<DeviceCert>> {
+    pub(super) fn my_other_devices(&self) -> Result<Vec<DeviceCert>> {
         let mut stmt =
             self.db.prepare_cached("SELECT cert FROM known_devices WHERE user = ? AND device != ? AND device NOT IN (SELECT device FROM revoked_devices)")?;
         let rows: Vec<Vec<u8>> =
@@ -59,7 +59,7 @@ impl Replica {
         Ok(rows.into_iter().filter_map(|b| crate::payload::decode::<DeviceCert>(&b).ok()).filter(|c| c.verify()).collect())
     }
 
-    fn grants_for(&self, devices: &[DeviceKey], keys: &[(u64, [u8; 32])]) -> Result<Vec<KeyGrant>> {
+    pub(super) fn grants_for(&self, devices: &[DeviceKey], keys: &[(u64, [u8; 32])]) -> Result<Vec<KeyGrant>> {
         let mut out = Vec::new();
         for d in devices {
             for (epoch, k) in keys {
@@ -275,7 +275,7 @@ impl Replica {
         })
     }
 
-    fn max_hlc_of(&self, scope: ScopeId, device: &DeviceKey) -> Result<Option<u64>> {
+    pub(super) fn max_hlc_of(&self, scope: ScopeId, device: &DeviceKey) -> Result<Option<u64>> {
         let v: Option<i64> =
             self.db.query_row("SELECT MAX(hlc) FROM events WHERE scope = ? AND author = ?", params![&scope.0[..], &device.0[..]], |r| r.get(0))?;
         Ok(v.map(|v| v as u64))
@@ -311,14 +311,21 @@ impl Replica {
         if st.members.contains_key(&self.me()) {
             devices.push(self.user.recovery_public());
         }
+        self.rotate_key_to(scope, &devices)
+    }
+
+    /// Starts a new epoch whose key only `devices` receive.
+    pub(super) fn rotate_key_to(&mut self, scope: ScopeId, devices: &[DeviceKey]) -> Result<()> {
         let next = self.current_key(scope)?.map(|(e, _)| e + 1).unwrap_or(1);
         let key: [u8; 32] = random_array(self.env.as_ref());
-        let grants = self.grants_for(&devices, &[(next, key)])?;
+        let grants = self.grants_for(devices, &[(next, key)])?;
         self.append_control(scope, &Control::KeyUpdate(KeyUpdatePayload { grants }))?;
         Ok(())
     }
 
     /// Revokes a lost or retired device in every scope where it is certified, and rotates keys.
+    /// The device keeps the user secret, so this only stops a device that cooperates; a stolen
+    /// device needs `rotate_identity`.
     pub fn revoke_device(&mut self, device: DeviceKey) -> Result<()> {
         if device == self.device_key() {
             return Err(Error::InvalidInput("cannot revoke this device from itself".into()));
@@ -545,6 +552,9 @@ impl Replica {
     pub fn adopt_user(&mut self, user: UserSecret) -> Result<()> {
         if user.public() == self.user_key() {
             return Ok(());
+        }
+        if self.is_retired(&user.public())? {
+            return Err(Error::InvalidInput("this identity was rotated; use the current recovery phrase".into()));
         }
         let old = self.user_key();
         let cert = DeviceCert::issue(&user, self.device_key(), &self.cfg.device_name, self.cfg.platform, self.env.now_ms());

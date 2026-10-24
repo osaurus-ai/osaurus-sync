@@ -26,7 +26,14 @@ impl Replica {
                 )?;
                 self.refresh_conversation(scope)?;
             }
-            Some(Control::MemberAdd(_)) | Some(Control::MemberRemove(_)) | Some(Control::RoleChange(_)) | Some(Control::AgentAssign(_)) => {
+            Some(Control::MemberAdd(p)) => {
+                // A used invite can't admit anyone, so it no longer keeps strangers connected.
+                if let Some(h) = p.invite {
+                    self.db.execute("DELETE FROM invites_issued WHERE token_hash = ?", [&h[..]])?;
+                }
+                self.refresh_conversation(scope)?;
+            }
+            Some(Control::MemberRemove(_)) | Some(Control::RoleChange(_)) | Some(Control::AgentAssign(_)) => {
                 self.refresh_conversation(scope)?;
             }
             Some(Control::DeviceCert(c)) => {
@@ -40,7 +47,7 @@ impl Replica {
                     self.emit(Change::SelfRevoked);
                 }
                 let mine = self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM known_devices WHERE device = ? AND user = ?)",
+                    "SELECT EXISTS(SELECT 1 FROM known_devices WHERE device = ? AND (user = ? OR user IN (SELECT user FROM retired_users)))",
                     params![&p.device.0[..], &self.user_key().0[..]],
                     |r| r.get::<_, bool>(0),
                 )?;

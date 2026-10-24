@@ -1,6 +1,7 @@
 use osaurus_sync_core::identity::Platform;
-use osaurus_sync_core::ids::{Role, ScopeId};
+use osaurus_sync_core::ids::{Principal, Role, ScopeId};
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
+use osaurus_sync_core::replica::SUCCESSION_GRACE_MS;
 use osaurus_sync_core::sync::engine::{MAX_INVALID_PER_SESSION, MAX_UNTRUSTED_MSGS};
 use osaurus_sync_core::sync::proto::{PROTOCOL_VERSION, ScopeOffer};
 use osaurus_sync_core::sync::{Msg, Notice, Out};
@@ -347,4 +348,107 @@ fn member_cannot_plant_a_foreign_scope() {
     assert!(!sim.r(alice).scope_ids().unwrap().contains(&other));
     let listed: Vec<_> = sim.r(alice).conversations().unwrap().into_iter().map(|c| c.scope).collect();
     assert_eq!(listed, vec![shared]);
+}
+
+#[test]
+fn stolen_device_cannot_rejoin_after_rotation() {
+    for seed in 14..22 {
+        stolen_device_scenario(seed);
+    }
+}
+
+fn stolen_device_scenario(seed: u64) {
+    let mut sim = Sim::new(seed);
+    let mac = sim.add_node("Mac", Platform::MacOs);
+    let phone = sim.add_node("Phone", Platform::Ios);
+    let pc = sim.add_node("PC", Platform::Windows);
+    let bob = sim.add_node("Bob", Platform::Windows);
+    sim.pair(mac, phone);
+    sim.run(10_000);
+    sim.pair(mac, pc);
+    sim.run(10_000);
+    let mine = sim.r(mac).create_scope(ScopeKind::Conversation, "Notes").unwrap();
+    sim.r(mac).send_message(mine, text("before")).unwrap();
+    let team = sim.r(bob).create_scope(ScopeKind::Workspace, "Bob's team").unwrap();
+    sim.invite(bob, mac, team, Role::Member);
+    sim.run(10_000);
+    sim.heal(&[]);
+    sim.run(50_000);
+    assert_eq!(contents(&mut sim, phone, mine), vec!["before"]);
+    let old_user = sim.r(mac).user_key();
+
+    // The phone is stolen. The PC, offline, starts a conversation the Mac doesn't have yet.
+    sim.disconnect_all(phone);
+    sim.disconnect_all(pc);
+    let offline = sim.r(pc).create_scope(ScopeKind::Conversation, "Offline").unwrap();
+    // The Mac revokes the phone and rotates the identity.
+    let stolen = sim.nodes[phone].device();
+    let report = sim.rotate_identity(mac, &[stolen]);
+    assert_eq!(report.rotated, vec![mine]);
+    assert_eq!(report.left, vec![team]);
+    let new_user = sim.r(mac).user_key();
+    assert_eq!(report.user, new_user);
+    assert_ne!(new_user, old_user);
+    sim.r(mac).send_message(mine, text("after")).unwrap();
+    sim.poll(mac);
+    sim.heal(&[phone]);
+    sim.run(50_000);
+
+    // The PC took on the new identity from the Mac and reads the new epoch.
+    assert_eq!(sim.r(pc).user_key(), new_user);
+    assert_eq!(contents(&mut sim, pc, mine), vec!["before", "after"]);
+    // The PC's offline conversation still lists the old identity until a device takes it over,
+    // after a grace period that leaves the takeover to the device that rotated where it can.
+    let owner = |sim: &mut Sim, i: usize, u| sim.r(i).conversation(offline).unwrap().unwrap().members.iter().any(|m| m.principal == Principal::User(u));
+    assert!(owner(&mut sim, mac, old_user));
+    assert_eq!(sim.r(pc).maintain().unwrap().successions_completed, 0);
+    sim.advance(SUCCESSION_GRACE_MS + 1);
+    assert_eq!(sim.r(pc).maintain().unwrap().successions_completed, 1);
+    sim.poll(pc);
+    sim.run(50_000);
+    assert!(!owner(&mut sim, mac, old_user) && owner(&mut sim, mac, new_user));
+    assert_eq!(sim.r(mac).maintain().unwrap().successions_completed, 0);
+    for d in [mac, pc] {
+        let mut listed: Vec<_> = sim.r(d).conversations().unwrap().into_iter().map(|c| c.scope).collect();
+        listed.sort();
+        let mut want = vec![mine, offline];
+        want.sort();
+        assert_eq!(listed, want);
+    }
+    // Bob's workspace lost the old identity; Bob adds the new one back.
+    let members = sim.r(bob).conversation(team).unwrap().unwrap().members;
+    assert!(members.iter().all(|m| m.principal != Principal::User(old_user)));
+    sim.r(bob).add_member(team, new_user, Role::Member).unwrap();
+    sim.r(bob).send_message(team, text("welcome back")).unwrap();
+    sim.poll(bob);
+    sim.run(50_000);
+    assert_eq!(contents(&mut sim, mac, team), vec!["welcome back"]);
+
+    // The thief tries the stolen phone, then a fresh device certified with the old secret.
+    let thief = sim.add_node_with_user_of("Thief", Platform::MacOs, phone);
+    assert_eq!(sim.r(thief).user_key(), old_user);
+    let thief_dev = sim.nodes[thief].device();
+    for t in [phone, thief] {
+        for d in [mac, pc, bob] {
+            sim.connect(t, d);
+        }
+    }
+    sim.run(50_000);
+    for t in [phone, thief] {
+        for d in [mac, pc, bob] {
+            assert!(!sim.is_linked(t, d), "{t} still linked to {d}");
+        }
+    }
+    assert!(sim.nodes[mac].notices.contains(&Notice::PeerRevoked(stolen)));
+    for d in [mac, pc, bob] {
+        assert!(sim.nodes[d].notices.contains(&Notice::PeerRejected(thief_dev)), "node {d} admitted the thief");
+    }
+    assert!(!sim.r(thief).scope_ids().unwrap().contains(&mine));
+    assert_eq!(sim.r(pc).user_key(), new_user);
+
+    // Even holding every event, the old secret opens nothing written after the rotation.
+    for e in all_events(&mut sim, mac, mine) {
+        sim.r(phone).ingest(&e).unwrap();
+    }
+    assert_eq!(contents(&mut sim, phone, mine), vec!["before"]);
 }

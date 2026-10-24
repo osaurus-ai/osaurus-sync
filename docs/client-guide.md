@@ -226,7 +226,7 @@ concurrent removal). Reload the scope from `messages`.
 | `devicesChanged` | The device list changed; refresh `devices()` |
 | `paired(device)` | Pairing finished |
 | `pairingFailed(reason)` | Pairing failed |
-| `identityChanged` | Pairing or recovery replaced the user identity; reload everything |
+| `identityChanged` | Pairing, recovery or rotation replaced the user identity; reload everything |
 | `recoveryAvailable` | A restored backup is waiting for its recovery phrase |
 | `selfRevoked` | This device was revoked; sync has stopped |
 | `peerRevoked(device)` | Another device was revoked |
@@ -281,8 +281,33 @@ Managing devices:
 
 ```swift
 let devices = try core.devices()          // id, name, platform, lastSeenMs, revoked, isSelf
-try core.revokeDevice(device: lost.id)    // rotates scope keys; the device can't read new content
+try core.revokeDevice(device: wiped.id)   // a lost or wiped device
+let result = try core.revokeAndRotate(devices: [stolen.id])   // a stolen device
 ```
+
+```csharp
+var devices = core.Devices();
+core.RevokeDevice(wiped.Id);
+var result = core.RevokeAndRotate(new[] { stolen.Id });
+```
+
+Pick the call by what happened to the device:
+
+- **`revokeDevice`** is for a device that was lost or wiped. It rotates scope keys so the device
+  can't read new content, but the device keeps the user secret. A device that's still running
+  could use that secret to read new content through the recovery grants, or to certify a new
+  device key.
+- **`revokeAndRotate`** is for a device that was stolen. It revokes the listed devices and
+  replaces the user identity, so the stolen secret stops working. Your other devices take on
+  the new identity when they next connect to a device that has it, and raise `identityChanged`.
+  The recovery phrase changes: show `recoveryPhrase()` again and ask the user to write down the
+  new one. The old phrase is refused.
+
+`revokeAndRotate` returns the new user key and two lists of conversations. `rotated` holds the
+ones this user owned, which the new identity now owns. `left` holds conversations owned by
+someone else. The old identity left those, and their owners have to invite the new user key
+before you can use them again. Messages your other devices send while the rotation is reaching
+them may be marked not delivered.
 
 ### Recovery phrase
 

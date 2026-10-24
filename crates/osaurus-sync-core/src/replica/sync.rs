@@ -252,7 +252,7 @@ impl Replica {
     /// of a user that is a member of (or was certified in) a scope held here. Anyone else may
     /// only pair or redeem an invite.
     pub fn is_trusted_peer(&mut self, cert: &DeviceCert) -> Result<bool> {
-        if !cert.verify() || cert.device == self.device_key() || self.is_device_revoked(&cert.device)? {
+        if !cert.verify() || cert.device == self.device_key() || self.is_device_revoked(&cert.device)? || self.is_retired(&cert.user)? {
             return Ok(false);
         }
         if cert.user == self.user_key() {

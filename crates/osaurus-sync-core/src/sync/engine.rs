@@ -7,7 +7,7 @@
 //! recent conversations become usable first. New events, local or received, are pushed to every
 //! other connected peer that may read the scope.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use super::proto::{Layer, Msg, PROTOCOL_VERSION, ScopeOffer};
 use super::recon::{self, Key, KeySource, MAX_KEY, MIN_KEY, Range};
@@ -17,10 +17,10 @@ use crate::envelope::{Decoded, Envelope, kind};
 use crate::error::{Error, Result};
 use crate::hlc;
 use crate::identity::DeviceCert;
-use crate::ids::{DeviceKey, EventHash, EventId, ScopeId};
+use crate::ids::{DeviceKey, EventHash, EventId, ScopeId, UserKey};
 use crate::keys::UserSecret;
 use crate::replica::{IngestOutcome, InviteToken, Replica};
-use crate::types::HistoryMode;
+use crate::types::{HistoryMode, IdentityRotation};
 
 const DAY_MS: u64 = 86_400_000;
 /// Content windows, newest first, as days before now.
@@ -176,11 +176,16 @@ struct Session {
     /// The peer may sync: one of this user's devices or a member's device. Untrusted sessions
     /// exist only to pair or redeem an invite; nothing they send is stored.
     trusted: bool,
+    /// The peer was one of this user's devices before this session's `Hello`, so it may hand
+    /// over a rotated identity.
+    own_device: bool,
     hello_sent: bool,
     /// Pairing code while this device waits for a grant.
     joining: Option<String>,
     queued_invites: Vec<InviteToken>,
-    offered: HashSet<ScopeId>,
+    /// Scopes offered in this session, and whether the peer could read their content then. A
+    /// scope is offered again once a control-only peer is admitted, so it fetches the content.
+    offered: HashMap<ScopeId, bool>,
     /// Heads and local seq of each scope as offered to the peer, to match its `Seen`.
     offered_at: HashMap<ScopeId, (Vec<EventHash>, Vec<EventHash>, i64)>,
     /// The peer's offered heads, echoed in `Seen` once the plan built on them finishes.
@@ -236,10 +241,11 @@ impl Session {
             storage_role: false,
             established: false,
             trusted: false,
+            own_device: false,
             hello_sent: false,
             joining: None,
             queued_invites: vec![],
-            offered: HashSet::new(),
+            offered: HashMap::new(),
             offered_at: HashMap::new(),
             planned_from: HashMap::new(),
             plans: HashMap::new(),
@@ -503,6 +509,7 @@ impl Engine {
                 return Ok(out);
             }
             Msg::Seen { scope, control_heads, heads } => self.on_seen(r, peer, scope, control_heads, heads)?,
+            Msg::IdentityHandoff { sealed_user, cert, retired } => self.on_identity_handoff(r, peer, sealed_user, cert, retired, &mut out)?,
         }
         out.extend(self.poll(r)?);
         Ok(out)
@@ -535,7 +542,10 @@ impl Engine {
             let s = &self.sessions[&peer];
             (!s.queued_invites.is_empty(), s.trusted)
         };
-        let trusted = was_trusted || vouched || r.is_trusted_peer(&cert)?;
+        // A device of this user still on a retired identity is owed the current one.
+        let successor = r.successor_cert(&cert)?;
+        let trusted = was_trusted || vouched || successor.is_some() || r.is_trusted_peer(&cert)?;
+        let own_device = r.is_own_device(&peer)?;
         if !trusted && !r.has_open_invites()? {
             out.push(Out::Notify(Notice::PeerRejected(peer)));
             out.push(Out::Send(peer, Msg::Bye { reason: "not a member".into() }));
@@ -549,6 +559,7 @@ impl Engine {
             s.storage_role = storage_role;
             s.established = true;
             s.trusted = trusted;
+            s.own_device = own_device;
             s.offered.clear();
             !std::mem::replace(&mut s.hello_sent, true)
         };
@@ -561,6 +572,9 @@ impl Engine {
         r.upsert_known_device(&cert)?;
         r.admit_device(&cert)?;
         r.record_contact(&peer, None)?;
+        if let Some(c) = successor {
+            out.push(Out::Send(peer, handoff(r, &cert, c)?));
+        }
         let invites = std::mem::take(&mut self.sessions.get_mut(&peer).unwrap().queued_invites);
         for t in invites {
             r.join_scope_tentatively(t.scope)?;
@@ -569,15 +583,28 @@ impl Engine {
         self.offer_new(r, peer, out)
     }
 
-    /// Offers every scope the peer may read that has not been offered in this session.
+    /// Offers every scope the peer may read that has not been offered in this session, or that
+    /// it can now read in full.
     fn offer_new(&mut self, r: &mut Replica, peer: DeviceKey, out: &mut Vec<Out>) -> Result<()> {
         let mut scopes = Vec::new();
+        let mut full = Vec::new();
         for scope in r.scope_ids()? {
-            if self.sessions[&peer].offered.contains(&scope) || !r.may_read_control(scope, &peer)? {
+            let was = self.sessions[&peer].offered.get(&scope).copied();
+            if !r.may_read_control(scope, &peer)? {
                 continue;
+            }
+            let now_full = r.is_authorized(scope, &peer)?;
+            match was {
+                Some(w) if w == now_full => continue,
+                Some(true) => {
+                    self.sessions.get_mut(&peer).unwrap().offered.insert(scope, false);
+                    continue;
+                }
+                _ => {}
             }
             let (control_heads, heads) = r.scope_heads(scope)?;
             scopes.push(ScopeOffer { scope, control_heads, heads });
+            full.push(now_full);
         }
         if scopes.is_empty() {
             return Ok(());
@@ -591,7 +618,7 @@ impl Engine {
             offered_at.push((o.scope, (o.control_heads.clone(), o.heads.clone(), r.max_seq(o.scope)?)));
         }
         let s = self.sessions.get_mut(&peer).unwrap();
-        s.offered.extend(scopes.iter().map(|o| o.scope));
+        s.offered.extend(scopes.iter().map(|o| o.scope).zip(full));
         s.offered_at.extend(offered_at);
         out.push(Out::Send(peer, Msg::Offer { scopes }));
         Ok(())
@@ -901,6 +928,50 @@ impl Engine {
         Ok(())
     }
 
+    /// Another device of this user rotated the identity. Only a device that was already one of
+    /// this user's devices may hand it over.
+    fn on_identity_handoff(&mut self, r: &mut Replica, peer: DeviceKey, sealed: Vec<u8>, cert: DeviceCert, retired: UserKey, out: &mut Vec<Out>) -> Result<()> {
+        if !self.sessions.get(&peer).is_some_and(|s| s.established && s.trusted && s.own_device) {
+            return Ok(());
+        }
+        let Ok(entropy) = crypto::unseal(r.device_secret().signing_key(), &sealed).map(<[u8; 32]>::try_from) else { return Ok(()) };
+        let Ok(entropy) = entropy else { return Ok(()) };
+        if !r.accept_identity_handoff(UserSecret::from_entropy(entropy), cert, retired)? {
+            return Ok(());
+        }
+        tracing::info!(?peer, "took on the rotated identity");
+        out.extend(self.rehello(r)?);
+        Ok(())
+    }
+
+    /// Replaces this user's identity after a device was stolen; see `Replica::rotate_identity`.
+    /// Connected devices of this user get the new secret right away.
+    pub fn rotate_identity(&mut self, r: &mut Replica, revoke: &[DeviceKey]) -> Result<(IdentityRotation, Vec<Out>)> {
+        let report = r.rotate_identity(revoke)?;
+        let mut out = self.rehello(r)?;
+        out.extend(self.poll(r)?);
+        Ok((report, out))
+    }
+
+    /// Presents this device's current certificate to every established peer, and hands the
+    /// current identity to peers still on a retired one.
+    fn rehello(&mut self, r: &mut Replica) -> Result<Vec<Out>> {
+        let mut out = Vec::new();
+        let hello = self.hello(r);
+        for (peer, s) in &self.sessions {
+            if !s.established || r.is_device_revoked(peer)? {
+                continue;
+            }
+            out.push(Out::Send(*peer, hello.clone()));
+            if let Some(cert) = &s.cert
+                && let Some(c) = r.successor_cert(cert)?
+            {
+                out.push(Out::Send(*peer, handoff(r, cert, c)?));
+            }
+        }
+        Ok(out)
+    }
+
     // ---- driving ----
 
     /// Pushes new events and starts queued reconciliation. Call after local writes.
@@ -981,7 +1052,7 @@ impl Engine {
         // Hand on-demand requests to a peer that can serve them.
         let pending = std::mem::take(&mut self.on_demand);
         for job in pending {
-            let target = peers.iter().copied().find(|p| self.sessions[p].offered.contains(&job.scope) || self.sessions[p].plans.contains_key(&job.scope));
+            let target = peers.iter().copied().find(|p| self.sessions[p].offered.contains_key(&job.scope) || self.sessions[p].plans.contains_key(&job.scope));
             match target {
                 Some(p) => self.sessions.get_mut(&p).unwrap().queue.push(job),
                 None => self.on_demand.push(job),
@@ -1007,6 +1078,13 @@ impl Engine {
         }
         Ok(out)
     }
+}
+
+/// The current user secret sealed to a device presenting `presented` (a retired user's
+/// certificate), with `successor`, its certificate under the current user.
+fn handoff(r: &Replica, presented: &DeviceCert, successor: DeviceCert) -> Result<Msg> {
+    let sealed_user = crypto::seal_to_device(r.env().as_ref(), &presented.device.0, &r.user_secret().entropy())?;
+    Ok(Msg::IdentityHandoff { sealed_user, cert: successor, retired: presented.user })
 }
 
 fn is_control_event(bytes: &[u8]) -> bool {

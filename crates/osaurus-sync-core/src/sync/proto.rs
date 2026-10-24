@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::recon::{Key, Range};
 use crate::error::{Error, Result};
 use crate::identity::DeviceCert;
-use crate::ids::{AgentId, EventHash, EventId, ScopeId};
+use crate::ids::{AgentId, EventHash, EventId, ScopeId, UserKey};
 
 /// Bumped on incompatible changes. Peers with a different major version refuse to sync.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -95,6 +95,13 @@ pub enum Msg {
         scope: ScopeId,
         control_heads: Vec<EventHash>,
         heads: Vec<EventHash>,
+    },
+    /// The user secret this user rotated to, sealed to the receiver's device key, and the
+    /// receiver's certificate under it. Sent to a device still presenting `retired`.
+    IdentityHandoff {
+        sealed_user: Vec<u8>,
+        cert: DeviceCert,
+        retired: UserKey,
     },
 }
 

@@ -153,6 +153,18 @@ impl NewMessage {
     }
 }
 
+/// Result of `rotate_identity`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRotation {
+    /// The new user key.
+    pub user: UserKey,
+    /// Scopes this user owned: the new identity took over as Owner.
+    pub rotated: Vec<ScopeId>,
+    /// Scopes owned by someone else: the old identity left them, and an owner or admin has to
+    /// invite the new one.
+    pub left: Vec<ScopeId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedMessage {
     pub role: MessageRole,

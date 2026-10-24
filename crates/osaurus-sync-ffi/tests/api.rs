@@ -235,6 +235,38 @@ fn pairing_sync_and_streams_over_loopback() {
 }
 
 #[test]
+fn rotated_identity_reaches_the_other_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let mac = SyncCore::open(config(dir.path(), "mac", Platform::MacOs, true), Box::new(Keys::default())).unwrap();
+    let pc = SyncCore::open(config(dir.path(), "pc", Platform::Windows, true), Box::new(Keys::default())).unwrap();
+    let events = Events::default();
+    pc.set_listener(Some(Box::new(events.clone())));
+    let scope = mac.create_conversation("Notes".into()).unwrap();
+    mac.send_message(scope.clone(), text("before")).unwrap();
+    mac.add_peer_address(pc.local_address().unwrap()).unwrap();
+    pc.add_peer_address(mac.local_address().unwrap()).unwrap();
+    let offer = mac.pairing_offer(300_000).unwrap();
+    block_on(pc.pair_with_offer(offer.payload)).unwrap();
+    until("history", || contents(&pc, &scope) == vec!["before"]);
+    let (old_user, old_phrase) = (mac.user_key().unwrap(), mac.recovery_phrase().unwrap());
+    events.0.lock().unwrap().clear();
+
+    let report = mac.revoke_and_rotate(vec![]).unwrap();
+    assert_eq!(report.rotated, vec![scope.clone()]);
+    assert_ne!(report.user, old_user);
+    assert_eq!(mac.user_key().unwrap(), report.user);
+    assert_ne!(mac.recovery_phrase().unwrap(), old_phrase);
+    until("handoff", || pc.user_key().unwrap() == report.user);
+    until("identity event", || events.0.lock().unwrap().iter().any(|e| matches!(e, CoreEvent::IdentityChanged)));
+    mac.send_message(scope.clone(), text("after")).unwrap();
+    until("new epoch", || contents(&pc, &scope) == vec!["before", "after"]);
+    assert!(matches!(pc.recover_from_phrase(old_phrase.join(" ")), Err(SyncError::InvalidInput { .. })));
+
+    block_on(mac.close()).unwrap();
+    block_on(pc.close()).unwrap();
+}
+
+#[test]
 fn restored_backup_unlocks_with_the_phrase() {
     let dir = tempfile::tempdir().unwrap();
     let old = SyncCore::open(config(dir.path(), "old", Platform::MacOs, false), Box::new(Keys::default())).unwrap();
