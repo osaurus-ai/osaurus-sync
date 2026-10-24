@@ -753,13 +753,16 @@ impl Inner {
             self.deliver(notices, changes);
         }
         self.listener.changes(vec![Change::DevicesChanged]);
-        let res = self.clone().read_loop(peer, &mut recv).await;
+        let res = self.clone().read_loop(peer, id, &mut recv).await;
         self.unregister(&peer, id);
         writer.abort();
         res
     }
 
-    async fn read_loop(self: Arc<Self>, peer: DeviceKey, recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
+    /// Hands frames from connection `id` to the engine until the peer closes it or another
+    /// connection replaces it. A replaced or suspended connection's late frames are dropped:
+    /// the engine keys sessions by peer, so they would land in the next connection's session.
+    async fn read_loop(self: Arc<Self>, peer: DeviceKey, id: u64, recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
         while let Some(bytes) = frame::read(recv).await? {
             self.bytes_received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             // Large chunks are applied in slices, releasing the state lock in between so local
@@ -770,6 +773,9 @@ impl Inner {
                     let n = if let Msg::Events { events, .. } = &msg { events.len() } else { 0 };
                     let res = {
                         let mut st = lock(&me.state);
+                        if !lock(&me.peers).get(&peer).is_some_and(|p| p.id == id) {
+                            return None;
+                        }
                         let State { replica, engine } = &mut *st;
                         let res = engine.handle(replica, peer, msg).map(|outs| me.route(outs));
                         (res, replica.take_changes())
@@ -782,9 +788,13 @@ impl Inner {
                             debug!("checkpoint failed: {e}");
                         }
                     }
-                    res
+                    Some(res)
                 })
                 .await?;
+                let Some(res) = res else {
+                    debug!(?peer, "dropping frames from a connection that is no longer current");
+                    return Ok(());
+                };
                 match res {
                     (Ok(notices), changes) => self.deliver(notices, changes),
                     (Err(e), changes) => {
