@@ -156,6 +156,15 @@ Wall clocks never decide validity. They only order messages for display and pick
 - **Agents** have their own secp256k1 identity. An agent binding, signed by the agent's key,
   names the device that hosts it and an expiry. `agent_assign` puts an agent in a scope; the
   latest causally valid assignment wins.
+- **Agent cards** connect an agent's public address to sync. The address is the last 20 bytes of
+  keccak-256 over the agent's uncompressed public key, the Ethereum-style address that
+  osaurus-relay names agents by. A card is the agent key's signature
+  (`osaurus-sync/agent-card/v1`) over the agent, its host device, the host's user key and an
+  expiry, encoded as `osaurus-agent-card:1:<hex postcard>`. The host app serves it on the
+  agent's osaurus-relay URL. A caller verifies it against the address it dialed and then invites
+  that user with an invite bound to the user key. Cards never enter a scope, and admission still
+  goes through membership. A bound invite's user is recorded only on the issuing device, which is
+  the only device that admits with it.
 
 ## Membership and validation
 
@@ -211,8 +220,8 @@ directory. A lock file makes sure only one process opens a data directory at a t
 - **Base tables change only through numbered migrations** (`store.rs`). Version 1 is the
   original schema, and each later step runs in its own transaction that also records the new
   version, so an interrupted upgrade resumes. New databases run the same steps. A database
-  from a newer release is refused with `NewerDatabase` rather than opened. A frozen version 1
-  data directory in `tests/fixtures/store-v1` is upgraded in CI.
+  from a newer release is refused with `NewerDatabase` rather than opened. Frozen data directories
+  from versions 1 and 2, in `tests/fixtures/store-v<N>`, are upgraded in CI.
 - **Crash check.** A `.unclean` marker file exists whenever the replica may have unflushed
   writes; `flush` (on suspend and close) removes it, and the next write recreates it. Opening
   with the marker present runs `PRAGMA integrity_check`. If it fails, the view tables are

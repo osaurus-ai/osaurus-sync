@@ -161,10 +161,28 @@ final class BindingTests: XCTestCase {
         try other.redeemInvite(token: invite)
         try await other.close()
 
-        let agent = try core.assignAgent(scope: workspace, agentSecret: generateAgentSecret(), host: nil, role: .member, ttlMs: 86_400_000)
+        let agentSecret = generateAgentSecret()
+        let agent = try core.assignAgent(scope: workspace, agentSecret: agentSecret, host: nil, role: .member, ttlMs: 86_400_000)
         XCTAssertTrue(agent.count > 60)
         XCTAssertNotNil(try core.publishAgentRecord(agentSecret: generateAgentSecret(), ttlMs: 60_000))
         XCTAssertNil(try core.publishAgentRecord(agentSecret: nil, ttlMs: 0))
+        let address = try agentAddress(agent: agent)
+        XCTAssertTrue(address.hasPrefix("0x") && address.count == 42)
+        let hosted = try XCTUnwrap(core.agents(scope: workspace).first)
+        XCTAssertEqual(hosted.address, address)
+        XCTAssertTrue(hosted.hostedHere)
+        let card = try core.agentCard(agentSecret: agentSecret, ttlMs: 86_400_000)
+        let verified = try verifyAgentCard(card: card, address: address.uppercased().replacingOccurrences(of: "0X", with: "0x"))
+        XCTAssertEqual(verified.host, core.deviceKey())
+        XCTAssertEqual(verified.user, try core.userKey())
+        XCTAssertThrowsError(try verifyAgentCard(card: card, address: "0x" + String(repeating: "0", count: 40))) { e in
+            XCTAssertEqual((e as? SyncError)?.code, SyncErrorCode.crypto)
+        }
+        let expired = try core.agentCard(agentSecret: agentSecret, ttlMs: 0)
+        XCTAssertThrowsError(try verifyAgentCard(card: expired, address: nil)) { e in
+            XCTAssertEqual((e as? SyncError)?.code, SyncErrorCode.crypto)
+        }
+        XCTAssertTrue(try core.createInviteFor(scope: workspace, user: verified.user, role: .member, ttlMs: 60_000).hasPrefix("osaurus-invite:1:"))
 
         XCTAssertEqual(try core.recoveryPhrase().count, 24)
         XCTAssertEqual(try core.devices().count, 1)

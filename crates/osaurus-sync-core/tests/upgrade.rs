@@ -14,6 +14,7 @@ use std::sync::Arc;
 use osaurus_sync_core::env::SystemEnv;
 use osaurus_sync_core::error::Error;
 use osaurus_sync_core::identity::Platform;
+use osaurus_sync_core::ids::Role;
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
 use osaurus_sync_core::replica::MemorySecretStore;
 use osaurus_sync_core::store;
@@ -83,7 +84,16 @@ fn open_fixture(version: u32) -> (Replica, tempfile::TempDir) {
 
 #[test]
 fn opens_a_version_1_database() {
-    let (mut r, _tmp) = open_fixture(1);
+    opens_fixture(1);
+}
+
+#[test]
+fn opens_a_version_2_database() {
+    opens_fixture(2);
+}
+
+fn opens_fixture(version: u32) {
+    let (mut r, _tmp) = open_fixture(version);
     assert_eq!(store::store_version(r.db_for_tests()).unwrap(), Some(store::STORE_VERSION));
     let list = r.conversations().unwrap();
     assert_eq!(list.len(), 2);
@@ -100,6 +110,7 @@ fn opens_a_version_1_database() {
     // New writes, and features added since, work on the upgraded database.
     r.send_message(trip.scope, text("after the upgrade")).unwrap();
     let ws = list.iter().find(|c| c.title == "Projects").unwrap().scope;
+    r.create_invite_for(ws, Role::Member, r.user_key(), 60_000).unwrap();
     r.leave_scope(ws).unwrap();
     assert!(r.has_left(ws).unwrap());
     r.close().unwrap();

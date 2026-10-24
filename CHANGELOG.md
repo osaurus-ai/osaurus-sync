@@ -4,6 +4,28 @@ Each release lists what changed for the apps that use the library. Versions foll
 versioning; `API_VERSION` and `PROTOCOL_VERSION` are listed whenever they change. The release
 workflow copies a version's section into its GitHub release notes.
 
+## Unreleased
+
+`API_VERSION` and `PROTOCOL_VERSION` are unchanged; every addition is a new call.
+
+**Reaching an agent by its address**
+
+- `agentAddress(agent:)` returns an agent's `0x` address, the one osaurus-relay names it by.
+- `agents(scope:)` lists a scope's agents with their address, role, host device and expiry.
+- `agentCard(agentSecret:ttlMs:)` signs a card naming this device and user as the agent's host,
+  for the app to serve at `/.well-known/osaurus-sync` on the agent's osaurus-relay URL.
+- `verifyAgentCard(card:address:)` checks a card's signature, expiry and address, and returns
+  the host device and the owner's user key.
+- `createInviteFor(scope:user:role:ttlMs:)` creates an invite that only that user key can
+  redeem, for sending over channels others can read.
+
+**Changes**
+
+- Invites are now admitted only by the device that created them. Redeeming already sends the
+  request to that device, so working flows are unaffected.
+- The data directory moves to store version 3, which adds a column for bound invites. Earlier
+  releases can't open it afterwards.
+
 ## 0.1.0-beta.1 - 2026-10-24
 
 The first prerelease, for building the Mac, iOS and Windows clients. `API_VERSION` 1,

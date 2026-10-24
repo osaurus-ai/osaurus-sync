@@ -177,6 +177,8 @@ const MIGRATIONS: &[&str] = &[
     // 2: scopes this device left. Kept after the scope is purged so offers don't bring it back;
     // an invite clears it.
     "CREATE TABLE left_scopes (scope BLOB PRIMARY KEY, left_ms INTEGER NOT NULL);",
+    // 3: the only user an issued invite admits, when it was created for one.
+    "ALTER TABLE invites_issued ADD COLUMN for_user BLOB;",
 ];
 
 const VIEW_SCHEMA: &str = r#"

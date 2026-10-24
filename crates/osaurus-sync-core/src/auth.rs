@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::envelope::kind;
-use crate::identity::DeviceCert;
+use crate::identity::{AgentBinding, DeviceCert};
 use crate::ids::{AgentId, DeviceKey, EventHash, EventId, Principal, Role, ScopeId, UserKey};
 use crate::payload::{Control, InvitePayload};
 
@@ -95,7 +95,8 @@ pub struct MembershipState {
     pub members: BTreeMap<Principal, Role>,
     pub certs: BTreeMap<DeviceKey, BTreeMap<UserKey, DeviceCert>>,
     pub revoked: BTreeSet<DeviceKey>,
-    pub agent_hosts: BTreeMap<AgentId, DeviceKey>,
+    /// The winning assignment per agent; its `host_device` is the only device that acts for it.
+    pub agent_hosts: BTreeMap<AgentId, AgentBinding>,
     pub invites: BTreeMap<[u8; 32], InvitePayload>,
     pub used_invites: BTreeSet<[u8; 32]>,
 }
@@ -114,8 +115,8 @@ impl MembershipState {
                 }
             }
         }
-        for (agent, host) in &self.agent_hosts {
-            if host == device
+        for (agent, binding) in &self.agent_hosts {
+            if binding.host_device == *device
                 && let Some(role) = self.members.get(&Principal::Agent(*agent))
             {
                 out.push((Principal::Agent(*agent), *role));
@@ -440,7 +441,7 @@ impl ScopeAuth {
             if let Some(&m) = maximal.first()
                 && let Some(Control::AgentAssign(b)) = &self.events[m].body
             {
-                st.agent_hosts.insert(agent, b.host_device);
+                st.agent_hosts.insert(agent, b.clone());
             }
         }
         st

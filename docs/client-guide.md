@@ -392,6 +392,15 @@ Roles are `viewer`, `member`, `admin` and `owner`. Viewers can only read. Member
 Admins manage Viewers and Members. Owners manage everyone. A disallowed call throws
 `PermissionDenied`.
 
+Anyone holding a `createInvite` link can redeem it. When the link travels over a channel others
+can read, use `createInviteFor(scope:user:role:ttlMs:)` instead: only that user key can redeem it,
+so a copied link admits nobody else. Either kind of invite is admitted only by the device that
+created it, so that device has to come online for the redemption to finish.
+
+`invite(scope:user:role:)` adds a user without a link, but it doesn't connect the two of you:
+sync only dials devices already in a scope you share, and a device turns away strangers that
+don't hold an invite. Send an invite link when the other user has never synced with you.
+
 ## Agents
 
 An agent has its own identity (a secp256k1 secret), is hosted by one device, and can post in the
@@ -409,6 +418,52 @@ let hosted = try await core.resolveAgent(host: deviceKey)                 // whi
 
 `host: nil` makes this device the host. Sending `asAgent` from a device that doesn't host the
 agent fails with `PermissionDenied`.
+
+`agents(scope:)` lists a scope's agents. Each `AgentInfo` has the agent id, its `0x` address,
+its role, the host device (`nil` if it was never assigned), `hostedHere`, and when the
+assignment expires. If several devices assigned the same agent, the latest assignment wins.
+
+### Reaching an agent by its address
+
+[osaurus-relay](https://github.com/osaurus-ai/osaurus-relay) gives each agent a public URL,
+`https://0x<address>.agent.osaurus.ai`, where the address comes from the agent's key. Sync
+doesn't look agents up by address. Instead, the host app serves a signed **agent card** on that
+URL, and a caller uses it to learn which device hosts the agent and which user owns it.
+Membership still decides who syncs what.
+
+```swift
+// The host app, which keeps the osaurus-relay tunnel open for the agent:
+let address = try agentAddress(agent: agentId)                   // "0x7e5f…", the tunnel's address
+let card = try core.agentCard(agentSecret: secret, ttlMs: 86_400_000)
+// Serve GET /.well-known/osaurus-sync as {"card": card}.
+
+// The caller, given only the address:
+let json = try await fetch("https://\(address).agent.osaurus.ai/.well-known/osaurus-sync")
+let info = try verifyAgentCard(card: json.card, address: address)  // host device, owner's user key
+let link = try core.createInviteFor(scope: workspace, user: info.user, role: .member, ttlMs: 86_400_000)
+// POST the link to an endpoint the host app serves on the same URL.
+
+// The host app, on receiving the link:
+try core.redeemInvite(token: link)                               // dials the caller and joins
+```
+
+- The card is signed by the agent's key over the agent, the host device, the owner's user key,
+  and an expiry. osaurus-relay terminates TLS and could change what it forwards, but it can't
+  forge a card. The card doesn't include the device name.
+- `verifyAgentCard` throws `invalidInput` for a malformed card, and `crypto` for a bad
+  signature, an expired card, or an address that doesn't match. The address is compared
+  case-insensitively. Pass `nil` only when you got the card some other way and will check
+  `info.address` yourself.
+- osaurus-relay passes any path to the host, so the well-known endpoint needs no relay change.
+  The endpoint that receives invite links is up to the app; sync doesn't define it.
+- Use a short TTL, such as a day, and sign a fresh card before the old one expires. A card for a
+  host that no longer runs the agent keeps pointing at it until it expires.
+- Keep the osaurus-relay tunnel on the device that `agents(scope:)` reports as the host, so the
+  card and the tunnel agree.
+- Send `createInviteFor` links over this channel, not `createInvite` links. osaurus-relay sees
+  requests in plaintext, and a bound link is useless to anyone but the card's user.
+- `publishAgentRecord` and `resolveAgent` are the other direction: given a device, which agent
+  it hosts.
 
 ## History and backfill
 

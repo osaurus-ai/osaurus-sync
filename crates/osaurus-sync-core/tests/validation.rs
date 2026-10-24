@@ -143,6 +143,35 @@ fn agent_messages_only_from_host() {
 }
 
 #[test]
+fn agents_report_the_latest_assignment() {
+    let env = Arc::new(TestEnv::new(16, 1_700_000_000_000));
+    let ((mut alice, _a), (mut bob, _b), scope) = alice_and_bob(&env);
+    assert!(alice.agents(scope).unwrap().is_empty());
+    let secret = [7u8; 32];
+    let agent = alice.assign_agent(scope, &secret, None, Role::Member, 30 * 86_400_000).unwrap();
+    let list = alice.agents(scope).unwrap();
+    assert_eq!(list.len(), 1);
+    let (id, role, binding) = &list[0];
+    assert_eq!((*id, *role), (agent, Role::Member));
+    let binding = binding.as_ref().unwrap();
+    assert_eq!(binding.host_device, alice.device_key());
+    assert_eq!(binding.expires_ms, osaurus_sync_core::env::Env::now_ms(&*env) + 30 * 86_400_000);
+
+    // Bob reassigns the agent to his device; both converge on the newer binding.
+    copy(&alice, &mut bob, scope);
+    env.advance(10);
+    bob.assign_agent(scope, &secret, None, Role::Member, 86_400_000).unwrap();
+    copy(&bob, &mut alice, scope);
+    let bob_device = bob.device_key();
+    for r in [&mut alice, &mut bob] {
+        let list = r.agents(scope).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].2.as_ref().unwrap().host_device, bob_device);
+    }
+    assert_eq!(alice.agent_host(scope, &agent).unwrap(), Some(bob_device));
+}
+
+#[test]
 fn held_until_parents_arrive_and_garbage_rejected() {
     let env = Arc::new(TestEnv::new(15, 1_700_000_000_000));
     let (mut a, _ad) = open("A", &env);
@@ -225,4 +254,24 @@ fn delivery_order_does_not_matter() {
     let v1: Vec<_> = c1.scope_heads(scope).unwrap().0;
     let v2: Vec<_> = c2.scope_heads(scope).unwrap().0;
     assert_eq!(v1, v2);
+}
+
+#[test]
+fn a_bound_invite_admits_only_its_user_at_the_issuer() {
+    let env = Arc::new(TestEnv::new(17, 1_700_000_000_000));
+    let ((mut alice, _a), (mut bob, _b), scope) = alice_and_bob(&env);
+    let (mut carol, _c) = open("Carol Mac", &env);
+    let (mallory, _m) = open("Mallory", &env);
+    let invite = alice.create_invite_for(scope, Role::Member, carol.user_key(), 86_400_000).unwrap();
+    env.advance(10);
+    assert!(matches!(alice.admit_invitee(scope, invite.token, mallory.cert()), Err(Error::PermissionDenied(m)) if m.contains("another user")));
+
+    // Another admin holds the same invite event but not the binding, so it won't admit.
+    alice.change_role(scope, Principal::User(bob.user_key()), Role::Admin).unwrap();
+    copy(&alice, &mut bob, scope);
+    assert!(matches!(bob.admit_invitee(scope, invite.token, mallory.cert()), Err(Error::PermissionDenied(m)) if m.contains("not issued")));
+
+    alice.admit_invitee(scope, invite.token, carol.cert()).unwrap();
+    copy(&alice, &mut carol, scope);
+    assert_eq!(carol.conversation(scope).unwrap().unwrap().my_role, Some(Role::Member));
 }

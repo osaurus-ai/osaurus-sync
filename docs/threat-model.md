@@ -101,6 +101,9 @@ Any device on the internet that knows a device id can connect.
 
 - It's sent `Bye` unless admission trusts its certificate. The one exception is a device
   redeeming an open invite, which may send 16 messages.
+- A copied invite link admits whoever redeems it first, unless it was created with
+  `createInviteFor`, which admits only the named user key. Only the issuing device admits
+  either kind.
 - Frames are capped at 8 MiB and payloads at 4 MiB. Decoding happens before anything else, and
   every decoder (envelopes, protocol messages, stream frames, payloads, invites and pairing
   codes) and range reconciliation are fuzzed nightly (`fuzz/`).
@@ -198,6 +201,14 @@ external review.
   rejects its new messages. Purges can't be undone, so judging these by removals that arrive
   later would leave devices that compacted and devices that didn't with different views.
 - **Denial of service** by trusted peers is bounded but not prevented.
+- **Agent cards can point at a former host.** A card stays valid until it expires, so after an
+  agent moves to another device, an old card still names the former host and its user. A card
+  only helps a caller find and verify an agent's owner; admission still requires membership, and
+  a bound invite admits only the user the card named. Short card lifetimes limit the window.
+- **osaurus-relay sees agent traffic in plaintext.** It terminates TLS, so it can read, drop or
+  replay agent cards and invite links. It can't forge a card, which the agent key signs, or use a
+  bound invite, but it can redeem an unbound one. Apps send only `createInviteFor` links through
+  it.
 
 ## Verification
 
@@ -222,6 +233,8 @@ yet. The scope:
 5. Identity rotation and `IdentityHandoff`: who may hand over an identity, and the race above.
 6. The envelope's canonical encoding and what the signature covers.
 7. Epoch rotation on removal and revocation, and the cutoff rules in `auth.rs`.
+8. Agent cards and bound invites: the card's signed body and expiry check (`identity.rs`), the
+   keccak-256 address derivation (`ids.rs`), and the issuing-device check in `admit_invitee`.
 
 To prepare: freeze the protocol version, tag the reviewed commit, and give the reviewers this
 document, the architecture, `crypto.rs`, `identity.rs`, `keys.rs`, `auth.rs` and the engine's

@@ -420,6 +420,14 @@ impl SyncCore {
         self.write(|r| r.create_invite(scope, role.into(), ttl_ms)).map(|t| t.encode())
     }
 
+    /// An invite only `user` can redeem, for sending over a channel others can read, such as an
+    /// agent's public URL. Only this device can admit with it.
+    pub fn create_invite_for(&self, scope: String, user: String, role: MemberRole, ttl_ms: u64) -> R<String> {
+        let scope = scope_id(&scope)?;
+        let user = user_key(&user)?;
+        self.write(|r| r.create_invite_for(scope, role.into(), user, ttl_ms)).map(|t| t.encode())
+    }
+
     /// Redeems an invite. The result arrives as `CoreEvent::InviteResult`.
     pub fn redeem_invite(&self, token: String) -> R<()> {
         self.live()?;
@@ -525,6 +533,32 @@ impl SyncCore {
         let id = binding.as_ref().map(|b| b.agent.to_hex());
         self.node.publish_agent(binding).map_err(|e| SyncError::invalid(format!("{e:#}")))?;
         Ok(id)
+    }
+
+    /// The scope's agent members, with their hosts.
+    pub fn agents(&self, scope: String) -> R<Vec<AgentInfo>> {
+        let scope = scope_id(&scope)?;
+        let me = self.node.device_key();
+        let list = self.read(|r| r.agents(scope))?;
+        Ok(list
+            .into_iter()
+            .map(|(agent, role, binding)| AgentInfo {
+                agent: agent.to_hex(),
+                address: agent.address_hex().unwrap_or_default(),
+                role: role.into(),
+                host: binding.as_ref().map(|b| b.host_device.to_hex()),
+                hosted_here: binding.as_ref().is_some_and(|b| b.host_device == me),
+                expires_ms: binding.map(|b| b.expires_ms),
+            })
+            .collect())
+    }
+
+    /// Signs an agent card naming this device as the agent's host and this device's user, for
+    /// the host app to serve on the agent's public URL. Valid for `ttl_ms`.
+    pub fn agent_card(&self, agent_secret: Vec<u8>, ttl_ms: u64) -> R<String> {
+        let user = self.read(|r| Ok(r.user_key()))?;
+        let expires = osaurus_sync_core::env::Env::now_ms(&SystemEnv) + ttl_ms;
+        Ok(osaurus_sync_core::identity::AgentCard::sign(&agent_secret, self.node.device_key(), user, expires)?.encode())
     }
 
     /// Looks up the agent a device publishes as host. Returns the verified agent id.
@@ -779,4 +813,26 @@ impl OutgoingStream {
 #[uniffi::export]
 pub fn generate_agent_secret() -> Vec<u8> {
     random_array::<32>(&SystemEnv).to_vec()
+}
+
+/// The `0x` address of an agent id (hex, or an `a:<hex>` principal), as osaurus-relay names
+/// agents (`https://0x<address>.<domain>`).
+#[uniffi::export]
+pub fn agent_address(agent: String) -> R<String> {
+    types::agent_id(agent.strip_prefix("a:").unwrap_or(&agent))?.address_hex().ok_or_else(|| SyncError::invalid("not a valid agent key"))
+}
+
+/// Checks an agent card fetched from an agent's public URL: its signature, its expiry, and, if
+/// `address` is given, that it belongs to that agent. Fails with `Crypto` if any check fails.
+#[uniffi::export]
+pub fn verify_agent_card(card: String, address: Option<String>) -> R<AgentCardInfo> {
+    let now = osaurus_sync_core::env::Env::now_ms(&SystemEnv);
+    let c = osaurus_sync_core::identity::AgentCard::open(&card, address.as_deref(), now)?;
+    Ok(AgentCardInfo {
+        agent: c.agent.to_hex(),
+        address: c.agent.address_hex().unwrap_or_default(),
+        host: c.host_device.to_hex(),
+        user: c.user.to_hex(),
+        expires_ms: c.expires_ms,
+    })
 }

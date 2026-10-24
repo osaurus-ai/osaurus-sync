@@ -125,6 +125,23 @@ byte_id!(
     AgentId, 33
 );
 
+impl AgentId {
+    /// The agent's Ethereum-style address, as osaurus-relay names agents: the last 20 bytes of
+    /// keccak-256 over the uncompressed public key. None if the id isn't a valid curve point.
+    pub fn address(&self) -> Option<[u8; 20]> {
+        use sha3::Digest;
+        let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.0).ok()?;
+        let point = vk.to_sec1_point(false);
+        let hash = sha3::Keccak256::digest(&point.as_bytes()[1..]);
+        hash[12..].try_into().ok()
+    }
+
+    /// `address` as lowercase `0x` hex.
+    pub fn address_hex(&self) -> Option<String> {
+        self.address().map(|a| format!("0x{}", hex::encode(a)))
+    }
+}
+
 impl EventId {
     /// Builds a UUIDv7 from a millisecond timestamp and 10 random bytes.
     pub fn new_v7(unix_ms: u64, random: [u8; 10]) -> Self {
@@ -182,5 +199,21 @@ impl Role {
             3 => Role::Owner,
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::AgentBinding;
+
+    #[test]
+    fn agent_address_matches_ethereum() {
+        // Secret key 1: the generator point, whose Ethereum address is well known.
+        let mut secret = [0u8; 32];
+        secret[31] = 1;
+        let agent = AgentBinding::agent_id_from_secret(&secret).unwrap();
+        assert_eq!(agent.address_hex().unwrap(), "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+        assert_eq!(AgentId([0; 33]).address(), None);
     }
 }

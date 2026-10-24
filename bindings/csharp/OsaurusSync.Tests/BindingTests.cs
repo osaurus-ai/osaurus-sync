@@ -146,9 +146,26 @@ public sealed class BindingTests : IDisposable
             await other.Close();
         }
 
-        Assert.True(core.AssignAgent(workspace, OsaurusSyncFfiMethods.GenerateAgentSecret(), null, MemberRole.Member, 86_400_000).Length > 60);
+        var agentSecret = OsaurusSyncFfiMethods.GenerateAgentSecret();
+        var agent = core.AssignAgent(workspace, agentSecret, null, MemberRole.Member, 86_400_000);
+        Assert.True(agent.Length > 60);
         Assert.NotNull(core.PublishAgentRecord(OsaurusSyncFfiMethods.GenerateAgentSecret(), 60_000));
         Assert.Null(core.PublishAgentRecord(null, 0));
+        var address = OsaurusSyncFfiMethods.AgentAddress(agent);
+        Assert.Matches("^0x[0-9a-f]{40}$", address);
+        var hosted = Assert.Single(core.Agents(workspace));
+        Assert.Equal(address, hosted.Address);
+        Assert.True(hosted.HostedHere);
+        var card = core.AgentCard(agentSecret, 86_400_000);
+        var verified = OsaurusSyncFfiMethods.VerifyAgentCard(card, "0x" + address[2..].ToUpperInvariant());
+        Assert.Equal(core.DeviceKey(), verified.Host);
+        Assert.Equal(core.UserKey(), verified.User);
+        var wrongAddress = Assert.ThrowsAny<SyncException>(() => OsaurusSyncFfiMethods.VerifyAgentCard(card, "0x" + new string('0', 40)));
+        Assert.Equal(SyncErrorCode.Crypto, SyncErrorCode.CodeOf(wrongAddress));
+        var expired = core.AgentCard(agentSecret, 0);
+        var expiredError = Assert.ThrowsAny<SyncException>(() => OsaurusSyncFfiMethods.VerifyAgentCard(expired, null));
+        Assert.Equal(SyncErrorCode.Crypto, SyncErrorCode.CodeOf(expiredError));
+        Assert.StartsWith("osaurus-invite:1:", core.CreateInviteFor(workspace, verified.User, MemberRole.Member, 60_000));
 
         Assert.Equal(24, core.RecoveryPhrase().Length);
         Assert.Equal(core.DeviceKey(), Assert.Single(core.Devices()).Id);

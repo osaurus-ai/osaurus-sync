@@ -29,6 +29,7 @@ flowchart LR
 | Relay servers (`iroh-relay`) | Osaurus, two or more regions | Nothing durable | Sync between devices on different networks |
 | Discovery server (`iroh-dns-server`) | Osaurus, one deployment | A signed record per device: its device id and home relay URL | Finding a device by its id over the internet; agent host records |
 | Storage server | Not built yet | Full event history for the scopes it syncs | Delivery while the user's other devices are offline, compaction |
+| osaurus-relay | Osaurus, separately | Nothing for sync | Reaching an agent by its `0x` address (see [Agents and osaurus-relay](#agents-and-osaurus-relay)) |
 
 ## Tiers
 
@@ -197,7 +198,29 @@ using var core = OsaurusSync.Open(dir, Environment.MachineName, network: net);
   apply a new configuration at the next open rather than restarting a running core.
 - **Turn mDNS off** (`mdns = false`) if the user declined the iOS local network permission.
 
-## The storage server (later phase)
+## Agents and osaurus-relay
+
+[osaurus-relay](https://github.com/osaurus-ai/osaurus-relay) is a separate service with a
+different job. It's public HTTP ingress: it gives each agent a URL,
+`https://0x<address>.agent.osaurus.ai`, and forwards requests over a tunnel that the agent's
+host app keeps open. That's how webhooks and other web services reach an agent. Sync doesn't
+use osaurus-relay to move data, and it runs independently of the sync relays and the discovery
+server. Deploy, scale and monitor it on its own.
+
+The two connect in one place. The host app answers `GET /.well-known/osaurus-sync` on the
+agent's URL with a signed agent card, and a caller verifies it to learn the agent's host device
+and owner. Any sharing that follows uses ordinary invites over sync. See
+[Reaching an agent by its address](client-guide.md#reaching-an-agent-by-its-address).
+osaurus-relay passes every path through to the host, so it needs no change for this.
+
+They differ in what they see:
+
+- **osaurus-relay terminates TLS**, so it sees requests and responses in plaintext, including
+  agent cards and any invite links the apps send through it. Cards are signed by the agent key,
+  so it can't forge one. Apps send bound invites (`createInviteFor`) through it, which only the
+  card's user can redeem.
+- **The sync relays** forward QUIC traffic that is encrypted end to end between devices, and see
+  only device ids and traffic volume.
 
 A storage server is an Osaurus-run device that syncs like any other peer and has the storage
 role. The core already supports the role; the server binary isn't built yet. It would add:

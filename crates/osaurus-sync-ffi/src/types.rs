@@ -348,6 +348,34 @@ pub struct Member {
     pub role: MemberRole,
 }
 
+/// An agent member of a scope and its current assignment.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AgentInfo {
+    /// The agent id (hex of its compressed secp256k1 key), as in `a:<agent>` principals.
+    pub agent: String,
+    /// The agent's `0x` address, as osaurus-relay names it.
+    pub address: String,
+    pub role: MemberRole,
+    /// The device that hosts the agent; None if the agent was never assigned.
+    pub host: Option<String>,
+    /// True when this device is the host.
+    pub hosted_here: bool,
+    /// When the assignment's binding expires.
+    pub expires_ms: Option<u64>,
+}
+
+/// A verified agent card: who hosts an agent, and the user that host acts for.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AgentCardInfo {
+    pub agent: String,
+    pub address: String,
+    /// The host's device id, for dialing and admission.
+    pub host: String,
+    /// The host's user key, for `invite`.
+    pub user: String,
+    pub expires_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct Conversation {
     pub scope: String,

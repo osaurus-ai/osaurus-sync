@@ -76,10 +76,10 @@ Only regenerate the fixtures for a deliberate format change, and treat it as a b
 REGENERATE_FIXTURES=1 cargo test -p osaurus-sync-sim --test fixtures
 ```
 
-`crates/osaurus-sync-core/tests/fixtures/store-v1` is a data directory written by the last
-commit at store version 1, with its key store entries. `tests/upgrade.rs` opens it with the
-current code and checks that conversations, edits, reactions and attachments survive the
-migrations. When you add a migration (see `store.rs`), first freeze the outgoing version: check
+`crates/osaurus-sync-core/tests/fixtures/store-v<N>` holds a data directory written by the last
+commit at store version N (1 and 2 so far), with its key store entries. `tests/upgrade.rs` opens
+each with the current code and checks that conversations, edits, reactions and attachments
+survive the migrations. When you add a migration (see `store.rs`), first freeze the outgoing version: check
 out the last commit at that version and run
 
 ```sh
@@ -87,7 +87,7 @@ OSAURUS_FIXTURE_OUT=/tmp/store-vN cargo test -p osaurus-sync-core --test upgrade
 ```
 
 then copy `/tmp/store-vN` (without `data/.lock`) to `tests/fixtures/store-vN` and add a test for
-it next to `opens_a_version_1_database`.
+it next to `opens_a_version_2_database`.
 
 ### Scale tests
 

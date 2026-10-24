@@ -295,6 +295,53 @@ fn restored_backup_unlocks_with_the_phrase() {
 }
 
 #[test]
+fn agent_card_bootstraps_a_workspace_invite() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = SyncCore::open(config(dir.path(), "host", Platform::MacOs, true), Box::new(Keys::default())).unwrap();
+    let caller = SyncCore::open(config(dir.path(), "caller", Platform::Windows, true), Box::new(Keys::default())).unwrap();
+    let host_events = Events::default();
+    host.set_listener(Some(Box::new(host_events.clone())));
+
+    // The host runs the agent and serves its card.
+    let secret = generate_agent_secret();
+    let home = host.create_conversation("Agent home".into()).unwrap();
+    let agent = host.assign_agent(home.clone(), secret.clone(), None, MemberRole::Member, 86_400_000).unwrap();
+    let address = agent_address(agent.clone()).unwrap();
+    assert_eq!(agent_address(format!("a:{agent}")).unwrap(), address);
+    assert!(address.starts_with("0x") && address.len() == 42);
+    let info = host.agents(home.clone()).unwrap();
+    assert_eq!(info.len(), 1);
+    assert_eq!((info[0].agent.as_str(), info[0].address.as_str()), (agent.as_str(), address.as_str()));
+    assert_eq!(info[0].host.as_deref(), Some(host.device_key().as_str()));
+    assert!(info[0].hosted_here && info[0].expires_ms.is_some());
+    let card = host.agent_card(secret, 86_400_000).unwrap();
+
+    // The caller, another user, fetched the card from the agent's URL.
+    let verified = verify_agent_card(card.clone(), Some(address.to_uppercase().replacen("0X", "0x", 1))).unwrap();
+    assert_eq!(verified.agent, agent);
+    assert_eq!(verified.host, host.device_key());
+    assert_eq!(verified.user, host.user_key().unwrap());
+    let other = agent_address(host.assign_agent(home.clone(), generate_agent_secret(), None, MemberRole::Member, 60_000).unwrap()).unwrap();
+    assert!(matches!(verify_agent_card(card.clone(), Some(other)), Err(SyncError::Crypto { .. })));
+    assert!(matches!(verify_agent_card("osaurus-agent-card:1:zz".into(), None), Err(SyncError::InvalidInput { .. })));
+
+    // An invite bound to the card's user travels back over the same public channel.
+    let ws = caller.create_workspace("Team".into()).unwrap();
+    caller.send_message(ws.clone(), text("hello agent")).unwrap();
+    let token = caller.create_invite_for(ws.clone(), verified.user, MemberRole::Member, 300_000).unwrap();
+    host.add_peer_address(caller.local_address().unwrap()).unwrap();
+    caller.add_peer_address(host.local_address().unwrap()).unwrap();
+    host.redeem_invite(token).unwrap();
+    until("invite accepted", || host_events.0.lock().unwrap().iter().any(|e| matches!(e, CoreEvent::InviteResult { error: None, .. })));
+    until("workspace", || host.conversations().unwrap().iter().any(|c| c.scope == ws));
+    until("history", || contents(&host, &ws) == vec!["hello agent"]);
+    assert_eq!(host.conversation(ws.clone()).unwrap().unwrap().my_role, Some(MemberRole::Member));
+
+    block_on(host.close()).unwrap();
+    block_on(caller.close()).unwrap();
+}
+
+#[test]
 fn network_configs() {
     let d = default_network_config();
     assert!(d.relays.is_empty() && d.discovery_server.is_none() && d.mdns);

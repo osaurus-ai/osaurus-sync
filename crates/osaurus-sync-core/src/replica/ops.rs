@@ -287,7 +287,7 @@ impl Replica {
             let st = r.auth_mut(scope)?.full_state();
             let devices: Vec<DeviceKey> = match subject {
                 Principal::User(u) => st.devices_of(&u),
-                Principal::Agent(a) => st.agent_hosts.get(&a).copied().into_iter().collect(),
+                Principal::Agent(a) => st.agent_hosts.get(&a).map(|b| b.host_device).into_iter().collect(),
             };
             let mut cutoffs = Vec::new();
             for d in devices {
@@ -481,21 +481,31 @@ impl Replica {
     // ---- invites ----
 
     pub fn create_invite(&mut self, scope: ScopeId, role: Role, ttl_ms: u64) -> Result<InviteToken> {
+        self.issue_invite(scope, role, ttl_ms, None)
+    }
+
+    /// An invite only `user` can redeem, for tokens sent over channels that others can read.
+    pub fn create_invite_for(&mut self, scope: ScopeId, role: Role, user: UserKey, ttl_ms: u64) -> Result<InviteToken> {
+        self.issue_invite(scope, role, ttl_ms, Some(user))
+    }
+
+    fn issue_invite(&mut self, scope: ScopeId, role: Role, ttl_ms: u64, for_user: Option<UserKey>) -> Result<InviteToken> {
         let token: [u8; 32] = random_array(self.env.as_ref());
         let expires_ms = self.env.now_ms() + ttl_ms;
         let token_hash = crypto::hash(&token);
         self.tx(|r| {
             r.append_control(scope, &Control::Invite(InvitePayload { token_hash, role, expires_ms }))?;
             r.db.execute(
-                "INSERT INTO invites_issued(token_hash, scope, token, role, expires_ms) VALUES (?, ?, ?, ?, ?)",
-                params![&token_hash[..], &scope.0[..], &token[..], role as i64, expires_ms as i64],
+                "INSERT INTO invites_issued(token_hash, scope, token, role, expires_ms, for_user) VALUES (?, ?, ?, ?, ?, ?)",
+                params![&token_hash[..], &scope.0[..], &token[..], role as i64, expires_ms as i64, for_user.as_ref().map(|u| &u.0[..])],
             )?;
             Ok(())
         })?;
         Ok(InviteToken { scope, token, inviter: self.device_key(), role })
     }
 
-    /// Admits an invitee presenting a valid, unused token. Runs on an Admin or Owner device.
+    /// Admits an invitee presenting a valid, unused token. Runs on the Admin or Owner device
+    /// that issued it, since only that device knows which user a bound invite is for.
     pub fn admit_invitee(&mut self, scope: ScopeId, token: [u8; 32], cert: &DeviceCert) -> Result<()> {
         if !cert.verify() {
             return Err(Error::InvalidInput("bad certificate".into()));
@@ -508,6 +518,13 @@ impl Replica {
         }
         if invite.expires_ms < self.env.now_ms() {
             return Err(Error::PermissionDenied("invite expired".into()));
+        }
+        let issued: Option<Option<Vec<u8>>> =
+            self.db.query_row("SELECT for_user FROM invites_issued WHERE token_hash = ?", [&hash[..]], |r| r.get(0)).optional()?;
+        match issued {
+            None => return Err(Error::PermissionDenied("invite not issued by this device".into())),
+            Some(Some(user)) if user != cert.user.0[..] => return Err(Error::PermissionDenied("invite is for another user".into())),
+            Some(_) => {}
         }
         if st.max_role(&self.device_key()) < Some(Role::Admin) {
             return Err(Error::PermissionDenied("only an admin can admit".into()));
@@ -542,7 +559,21 @@ impl Replica {
     }
 
     pub fn agent_host(&mut self, scope: ScopeId, agent: &AgentId) -> Result<Option<DeviceKey>> {
-        Ok(self.auth_mut(scope)?.full_state().agent_hosts.get(agent).copied())
+        Ok(self.auth_mut(scope)?.full_state().agent_hosts.get(agent).map(|b| b.host_device))
+    }
+
+    /// The scope's agent members with their roles and current assignments. An agent added as a
+    /// member but never assigned has no binding.
+    pub fn agents(&mut self, scope: ScopeId) -> Result<Vec<(AgentId, Role, Option<AgentBinding>)>> {
+        let st = self.auth_mut(scope)?.full_state();
+        Ok(st
+            .members
+            .iter()
+            .filter_map(|(p, role)| match p {
+                Principal::Agent(a) => Some((*a, *role, st.agent_hosts.get(a).cloned())),
+                Principal::User(_) => None,
+            })
+            .collect())
     }
 
     // ---- identity ----
