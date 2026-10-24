@@ -221,8 +221,11 @@ directory. A lock file makes sure only one process opens a data directory at a t
   opening fails with `Corrupt` and the app can offer `reset` and a fresh sync.
 - **Checkpoints.** SQLite's automatic WAL checkpoint runs inside whichever commit crosses the
   threshold and ends in an fsync, which would stall local writes behind the replica's lock.
-  The network node instead runs a passive checkpoint every second from a second connection,
-  which doesn't block writers, and raises the automatic threshold to about 40 MB as a
+  The network node instead runs a passive checkpoint from a second connection, which doesn't
+  block writers, and raises the automatic threshold to about 40 MB as a backstop. It runs one
+  every second, and during a catch-up after every 128 received events, between slices with the
+  lock released. The log only restarts when a write begins after a checkpoint has caught up,
+  so under a steady stream of slices a once-a-second checkpoint would let it grow to the
   backstop.
 - Supporting tables track DAG heads, held events, the outbox, peers, storage peers, known and
   revoked devices, retired users, blobs, Loro snapshots and read state. `left_scopes` remembers
@@ -579,9 +582,9 @@ budget fails the run.
 | Local send to view update | under 5 ms | 0.13 ms |
 | Open a conversation, first 50 messages | under 20 ms | 0.14 ms |
 | Cold start with 100 scopes | under 300 ms | 1.1 ms |
-| Catch-up of 1,000 events on a LAN | under 1 s | 367 ms (loopback, including reconnect) |
-| Live delivery to a connected peer | one round trip plus 10 ms | 0.42 ms |
-| Local send while catching up 10,000 events | under 5 ms (95th percentile) | 4.6 ms; 1.1 ms median |
+| Catch-up of 1,000 events on a LAN | under 1 s | 280 ms (loopback, including reconnect) |
+| Live delivery to a connected peer | one round trip plus 10 ms | 0.36 ms |
+| Local send while catching up 10,000 events | under 5 ms (95th percentile) | 2.3–3.9 ms at the 95th percentile |
 
 ## Out of scope for Phase 1
 

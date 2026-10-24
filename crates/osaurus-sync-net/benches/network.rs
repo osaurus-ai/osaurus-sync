@@ -46,9 +46,23 @@ fn recent_log() -> &'static Mutex<VecDeque<String>> {
 
 struct Recent;
 
+impl Recent {
+    fn wants(m: &tracing::Metadata<'_>) -> bool {
+        m.is_event() && (*m.level() <= Level::INFO || *m.level() <= Level::DEBUG && m.target().starts_with("osaurus_sync_net"))
+    }
+}
+
 impl<S: Subscriber> Layer<S> for Recent {
+    fn register_callsite(&self, m: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        if Recent::wants(m) { tracing::subscriber::Interest::always() } else { tracing::subscriber::Interest::never() }
+    }
+
     fn enabled(&self, m: &tracing::Metadata<'_>, _: Context<'_, S>) -> bool {
-        m.is_event() && (*m.level() <= Level::INFO || m.target().starts_with("osaurus_sync_net"))
+        Recent::wants(m)
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::DEBUG)
     }
 
     fn on_event(&self, e: &Event<'_>, _: Context<'_, S>) {

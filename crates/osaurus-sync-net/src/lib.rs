@@ -12,7 +12,7 @@ mod frame;
 mod streams;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,10 @@ const MAINTAIN_EVERY: Duration = Duration::from_secs(3600);
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
 /// Events applied per state-lock hold when a received chunk is large.
 const APPLY_SLICE: usize = 16;
+/// Received events applied between checkpoints during a catch-up. A once-a-second checkpoint
+/// can't keep up with one: the log only restarts when a write begins after a checkpoint has
+/// caught up, so it would grow until a commit behind the lock checkpoints it inline.
+const CHECKPOINT_AFTER: usize = 128;
 /// Two connections between the same pair, in opposite directions, opened within this window
 /// are a simultaneous dial and settled by a tie-break. Past it, the newer one wins: the peer
 /// only dials while it has no working connection, so the older one is stale.
@@ -194,6 +198,7 @@ pub(crate) struct Inner {
     next_conn: AtomicU64,
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
+    applied_since_checkpoint: AtomicUsize,
     memory: MemoryLookup,
     agent_record: Mutex<Option<AgentBinding>>,
     pub(crate) streams: streams::Incoming,
@@ -277,6 +282,7 @@ impl SyncNode {
             next_conn: AtomicU64::new(1),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
+            applied_since_checkpoint: AtomicUsize::new(0),
             memory: MemoryLookup::new(),
             agent_record: Mutex::new(None),
             streams: streams::Incoming::default(),
@@ -761,10 +767,22 @@ impl Inner {
             for msg in Msg::decode(&bytes)?.into_slices(APPLY_SLICE) {
                 let me = self.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    let mut st = lock(&me.state);
-                    let State { replica, engine } = &mut *st;
-                    let res = engine.handle(replica, peer, msg).map(|outs| me.route(outs));
-                    (res, replica.take_changes())
+                    let n = if let Msg::Events { events, .. } = &msg { events.len() } else { 0 };
+                    let res = {
+                        let mut st = lock(&me.state);
+                        let State { replica, engine } = &mut *st;
+                        let res = engine.handle(replica, peer, msg).map(|outs| me.route(outs));
+                        (res, replica.take_changes())
+                    };
+                    if let Some(cp) = &me.checkpointer
+                        && me.applied_since_checkpoint.fetch_add(n, Ordering::Relaxed) + n >= CHECKPOINT_AFTER
+                    {
+                        me.applied_since_checkpoint.store(0, Ordering::Relaxed);
+                        if let Err(e) = cp.run() {
+                            debug!("checkpoint failed: {e}");
+                        }
+                    }
+                    res
                 })
                 .await?;
                 match res {

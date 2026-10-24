@@ -34,8 +34,9 @@ struct State {
 
 impl Checkpointer {
     /// Copies committed log frames into the database without waiting for readers or writers.
-    /// Call it every second or so from a thread that doesn't hold the replica. Does nothing
-    /// once the replica is closed.
+    /// Call it every second or so from a thread that doesn't hold the replica, and between
+    /// batches of a long run of writes: the log restarts only when a write begins after a
+    /// checkpoint has caught up. Does nothing once the replica is closed.
     pub fn run(&self) -> Result<()> {
         let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.closed {
