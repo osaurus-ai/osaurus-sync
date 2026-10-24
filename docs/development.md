@@ -10,6 +10,8 @@ How to build, test and release Osaurus Sync.
 | Xcode 16+ | The Swift package | macOS only. Provides `xcodebuild` and the iOS Simulator |
 | .NET 8 SDK | The C# package | `brew install --cask dotnet-sdk` on macOS |
 | uniffi-bindgen-cs | Generating C# bindings | `cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.1+v0.31.0` |
+| cargo-deny, cargo-about, cargo-cyclonedx | Dependency checks, notices, SBOMs | Optional locally; see [Dependencies and licenses](#dependencies-and-licenses) |
+| Nightly Rust and cargo-fuzz | Fuzzing | Optional locally; see [Fuzzing](#fuzzing) |
 
 Pinned versions that matter:
 
@@ -28,9 +30,11 @@ crates/
 bindings/
   swift/                Swift package for macOS and iOS
   csharp/               .NET 8 package and xUnit tests
-scripts/                build, binding generation, packaging, simulator helpers
+fuzz/                   cargo-fuzz targets (separate crate, nightly)
+scripts/                build, binding generation, packaging, notices, SBOM, fuzzing, simulator helpers
 tests/fixtures/         signed events from earlier builds (compatibility)
-docs/                   architecture, client guide, this file
+docs/                   architecture, client guide, threat model, this file
+deny.toml, about.toml   dependency policy and the notices configuration
 ```
 
 ## Building and testing the core
@@ -173,6 +177,10 @@ installed device, so changes need care:
 - **Bump `VIEW_VERSION`** when a view table changes. The views are rebuilt from `events` on the
   next open.
 - Add a fixture for the new format, and keep the old fixtures passing.
+
+Until the first tagged release, `API_VERSION` and `PROTOCOL_VERSION` stay at 1 and
+incompatible changes don't bump them, since no installed build needs to interoperate. From the
+first release on, the rules above apply.
 
 ## Fuzzing
 
