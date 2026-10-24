@@ -31,6 +31,17 @@ const MAX_IN_FLIGHT: usize = 8;
 const WANT_CHUNK: usize = 512;
 const EVENTS_CHUNK_BYTES: usize = 1024 * 1024;
 const PAIRING_ATTEMPTS: u32 = 5;
+/// Per-session receive limits, per window. Catch-up replies are limited loosely; unsolicited
+/// pushes (live traffic) much more tightly.
+pub const BUDGET_WINDOW_MS: u64 = 60_000;
+pub const MAX_EVENTS_PER_WINDOW: usize = 500_000;
+pub const MAX_BYTES_PER_WINDOW: usize = 2 << 30;
+pub const MAX_PUSHED_PER_WINDOW: usize = 20_000;
+pub const MAX_PUSHED_BYTES_PER_WINDOW: usize = 256 << 20;
+/// Invalid events (bad signature, malformed, over the held limit) tolerated per session.
+pub const MAX_INVALID_PER_SESSION: usize = 1_000;
+/// Messages an untrusted session may send while redeeming an invite.
+pub const MAX_UNTRUSTED_MSGS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Out {
@@ -180,6 +191,42 @@ struct Session {
     running: BTreeMap<u32, Running>,
     /// Want tag -> recon tag.
     wants: HashMap<u32, u32>,
+    budget: Budget,
+}
+
+/// What a peer has sent in the current window. A peer over any limit is disconnected.
+#[derive(Default)]
+struct Budget {
+    window_start_ms: u64,
+    events: usize,
+    bytes: usize,
+    pushed: usize,
+    pushed_bytes: usize,
+    invalid: usize,
+    untrusted_msgs: usize,
+}
+
+impl Budget {
+    /// Charges a batch of received events. Returns why the peer is over budget, if it is.
+    fn charge(&mut self, now_ms: u64, events: &[Vec<u8>], pushed: bool) -> Option<&'static str> {
+        if now_ms.saturating_sub(self.window_start_ms) >= BUDGET_WINDOW_MS {
+            *self = Budget { window_start_ms: now_ms, invalid: self.invalid, untrusted_msgs: self.untrusted_msgs, ..Default::default() };
+        }
+        let bytes: usize = events.iter().map(|e| e.len()).sum();
+        self.events += events.len();
+        self.bytes += bytes;
+        if pushed {
+            self.pushed += events.len();
+            self.pushed_bytes += bytes;
+        }
+        if self.events > MAX_EVENTS_PER_WINDOW || self.bytes > MAX_BYTES_PER_WINDOW {
+            Some("event budget exceeded")
+        } else if self.pushed > MAX_PUSHED_PER_WINDOW || self.pushed_bytes > MAX_PUSHED_BYTES_PER_WINDOW {
+            Some("push budget exceeded")
+        } else {
+            None
+        }
+    }
 }
 
 impl Session {
@@ -200,6 +247,7 @@ impl Session {
             parked: vec![],
             running: BTreeMap::new(),
             wants: HashMap::new(),
+            budget: Budget::default(),
         }
     }
 
@@ -371,7 +419,29 @@ impl Engine {
     pub fn handle(&mut self, r: &mut Replica, peer: DeviceKey, msg: Msg) -> Result<Vec<Out>> {
         let mut out = Vec::new();
         let sync_msg = matches!(msg, Msg::Offer { .. } | Msg::Recon { .. } | Msg::Want { .. } | Msg::Events { .. } | Msg::Ack { .. } | Msg::Seen { .. });
-        if sync_msg && !self.sessions.get(&peer).is_some_and(|s| s.established && s.trusted) {
+        let handshake = matches!(msg, Msg::Hello { .. } | Msg::PairRequest { .. } | Msg::PairingGrant { .. } | Msg::PairDenied { .. } | Msg::Bye { .. });
+        let trusted = self.sessions.get(&peer).is_some_and(|s| s.established && s.trusted);
+        let over = if trusted {
+            match &msg {
+                Msg::Events { tag, events, .. } => self.sessions.get_mut(&peer).unwrap().budget.charge(r.env().now_ms(), events, *tag == 0),
+                _ => None,
+            }
+        } else if handshake {
+            None
+        } else {
+            // Without a session there is nothing to answer.
+            let Some(s) = self.sessions.get_mut(&peer) else { return Ok(out) };
+            s.budget.untrusted_msgs += 1;
+            (s.budget.untrusted_msgs > MAX_UNTRUSTED_MSGS).then_some("too many messages before admission")
+        };
+        if let Some(why) = over {
+            tracing::warn!(?peer, why, "disconnecting peer");
+            out.push(Out::Send(peer, Msg::Bye { reason: why.into() }));
+            out.push(Out::Close(peer, why.into()));
+            self.disconnect(&peer);
+            return Ok(out);
+        }
+        if sync_msg && !trusted {
             return Ok(out);
         }
         self.sessions.entry(peer).or_insert_with(Session::new);
@@ -664,7 +734,7 @@ impl Engine {
         let mut acks = Vec::new();
         let mut missing: HashMap<ScopeId, Vec<EventHash>> = HashMap::new();
         for b in events {
-            match r.ingest(&b)? {
+            match r.ingest_from(&b, Some(peer))? {
                 IngestOutcome::Stored { hash, .. } => {
                     self.came_from.insert(hash, peer);
                     acks.push(hash);
@@ -678,7 +748,19 @@ impl Engine {
                         }
                     }
                 }
-                IngestOutcome::Invalid(reason) => tracing::debug!(%reason, "dropped invalid event"),
+                IngestOutcome::NotJoined { scope } => tracing::debug!(?scope, "dropped event for a scope not joined"),
+                IngestOutcome::Invalid(reason) => {
+                    tracing::debug!(%reason, "dropped invalid event");
+                    let s = self.sessions.get_mut(&peer).unwrap();
+                    s.budget.invalid += 1;
+                    if s.budget.invalid > MAX_INVALID_PER_SESSION {
+                        tracing::warn!(?peer, "disconnecting peer: too many invalid events");
+                        out.push(Out::Send(peer, Msg::Bye { reason: "too many invalid events".into() }));
+                        out.push(Out::Close(peer, "too many invalid events".into()));
+                        self.disconnect(&peer);
+                        return Ok(());
+                    }
+                }
             }
         }
         if !acks.is_empty() {

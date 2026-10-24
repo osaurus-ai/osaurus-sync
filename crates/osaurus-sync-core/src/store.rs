@@ -72,9 +72,20 @@ CREATE TABLE IF NOT EXISTS held (
     hash BLOB PRIMARY KEY,
     scope BLOB NOT NULL,
     bytes BLOB NOT NULL,
-    received_ms INTEGER NOT NULL
+    received_ms INTEGER NOT NULL,
+    -- The peer that sent it, for per-peer limits. NULL when unknown.
+    peer BLOB
 );
 CREATE INDEX IF NOT EXISTS held_scope ON held(scope);
+CREATE INDEX IF NOT EXISTS held_peer ON held(peer);
+
+-- The control parents each held event is waiting for. A stored event releases only its waiters.
+CREATE TABLE IF NOT EXISTS held_needs (
+    missing BLOB NOT NULL,
+    hash BLOB NOT NULL,
+    PRIMARY KEY (missing, hash)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS held_needs_hash ON held_needs(hash);
 
 CREATE TABLE IF NOT EXISTS scopes (
     scope BLOB PRIMARY KEY,
@@ -249,9 +260,18 @@ pub fn open(path: Option<&std::path::Path>) -> Result<Connection> {
 
 /// Creates tables. Returns true when view tables were (re)created and must be rebuilt.
 pub fn migrate(conn: &Connection) -> Result<bool> {
+    let had_held = has_table(conn, "held")?;
+    let had_needs = has_table(conn, "held_needs")?;
+    if had_held && !has_column(conn, "held", "peer")? {
+        conn.execute_batch("ALTER TABLE held ADD COLUMN peer BLOB;")?;
+    }
     conn.execute_batch(BASE_SCHEMA)?;
     if !has_column(conn, "scopes", "tentative")? {
         conn.execute_batch("ALTER TABLE scopes ADD COLUMN tentative INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !had_needs {
+        // Held rows from before the index can't be released; peers send them again.
+        conn.execute_batch("DELETE FROM held;")?;
     }
     let view_version: Option<i64> = meta_i64(conn, "view_version")?;
     let rebuild = view_version != Some(VIEW_VERSION);
@@ -265,6 +285,10 @@ pub fn migrate(conn: &Connection) -> Result<bool> {
     set_meta(conn, "view_version", &VIEW_VERSION.to_le_bytes())?;
     let had_events: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM events)", [], |r| r.get(0))?;
     Ok(rebuild && had_events)
+}
+
+fn has_table(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)", [table], |r| r.get(0))?)
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {

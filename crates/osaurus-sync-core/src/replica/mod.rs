@@ -6,6 +6,7 @@
 mod apply;
 mod compact;
 mod loro_docs;
+mod maintain;
 mod ops;
 mod read;
 mod sync;
@@ -33,8 +34,9 @@ use crate::types::{Change, HistoryMode};
 
 pub use compact::{Compaction, PointInTimeView};
 pub use loro_docs::LoroCache;
+pub use maintain::{Maintenance, PEER_TTL_MS, TENTATIVE_TTL_MS};
 pub use ops::InviteToken;
-pub use sync::{IngestOutcome, ReconKey};
+pub use sync::{HELD_MAX_BYTES, HELD_MAX_EVENTS, HELD_TTL_MS, IngestOutcome, ReconKey};
 
 /// Where device and user secrets live: the Keychain on Apple platforms, DPAPI on Windows.
 pub trait SecretStore: Send + Sync {
@@ -78,6 +80,11 @@ pub struct ReplicaConfig {
     pub storage_role: bool,
     /// Fold Loro updates into a shallow snapshot once this many can be compacted.
     pub compact_min_updates: u32,
+    /// Size cap for decrypted attachments under `blobs/plain`; least recently opened go first.
+    pub plain_cache_bytes: u64,
+    /// Limits on events waiting for their control parents, per scope and per sending peer.
+    pub held_max_events: usize,
+    pub held_max_bytes: usize,
 }
 
 impl ReplicaConfig {
@@ -91,6 +98,9 @@ impl ReplicaConfig {
             snapshot_every: 500,
             storage_role: false,
             compact_min_updates: 64,
+            plain_cache_bytes: 512 << 20,
+            held_max_events: sync::HELD_MAX_EVENTS,
+            held_max_bytes: sync::HELD_MAX_BYTES,
         }
     }
 
@@ -448,6 +458,7 @@ impl Replica {
             let s = &scope.0[..];
             r.db.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT rowid FROM messages_view WHERE scope = ?)", [s])?;
             r.db.execute("DELETE FROM event_parents WHERE child IN (SELECT hash FROM events WHERE scope = ?)", [s])?;
+            r.db.execute("DELETE FROM held_needs WHERE hash IN (SELECT hash FROM held WHERE scope = ?)", [s])?;
             for table in [
                 "events",
                 "heads",

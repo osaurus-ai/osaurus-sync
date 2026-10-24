@@ -42,6 +42,7 @@ const MDNS_SERVICE: &str = "osaurus-sync";
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
+const MAINTAIN_EVERY: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Relays {
@@ -479,6 +480,8 @@ impl Inner {
             .spawn();
         let me = self.clone();
         tasks.push(tokio::spawn(async move { me.dial_loop().await }));
+        let me = self.clone();
+        tasks.push(tokio::spawn(async move { me.maintain_loop().await }));
         *lock(&self.endpoint) = Some(endpoint.clone());
         *net = Some(Net { endpoint, router, tasks });
         drop(net);
@@ -729,6 +732,19 @@ impl Inner {
                 }
             }
         });
+    }
+
+    /// Prunes local tables at start and then hourly.
+    async fn maintain_loop(self: Arc<Self>) {
+        loop {
+            let res = { lock(&self.state).replica.maintain() };
+            match res {
+                Ok(m) if m != Default::default() => debug!(?m, "maintenance"),
+                Ok(_) => {}
+                Err(e) => warn!("maintenance failed: {e}"),
+            }
+            tokio::time::sleep(MAINTAIN_EVERY).await;
+        }
     }
 
     async fn dial_loop(self: Arc<Self>) {

@@ -1,7 +1,8 @@
 use osaurus_sync_core::identity::Platform;
 use osaurus_sync_core::ids::{Role, ScopeId};
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
-use osaurus_sync_core::sync::proto::ScopeOffer;
+use osaurus_sync_core::sync::engine::{MAX_INVALID_PER_SESSION, MAX_UNTRUSTED_MSGS};
+use osaurus_sync_core::sync::proto::{PROTOCOL_VERSION, ScopeOffer};
 use osaurus_sync_core::sync::{Msg, Notice, Out};
 use osaurus_sync_core::types::{DeliveryStatus, HistoryMode, ImportedMessage, NewMessage};
 use osaurus_sync_sim::{Sim, snapshot};
@@ -256,6 +257,38 @@ fn open_invite_lets_a_stranger_redeem_but_not_sync() {
     sim.run(10_000);
     assert!(!sim.r(alice).scope_ids().unwrap().contains(&spam));
     assert_eq!(sim.r(alice).conversations().unwrap().len(), 1);
+}
+
+#[test]
+fn peers_over_budget_are_disconnected() {
+    let mut sim = Sim::new(12);
+    let mac = sim.add_node("Mac", Platform::MacOs);
+    let pc = sim.add_node("PC", Platform::Windows);
+    sim.pair(mac, pc);
+    sim.run(10_000);
+    assert!(sim.is_linked(mac, pc));
+    // A trusted peer that floods garbage is cut off.
+    let garbage = vec![vec![0u8; 8]; MAX_INVALID_PER_SESSION + 1];
+    inject(&mut sim, pc, mac, Msg::Events { scope: ScopeId([1; 16]), tag: 0, events: garbage, last: true });
+    sim.run(10_000);
+    assert!(!sim.is_linked(mac, pc));
+
+    // An untrusted peer gets a handful of messages to redeem an invite, then is cut off.
+    let mallory = sim.add_node("Mallory", Platform::Windows);
+    let scope = sim.r(mac).create_scope(ScopeKind::Workspace, "Team").unwrap();
+    sim.r(mac).create_invite(scope, Role::Member, 3_600_000).unwrap();
+    let cert = sim.r(mallory).cert().clone();
+    let peer = sim.nodes[mallory].device();
+    let n = &mut sim.nodes[mac];
+    let r = n.replica.as_mut().unwrap();
+    let outs = n.engine.handle(r, peer, Msg::Hello { version: PROTOCOL_VERSION, cert, storage_role: false }).unwrap();
+    assert!(!outs.iter().any(|o| matches!(o, Out::Close(..))));
+    let mut closed = false;
+    for _ in 0..=MAX_UNTRUSTED_MSGS {
+        let outs = n.engine.handle(r, peer, Msg::Denied { scope }).unwrap();
+        closed |= outs.iter().any(|o| matches!(o, Out::Close(..)));
+    }
+    assert!(closed);
 }
 
 #[test]

@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::crypto;
 use crate::env::{Env, random_array};
@@ -97,10 +98,54 @@ impl BlobStore {
     pub fn open_plain(&self, r: &BlobRef) -> Result<PathBuf> {
         let safe: String = r.name.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect();
         let dst = self.dir.join("plain").join(format!("{}-{}", &hex::encode(r.hash)[..16], safe));
-        if !dst.exists() {
+        if dst.exists() {
+            // Opening counts as use for eviction.
+            if let Ok(f) = File::options().append(true).open(&dst) {
+                let _ = f.set_modified(SystemTime::now());
+            }
+        } else {
             crypto::decrypt_blob_file(&r.key, &self.path(&r.hash), &dst)?;
         }
         Ok(dst)
+    }
+
+    /// Opens a decrypted copy and keeps the plaintext cache under `cap` bytes.
+    pub fn open_plain_capped(&self, r: &BlobRef, cap: u64) -> Result<PathBuf> {
+        let dst = self.open_plain(r)?;
+        self.evict_plain(cap, Some(&dst));
+        Ok(dst)
+    }
+
+    /// Deletes the least recently opened decrypted copies until the cache fits in `cap` bytes.
+    /// `keep` is never deleted. Returns how many files were removed.
+    pub fn evict_plain(&self, cap: u64, keep: Option<&Path>) -> usize {
+        let Ok(entries) = fs::read_dir(self.dir.join("plain")) else { return 0 };
+        let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                m.is_file().then(|| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len(), e.path()))
+            })
+            .collect();
+        let mut total: u64 = files.iter().map(|f| f.1).sum();
+        if total <= cap {
+            return 0;
+        }
+        files.sort();
+        let mut removed = 0;
+        for (_, len, path) in files {
+            if total <= cap {
+                break;
+            }
+            if keep.is_some_and(|k| k == path) {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                total -= len;
+                removed += 1;
+            }
+        }
+        removed
     }
 
     pub fn delete(&self, hash: &[u8; 32]) {

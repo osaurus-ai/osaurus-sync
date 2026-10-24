@@ -31,12 +31,27 @@ pub enum IngestOutcome {
         hash: EventHash,
         missing: Vec<EventHash>,
     },
+    /// The event belongs to a scope this device hasn't joined; it was not stored.
+    NotJoined {
+        scope: ScopeId,
+    },
     Invalid(String),
 }
 
+/// Held events allowed per scope and per sending peer.
+pub const HELD_MAX_EVENTS: usize = 10_000;
+pub const HELD_MAX_BYTES: usize = 64 << 20;
+/// Held events whose parents never arrive are dropped after a week.
+pub const HELD_TTL_MS: u64 = 7 * 86_400_000;
+
 impl Replica {
-    /// Receives one encoded event from a peer.
+    /// Receives one encoded event from an unknown source.
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<IngestOutcome> {
+        self.ingest_from(bytes, None)
+    }
+
+    /// Receives one encoded event from `peer`, which per-peer limits are charged to.
+    pub fn ingest_from(&mut self, bytes: &[u8], peer: Option<DeviceKey>) -> Result<IngestOutcome> {
         let decoded = match Envelope::decode(bytes) {
             Ok(d) => d,
             Err(e) => return Ok(IngestOutcome::Invalid(e.to_string())),
@@ -44,7 +59,7 @@ impl Replica {
         let e = match decoded {
             Decoded::Unknown { version, id, scope, hash, bytes } => {
                 if !self.scope_exists(scope)? {
-                    return Ok(IngestOutcome::Invalid("scope not joined".into()));
+                    return Ok(IngestOutcome::NotJoined { scope });
                 }
                 return self.tx(|r| {
                     if r.event_exists(&hash)? {
@@ -67,7 +82,7 @@ impl Replica {
         let scope = e.scope;
         let author = e.author;
         if !self.scope_exists(scope)? {
-            return Ok(IngestOutcome::Invalid("scope not joined".into()));
+            return Ok(IngestOutcome::NotJoined { scope });
         }
         let held: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM held WHERE hash = ?)", [&hash.0[..]], |r| r.get(0))?;
         if held {
@@ -78,14 +93,13 @@ impl Replica {
             let out = match r.accept(e)? {
                 Accepted::Duplicate => IngestOutcome::Duplicate { hash },
                 Accepted::Held(missing) => {
-                    r.db.execute(
-                        "INSERT OR IGNORE INTO held(hash, scope, bytes, received_ms) VALUES (?, ?, ?, ?)",
-                        params![&hash.0[..], &scope.0[..], bytes, r.env.now_ms() as i64],
-                    )?;
+                    if !r.hold(scope, hash, bytes, &missing, peer)? {
+                        return Ok(IngestOutcome::Invalid("held limit reached".into()));
+                    }
                     IngestOutcome::Held { scope, hash, missing }
                 }
                 Accepted::Stored(v) => {
-                    r.release_held(scope)?;
+                    r.release_held(hash)?;
                     IngestOutcome::Stored { scope, hash, author: Some(author), valid: v.is_valid() }
                 }
             };
@@ -93,49 +107,85 @@ impl Replica {
         })
     }
 
-    /// Accepts held events whose control parents have arrived.
-    fn release_held(&mut self, scope: ScopeId) -> Result<()> {
-        loop {
-            let rows: Vec<(Vec<u8>, Vec<u8>)> = {
-                let mut stmt = self.db.prepare_cached("SELECT hash, bytes FROM held WHERE scope = ?")?;
-                stmt.query_map([&scope.0[..]], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?
-            };
-            let mut progressed = false;
-            for (h, b) in rows {
-                let Ok(Decoded::Known(e)) = Envelope::decode(&b) else {
-                    self.db.execute("DELETE FROM held WHERE hash = ?", [&h])?;
-                    continue;
-                };
-                if !self.auth_mut(scope)?.missing_parents(&e.control_parents).is_empty() {
-                    continue;
-                }
-                self.db.execute("DELETE FROM held WHERE hash = ?", [&h])?;
-                if matches!(self.accept(e)?, Accepted::Stored(_)) {
-                    progressed = true;
-                }
-            }
-            if !progressed {
-                return Ok(());
+    /// Parks an event until its control parents arrive. Returns false when the scope or the
+    /// sending peer is over its limit; the event is dropped and can be fetched again later.
+    fn hold(&mut self, scope: ScopeId, hash: EventHash, bytes: &[u8], missing: &[EventHash], peer: Option<DeviceKey>) -> Result<bool> {
+        let (max_n, max_bytes) = (self.cfg.held_max_events, self.cfg.held_max_bytes);
+        let (n, size): (i64, i64) =
+            self.db.query_row("SELECT COUNT(*), COALESCE(SUM(length(bytes)), 0) FROM held WHERE scope = ?", [&scope.0[..]], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if n as usize >= max_n || size as usize + bytes.len() > max_bytes {
+            return Ok(false);
+        }
+        if let Some(p) = peer {
+            let (n, size): (i64, i64) =
+                self.db.query_row("SELECT COUNT(*), COALESCE(SUM(length(bytes)), 0) FROM held WHERE peer = ?", [&p.0[..]], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            if n as usize >= max_n || size as usize + bytes.len() > max_bytes {
+                return Ok(false);
             }
         }
+        self.db.execute(
+            "INSERT OR IGNORE INTO held(hash, scope, bytes, received_ms, peer) VALUES (?, ?, ?, ?, ?)",
+            params![&hash.0[..], &scope.0[..], bytes, self.env.now_ms() as i64, peer.map(|p| p.0.to_vec())],
+        )?;
+        let mut stmt = self.db.prepare_cached("INSERT OR IGNORE INTO held_needs(missing, hash) VALUES (?, ?)")?;
+        for m in missing {
+            stmt.execute([&m.0[..], &hash.0[..]])?;
+        }
+        Ok(true)
+    }
+
+    /// Accepts the held events that were waiting only for `stored`, then those waiting for them.
+    fn release_held(&mut self, stored: EventHash) -> Result<()> {
+        let mut ready = vec![stored];
+        while let Some(parent) = ready.pop() {
+            let waiting: Vec<Vec<u8>> = {
+                let mut stmt = self.db.prepare_cached("SELECT hash FROM held_needs WHERE missing = ?")?;
+                stmt.query_map([&parent.0[..]], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+            };
+            if waiting.is_empty() {
+                continue;
+            }
+            self.db.execute("DELETE FROM held_needs WHERE missing = ?", [&parent.0[..]])?;
+            for h in waiting {
+                let still: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM held_needs WHERE hash = ?)", [&h], |r| r.get(0))?;
+                if still {
+                    continue;
+                }
+                let row: Option<(Vec<u8>, Option<Vec<u8>>)> =
+                    self.db.query_row("SELECT bytes, peer FROM held WHERE hash = ?", [&h], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+                let Some((b, peer)) = row else { continue };
+                self.db.execute("DELETE FROM held WHERE hash = ?", [&h])?;
+                let Ok(Decoded::Known(e)) = Envelope::decode(&b) else { continue };
+                let (scope, hash) = (e.scope, e.hash());
+                match self.accept(e)? {
+                    Accepted::Stored(_) => ready.push(hash),
+                    Accepted::Held(missing) => {
+                        let peer = peer.and_then(|p| <[u8; 32]>::try_from(p.as_slice()).ok()).map(DeviceKey);
+                        self.hold(scope, hash, &b, &missing, peer)?;
+                    }
+                    Accepted::Duplicate => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops held events older than `HELD_TTL_MS`. Returns how many were dropped.
+    pub(crate) fn expire_held(&mut self) -> Result<usize> {
+        let cutoff = self.env.now_ms().saturating_sub(HELD_TTL_MS) as i64;
+        let n = self.db.execute("DELETE FROM held WHERE received_ms < ?", [cutoff])?;
+        if n > 0 {
+            self.db.execute("DELETE FROM held_needs WHERE hash NOT IN (SELECT hash FROM held)", [])?;
+        }
+        Ok(n)
     }
 
     pub fn held_missing(&mut self, scope: ScopeId) -> Result<Vec<EventHash>> {
         let rows: Vec<Vec<u8>> = {
-            let mut stmt = self.db.prepare_cached("SELECT bytes FROM held WHERE scope = ?")?;
+            let mut stmt = self.db.prepare_cached("SELECT DISTINCT n.missing FROM held_needs n JOIN held h ON h.hash = n.hash WHERE h.scope = ?")?;
             stmt.query_map([&scope.0[..]], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
         };
-        let mut out = Vec::new();
-        for b in rows {
-            if let Ok(Decoded::Known(e)) = Envelope::decode(&b) {
-                for m in self.auth_mut(scope)?.missing_parents(&e.control_parents) {
-                    if !out.contains(&m) {
-                        out.push(m);
-                    }
-                }
-            }
-        }
-        Ok(out)
+        Ok(rows.into_iter().filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok()).map(EventHash).filter(|h| !self.event_exists(h).unwrap_or(false)).collect())
     }
 
     /// Current DAG heads: (control heads, other heads).

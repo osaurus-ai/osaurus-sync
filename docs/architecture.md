@@ -175,6 +175,10 @@ If two removals would cut each other off, the earlier one in the deterministic t
 **Rejected events are kept.** An event that fails validation is stored with status `rejected`
 and a stable reason code, so it isn't fetched again, and the app shows it as not delivered. An
 event that arrives before its control parents waits in the `held` table until they do.
+`held_needs` indexes each held event by the parents it lacks, so a stored event releases only
+its own waiters. Held events are capped per scope and per sending peer (10,000 events or
+64 MiB each, configurable), and are dropped after 7 days. An event dropped at the cap is fetched
+again on a later sync.
 
 ## Storage
 
@@ -188,6 +192,19 @@ directory. A lock file makes sure only one process opens a data directory at a t
   `edits`, `tombstones`, `reactions` and `conversations_view`.
 - Supporting tables track DAG heads, held events, the outbox, peers, storage peers, known and
   revoked devices, blobs, Loro snapshots and read state.
+- **Retention.** `Replica::maintain`, which the network node runs at start and then hourly, does
+  the following:
+  - expires held events;
+  - prunes invites that are expired or used;
+  - drops contact records for peers that are revoked or unseen for 90 days;
+  - forgets other users' devices that are no longer certified in any scope;
+  - purges tentatively joined scopes still unproven after a day;
+  - evicts decrypted attachments (`blobs/plain`) by least-recent use, above
+    `plain_cache_bytes` (512 MiB by default). Opening an attachment also enforces this cap.
+- **Session budgets.** Within each one-minute window, a session may receive 500k events or
+  2 GiB in total, but only 20k events or 256 MiB of those as unsolicited pushes. It may also send
+  1,000 invalid events per session. An untrusted session (one that is redeeming an invite) may
+  send 16 messages. A peer that goes over any of these is sent `Bye` and disconnected.
 
 **At rest**, event payloads are encrypted but the view tables hold plaintext so they can be
 searched and read quickly. Phase 1 relies on full-disk encryption (FileVault, BitLocker, iOS data

@@ -154,7 +154,7 @@ fn held_until_parents_arrive_and_garbage_rejected() {
     // Content first: it waits for the control events it depends on.
     let content = a.events_by_ids(scope, &ids(false)).unwrap();
     let control = a.events_by_ids(scope, &ids(true)).unwrap();
-    assert!(matches!(b.ingest(&content[0]).unwrap(), IngestOutcome::Invalid(_)), "events for unjoined scopes are refused");
+    assert!(matches!(b.ingest(&content[0]).unwrap(), IngestOutcome::NotJoined { .. }), "events for unjoined scopes are refused");
     b.join_scope(scope).unwrap();
     for e in &content {
         assert!(matches!(b.ingest(e).unwrap(), IngestOutcome::Held { .. }));

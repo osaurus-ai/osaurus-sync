@@ -270,7 +270,7 @@ impl Replica {
         if !self.blobs.has(hash) {
             return Ok(None);
         }
-        Ok(Some(self.blobs.open_plain(&r)?))
+        Ok(Some(self.blobs.open_plain_capped(&r, self.cfg.plain_cache_bytes)?))
     }
 
     pub fn blob_store(&self) -> &crate::blobs::BlobStore {
