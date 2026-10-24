@@ -99,3 +99,8 @@ dotnet test bindings/csharp/OsaurusSync.Tests
 The Rust toolchain is pinned in `rust-toolchain.toml`. The C# bindings need
 [uniffi-bindgen-cs](https://github.com/NordSecurity/uniffi-bindgen-cs). See
 [Development](docs/development.md) for the requirements and the full workflow.
+
+## License
+
+Proprietary; see [`LICENSE`](LICENSE). Releases include `THIRD_PARTY_NOTICES.md` for the open
+source components in the native library, and a CycloneDX SBOM per target.

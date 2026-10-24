@@ -174,6 +174,35 @@ installed device, so changes need care:
   next open.
 - Add a fixture for the new format, and keep the old fixtures passing.
 
+## Dependencies and licenses
+
+`deny.toml` configures `cargo deny check`, which runs in CI on every push and checks:
+
+- **Licenses.** Only the licenses in `deny.toml` are allowed: permissive ones plus MPL-2.0
+  (uniffi, and `im` through loro), whose file-level copyleft is met by shipping the notices
+  unmodified. A new dependency under any other license fails CI; don't add it to the allow
+  list without checking with whoever owns licensing.
+- **Advisories.** RustSec advisories against `Cargo.lock`. The nightly workflow also runs this,
+  since advisories land without a push. To ignore one, add its id to `[advisories] ignore` with
+  a comment saying why it doesn't apply, and remove it once a fixed version is out.
+- **Bans and sources.** No `openssl-sys` or `native-tls` (everything uses rustls), no wildcard
+  versions, and crates only from crates.io.
+
+The graph is limited to the shipped targets, so Linux-only and wasm dependencies don't count.
+
+Releases also ship:
+
+- **`THIRD_PARTY_NOTICES.md`**, from `scripts/gen-notices.sh` (cargo-about with `about.toml`).
+  It covers the crates compiled into the native library and is included in the NuGet package,
+  the Swift package and the GitHub release. It isn't checked in; run the script to see it.
+- **A CycloneDX 1.5 SBOM per target**, from `scripts/gen-sbom.sh` (cargo-cyclonedx), attached
+  to the GitHub release as `osaurus-sync-ffi_<target>.cdx.json`.
+
+Install the tools with `cargo install cargo-deny cargo-about cargo-cyclonedx` (or Homebrew).
+
+The repository's own code is proprietary for now (`LICENSE`, and `license = "UNLICENSED"` in
+`Cargo.toml`). If that changes, update both, and the NuGet package picks up the new `LICENSE`.
+
 ## Device validation
 
 CI covers the logic on simulators and hosted runners, but not hardware, permissions, power

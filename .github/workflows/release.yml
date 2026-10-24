@@ -46,12 +46,40 @@ jobs:
           fi
           { echo "version=$VERSION"; echo "tag=$TAG"; echo "publish=$PUBLISH"; } >> "$GITHUB_OUTPUT"
 
-  apple:
-    name: XCFramework
-    runs-on: macos-15
+  supply-chain:
+    name: Licenses, notices and SBOM
+    runs-on: ubuntu-latest
     needs: version
     steps:
       - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install || rustup show
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-about,cargo-cyclonedx
+      - run: cargo deny --locked check
+      - name: Third-party notices
+        run: scripts/gen-notices.sh
+      - name: SBOM
+        run: scripts/gen-sbom.sh dist/sbom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notices
+          path: THIRD_PARTY_NOTICES.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/sbom/*.cdx.json
+
+  apple:
+    name: XCFramework
+    runs-on: macos-15
+    needs: [version, supply-chain]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: notices
       - name: Toolchain
         run: rustup toolchain install || rustup show
       - name: Build XCFramework (release)
@@ -71,6 +99,7 @@ jobs:
           URL="https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/OsaurusSyncFFI.xcframework.zip"
           scripts/make-swift-package.sh dist/swift-package "$URL" "$(cat dist/OsaurusSyncFFI.xcframework.zip.checksum)"
           (cd dist/swift-package && swift package dump-package > /dev/null)
+          test -f dist/swift-package/THIRD_PARTY_NOTICES.md && test -f dist/swift-package/LICENSE
           (cd dist && zip -qry "OsaurusSync-swift-${{ needs.version.outputs.version }}.zip" swift-package)
       - uses: actions/upload-artifact@v4
         with:
@@ -203,6 +232,9 @@ jobs:
           dotnet-version: 8.0.x
       - uses: actions/download-artifact@v4
         with:
+          name: notices
+      - uses: actions/download-artifact@v4
+        with:
           pattern: "{win-x64,win-arm64,osx-arm64}"
           path: dist/native
       - uses: actions/download-artifact@v4
@@ -210,7 +242,9 @@ jobs:
           name: csharp-bindings
           path: bindings/csharp/OsaurusSync/Generated
       - name: Pack
-        run: scripts/pack-nuget.sh dist/native
+        run: |
+          scripts/pack-nuget.sh dist/native
+          unzip -l dist/nuget/*.nupkg | grep -q THIRD_PARTY_NOTICES.md
         env:
           VERSION: ${{ needs.version.outputs.version }}
       - uses: actions/upload-artifact@v4
@@ -221,7 +255,7 @@ jobs:
   publish:
     name: Publish
     runs-on: ubuntu-latest
-    needs: [version, apple, nuget]
+    needs: [version, supply-chain, apple, nuget]
     if: needs.version.outputs.publish == 'true'
     environment: release
     permissions:
@@ -230,7 +264,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: "{xcframework,nuget}"
+          pattern: "{xcframework,nuget,notices,sbom}"
           path: dist
           merge-multiple: true
       - name: GitHub release
@@ -246,7 +280,9 @@ jobs:
             dist/OsaurusSyncFFI.xcframework.zip \
             dist/OsaurusSyncFFI.xcframework.zip.checksum \
             dist/OsaurusSync-swift-*.zip \
-            dist/*.nupkg
+            dist/*.nupkg \
+            dist/THIRD_PARTY_NOTICES.md \
+            dist/*.cdx.json
       - name: NuGet
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}

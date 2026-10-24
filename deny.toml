@@ -1,0 +1,65 @@
+# cargo-deny: licenses, advisories, banned crates and sources. CI runs `cargo deny check`.
+# See docs/development.md#dependencies before adding to an allow list or ignoring an advisory.
+
+[graph]
+# The platforms the core ships on. Dependencies only used elsewhere (wasm, Linux netlink)
+# aren't in the shipped libraries, so they don't count.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    # CI runs the tests on Linux.
+    "x86_64-unknown-linux-gnu",
+]
+all-features = false
+no-default-features = false
+
+[advisories]
+# Unmaintained crates are reported but don't fail the check unless a fix is available upstream.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# Permissive licenses, plus MPL-2.0 (file-level copyleft: uniffi, and im via loro). Shipping
+# MPL code unmodified only requires the notice and a pointer to its source, which
+# THIRD_PARTY_NOTICES provides.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[licenses.private]
+# The workspace crates aren't published.
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # Everything uses rustls with ring; a second TLS stack would add attack surface.
+    { crate = "openssl-sys", reason = "use rustls" },
+    { crate = "native-tls", reason = "use rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

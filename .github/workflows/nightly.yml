@@ -29,6 +29,17 @@ jobs:
         env:
           OSAURUS_BUDGETS: enforce
 
+  advisories:
+    name: Security advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # New RustSec advisories land without a push; this catches them within a day.
+      - run: cargo deny --locked check advisories
+
   simulation:
     name: Simulation (many seeds)
     runs-on: ubuntu-latest

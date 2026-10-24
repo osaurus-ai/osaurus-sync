@@ -32,6 +32,16 @@ jobs:
         env:
           SIM_SEEDS: "200"
 
+  dependencies:
+    name: Dependencies (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check
+
   benchmarks:
     name: Performance budgets
     runs-on: ubuntu-latest

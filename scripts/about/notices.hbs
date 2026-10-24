@@ -1,0 +1,29 @@
+# Third-party notices
+
+The Osaurus sync native library (`OsaurusSyncFFI.xcframework`, `osaurus_sync_ffi.dll`,
+`libosaurus_sync_ffi.dylib`) includes the open source components below. It also embeds SQLite,
+through `libsqlite3-sys`, which is in the public domain.
+
+Components under MPL-2.0 are used unmodified; their source is available from crates.io at the
+versions listed.
+
+## Licenses used
+
+{{#each overview}}
+- {{{name}}}: {{count}} {{#if (eq count 1)}}component{{else}}components{{/if}}
+{{/each}}
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- [{{crate.name}} {{crate.version}}]({{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}})
+{{/each}}
+
+```
+{{{text}}}
+```
+
+{{/each}}
