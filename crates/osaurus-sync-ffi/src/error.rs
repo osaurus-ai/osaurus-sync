@@ -91,7 +91,8 @@ impl From<CoreError> for SyncError {
             | CoreError::Network(s)
             | CoreError::Pairing(s)
             | CoreError::Internal(s)
-            | CoreError::Corrupt(s) => s.clone(),
+            | CoreError::Corrupt(s)
+            | CoreError::KeyStore(s) => s.clone(),
             other => other.to_string(),
         };
         match e {
@@ -108,6 +109,7 @@ impl From<CoreError> for SyncError {
             CoreError::IncompatibleVersion { .. } => SyncError::IncompatibleVersion { code, detail },
             CoreError::Pairing(_) => SyncError::Pairing { code, detail },
             CoreError::Closed => SyncError::Closed { code, detail },
+            CoreError::KeyStore(_) => SyncError::KeyStore { code, detail },
             CoreError::Internal(_) => SyncError::Internal { code, detail },
             CoreError::Corrupt(_) => SyncError::Corrupt { code, detail },
             CoreError::NewerDatabase { .. } => SyncError::NewerDatabase { code, detail },

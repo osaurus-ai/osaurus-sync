@@ -309,11 +309,11 @@ final class BindingTests: XCTestCase {
         } catch let e as SyncError {
             throw XCTSkip("keychain unavailable in this environment: \(e)")
         }
-        XCTAssertEqual(store.load(name: "k"), Data([1, 2, 3]))
+        XCTAssertEqual(try store.load(name: "k"), Data([1, 2, 3]))
         try store.store(name: "k", value: Data([4]))
-        XCTAssertEqual(store.load(name: "k"), Data([4]))
+        XCTAssertEqual(try store.load(name: "k"), Data([4]))
         try store.delete(name: "k")
-        XCTAssertNil(store.load(name: "k"))
+        XCTAssertNil(try store.load(name: "k"))
         try store.delete(name: "k")
     }
 

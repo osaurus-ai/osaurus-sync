@@ -29,6 +29,9 @@ pub enum Error {
     Pairing(String),
     #[error("the core is closed")]
     Closed,
+    /// The OS key store failed, for example a Keychain read before the device's first unlock.
+    #[error("key store error: {0}")]
+    KeyStore(String),
     #[error("internal error: {0}")]
     Internal(String),
     /// The database failed its integrity check and couldn't be repaired from the event log.
@@ -56,6 +59,7 @@ impl Error {
             Error::IncompatibleVersion { .. } => 110,
             Error::Pairing(_) => 111,
             Error::Closed => 112,
+            Error::KeyStore(_) => 113,
             Error::Internal(_) => 199,
             Error::Corrupt(_) => 114,
             Error::NewerDatabase { .. } => 115,

@@ -2,7 +2,7 @@ use osaurus_sync_core::error::Error;
 use osaurus_sync_core::identity::Platform;
 use osaurus_sync_core::ids::{Principal, Role};
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
-use osaurus_sync_core::replica::{Replica, SecretStore};
+use osaurus_sync_core::replica::Replica;
 use osaurus_sync_core::types::{Attachment, NewMessage};
 use osaurus_sync_sim::Sim;
 
@@ -135,7 +135,7 @@ fn wipe_deletes_data_and_keys() {
     sim.r(mac).wipe().unwrap();
     let n = &mut sim.nodes[mac];
     for name in Replica::secret_names() {
-        assert!(n.secrets.load(name).is_none(), "{name} survived");
+        assert!(n.secrets.get(name).is_none(), "{name} survived");
     }
     let dir = n.dir.path();
     assert!(!dir.join("sync.db").exists() && !dir.join("blobs").exists());

@@ -174,6 +174,58 @@ installed device, so changes need care:
   next open.
 - Add a fixture for the new format, and keep the old fixtures passing.
 
+## Device validation
+
+CI covers the logic on simulators and hosted runners, but not hardware, permissions, power
+management or real networks. Before each release, run these checks on physical devices with a
+build of the release candidate and record the results (device, OS version, build, pass or fail,
+notes) in the release's pull request. Attach a `supportBundle()` from any failing step.
+
+Use two devices signed in to the same identity, plus a Mac on a different network for the relay
+checks. The app under test should use the production relay and discovery configuration, not
+`n0PublicNetworkConfig()`.
+
+### iOS
+
+Run on the oldest supported iPhone and a current one.
+
+| Check | Steps | Expected |
+| --- | --- | --- |
+| Keychain after reboot | Pair the phone, reboot it, and launch the app before unlocking (for example from a notification or a background launch), then again after unlocking | Before the first unlock, open fails with `KeyStore`; the app retries after unlock. After the first unlock, the same identity opens and `deviceKey()` is unchanged |
+| Keychain is device only | Restore the phone from an encrypted backup onto a second phone | The second phone has no sync identity and must pair as a new device |
+| Suspend and resume | Start a long sync, press Home, wait 30 seconds, return | `suspend` finishes within the background task; no crash report or watchdog kill. On return the sync resumes and completes |
+| Writes while suspended | Background the app, send a message from the Mac, foreground the phone | The message arrives within a few seconds of `resume` |
+| Long suspension | Leave the app in the background overnight | It resumes, reconnects and catches up without a fresh pairing |
+| Local network prompt | Fresh install, open the app | The local network prompt appears once. With Allow, LAN devices connect directly (`diagnostics()` shows `relayed == false`) |
+| Local network denied | Fresh install, choose Don't Allow | The app sets `mdns = false`; sync still works through relays; no repeated prompts. Re-enabling in Settings restores direct LAN connections after relaunch |
+| Cellular | Turn off Wi-Fi | Connections are relayed and sync completes. Switching between Wi-Fi and cellular mid-sync reconnects without user action |
+| Low Data Mode | Turn on Low Data Mode for the network | `BackfillPolicyMonitor` pauses backfill; new messages still sync; backfill resumes when it's turned off |
+| Low Power Mode | Turn on Low Power Mode | Backfill pauses as above; foreground sync keeps working |
+| Pairing by QR | Pair a new phone from the Mac's QR code, then deny camera access and pair with the typed code | Both paths succeed; a wrong code fails with `Pairing` and can be retried |
+| Storage pressure | Fill the phone to under 1 GB free and sync attachments | The attachment cache shrinks to its limit; no crash; `storageUsage()` reflects it |
+| Reset | Sign out from settings | `reset()` removes the data directory and Keychain items; the app returns to onboarding |
+
+### Windows arm64
+
+Run on a Windows 11 arm64 device (for example a Snapdragon laptop), with the NuGet package
+from the release candidate, not a locally built DLL.
+
+| Check | Steps | Expected |
+| --- | --- | --- |
+| Native load | Install the package in a clean arm64 app and call `ApiVersion()` | The `win-arm64` DLL loads with no x64 emulation (Task Manager shows the process as Arm64) |
+| Signature | Check the DLL's properties, or run `Get-AuthenticodeSignature` | Signed by the Osaurus certificate, valid |
+| Firewall prompt | First launch on a private network | One Windows Firewall prompt for UDP. With Allow, LAN peers connect directly |
+| Firewall denied | Fresh install, cancel the prompt | Sync works through relays; diagnostics show the connections as relayed |
+| DPAPI | Pair, sign out of Windows and back in, then reboot | The identity reopens. Copying `%LOCALAPPDATA%\Osaurus\Sync` to another account or machine doesn't: open fails with `KeyStore` |
+| Sleep and resume | Sleep the laptop for 10 minutes during a sync | After waking, the core reconnects and completes without a restart |
+| Network change | Switch between Wi-Fi and a phone hotspot | Reconnects and keeps syncing |
+| Battery saver | Turn on battery saver | Sync continues; no excess CPU use while idle (under 1% in Task Manager) |
+| Pairing with the Mac | Pair the Windows device with a Mac and an iPhone | All three converge on the same conversations, including attachments |
+| Reset | Sign out from the app | `Reset()` removes the data directory and the DPAPI key files |
+
+Repeat the Windows table on x64 when the release changes native code, networking or the key
+store.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on pushes to `main`, on pull requests, and on manual dispatch:

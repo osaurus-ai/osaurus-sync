@@ -34,6 +34,11 @@ public sealed class DpapiKeyStore : KeyStore
         return Path.Combine(_dir, name + ".dpapi");
     }
 
+    /// <summary>
+    /// Returns null only when the item doesn't exist. A file that can't be read or decrypted,
+    /// for example one copied from another Windows account, throws, so the core never replaces
+    /// the identity it holds.
+    /// </summary>
     public byte[]? Load(string name)
     {
         var path = PathFor(name);
@@ -42,9 +47,9 @@ public sealed class DpapiKeyStore : KeyStore
         {
             return ProtectedData.Unprotect(File.ReadAllBytes(path), Entropy, DataProtectionScope.CurrentUser);
         }
-        catch (CryptographicException)
+        catch (Exception e) when (e is IOException or CryptographicException or UnauthorizedAccessException)
         {
-            return null;
+            throw new SyncException.KeyStore(SyncErrorCode.KeyStore, $"load {name}: {e.Message}");
         }
     }
 

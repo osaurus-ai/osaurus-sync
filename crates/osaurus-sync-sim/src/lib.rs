@@ -130,7 +130,7 @@ impl Sim {
     /// A new device holding node `i`'s user secret under a device key of its own, as a thief
     /// who copied the secret off a stolen device would run.
     pub fn add_node_with_user_of(&mut self, name: &str, platform: Platform, i: usize) -> usize {
-        let user = self.nodes[i].secrets.load(osaurus_sync_core::replica::USER_SECRET).expect("node has a user secret");
+        let user = self.nodes[i].secrets.get(osaurus_sync_core::replica::USER_SECRET).expect("node has a user secret");
         let j = self.add_node(name, platform);
         let n = &mut self.nodes[j];
         n.replica.take().unwrap().close().unwrap();
@@ -400,7 +400,7 @@ impl Sim {
         let n = &self.nodes[i];
         let secrets = Arc::new(MemorySecretStore::default());
         for k in ["device-key", "user-secret"] {
-            if let Some(v) = n.secrets.load(k) {
+            if let Some(v) = n.secrets.get(k) {
                 secrets.store(k, &v).unwrap();
             }
         }

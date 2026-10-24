@@ -12,8 +12,8 @@ use osaurus_sync_ffi::*;
 struct Keys(Arc<Mutex<HashMap<String, Vec<u8>>>>);
 
 impl KeyStore for Keys {
-    fn load(&self, name: String) -> Option<Vec<u8>> {
-        self.0.lock().unwrap().get(&name).cloned()
+    fn load(&self, name: String) -> Result<Option<Vec<u8>>, SyncError> {
+        Ok(self.0.lock().unwrap().get(&name).cloned())
     }
     fn store(&self, name: String, value: Vec<u8>) -> Result<(), SyncError> {
         self.0.lock().unwrap().insert(name, value);

@@ -39,13 +39,18 @@ public final class KeychainKeyStore: KeyStore, @unchecked Sendable {
         return q
     }
 
-    public func load(name: String) -> Data? {
+    /// Returns nil only when the item doesn't exist. Other failures throw, including
+    /// `errSecInteractionNotAllowed` before the first unlock after a reboot, so the core never
+    /// mistakes a locked Keychain for a missing identity.
+    public func load(name: String) throws -> Data? {
         var q = query(name)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess else { return nil }
-        return out as? Data
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = out as? Data else { throw Self.error("load", status) }
+        return data
     }
 
     public func store(name: String, value: Data) throws {

@@ -67,9 +67,13 @@ pub fn local_network_config() -> NetworkConfig {
 
 /// Stores device and user secrets in the OS key store (Keychain, DPAPI). Secrets never touch
 /// the database.
+///
+/// `load` returns None only when the item doesn't exist. Throw `SyncError.KeyStore` for
+/// anything else, such as a locked Keychain or a DPAPI blob from another user: the core
+/// creates a new identity when a secret is missing.
 #[uniffi::export(callback_interface)]
 pub trait KeyStore: Send + Sync {
-    fn load(&self, name: String) -> Option<Vec<u8>>;
+    fn load(&self, name: String) -> Result<Option<Vec<u8>>, SyncError>;
     fn store(&self, name: String, value: Vec<u8>) -> Result<(), SyncError>;
     fn delete(&self, name: String) -> Result<(), SyncError>;
 }
@@ -91,15 +95,22 @@ pub trait ConversationListener: Send + Sync {
 
 struct KeyStoreAdapter(Box<dyn KeyStore>);
 
+fn key_store_error(e: SyncError) -> osaurus_sync_core::Error {
+    osaurus_sync_core::Error::KeyStore(match e {
+        SyncError::KeyStore { detail, .. } => detail,
+        other => other.to_string(),
+    })
+}
+
 impl SecretStore for KeyStoreAdapter {
-    fn load(&self, name: &str) -> Option<Vec<u8>> {
-        self.0.load(name.to_string())
+    fn load(&self, name: &str) -> osaurus_sync_core::Result<Option<Vec<u8>>> {
+        self.0.load(name.to_string()).map_err(key_store_error)
     }
     fn store(&self, name: &str, value: &[u8]) -> osaurus_sync_core::Result<()> {
-        self.0.store(name.to_string(), value.to_vec()).map_err(|e| osaurus_sync_core::Error::Storage(format!("key store: {e}")))
+        self.0.store(name.to_string(), value.to_vec()).map_err(key_store_error)
     }
     fn delete(&self, name: &str) -> osaurus_sync_core::Result<()> {
-        self.0.delete(name.to_string()).map_err(|e| osaurus_sync_core::Error::Storage(format!("key store: {e}")))
+        self.0.delete(name.to_string()).map_err(key_store_error)
     }
 }
 

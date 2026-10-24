@@ -205,7 +205,7 @@ fn restored_database_with_the_user_secret_recovers_on_open() {
     };
     // The user secret synced through the keychain; the device key did not.
     let restored = Arc::new(MemorySecretStore::default());
-    restored.store("user-secret", &secrets.load("user-secret").unwrap()).unwrap();
+    restored.store("user-secret", &secrets.get("user-secret").unwrap()).unwrap();
     let mut r = Replica::open(ReplicaConfig::new(dir.path(), "Mac", Platform::MacOs), env.clone(), restored).unwrap();
     assert!(!r.recovery_available().unwrap());
     assert_eq!(r.conversations().unwrap().len(), 1);
@@ -326,8 +326,7 @@ trait LoadEntropy {
 
 impl LoadEntropy for MemorySecretStore {
     fn load_entropy(&self) -> [u8; 32] {
-        use osaurus_sync_core::SecretStore;
-        self.load("user-secret").unwrap().try_into().unwrap()
+        self.get("user-secret").unwrap().try_into().unwrap()
     }
 }
 
@@ -352,7 +351,7 @@ fn rotation_locks_a_stolen_device_out_of_new_epochs() {
     assert!(a.replica.take_changes().contains(&Change::IdentityChanged));
     // The secret store holds the new identity; nothing is left staged.
     assert_eq!(UserSecret::from_entropy(a.secrets.load_entropy()).public(), a.replica.user_key());
-    assert!(a.secrets.load(osaurus_sync_core::replica::USER_SECRET_NEXT).is_none());
+    assert!(a.secrets.get(osaurus_sync_core::replica::USER_SECRET_NEXT).is_none());
 
     env.advance(5);
     a.replica.send_message(scope, text("after")).unwrap();
@@ -384,7 +383,7 @@ fn rotation_interrupted_before_storing_the_secret_completes_on_open() {
     secrets.store(osaurus_sync_core::replica::USER_SECRET_NEXT, &next).unwrap();
     let mut r = Replica::open(cfg(), env.clone(), secrets.clone()).unwrap();
     assert_eq!(r.user_key(), new);
-    assert!(secrets.load(osaurus_sync_core::replica::USER_SECRET_NEXT).is_none());
+    assert!(secrets.get(osaurus_sync_core::replica::USER_SECRET_NEXT).is_none());
     r.send_message(scope, text("still mine")).unwrap();
     r.close().unwrap();
     drop(r);
@@ -394,5 +393,37 @@ fn rotation_interrupted_before_storing_the_secret_completes_on_open() {
     secrets.store(osaurus_sync_core::replica::USER_SECRET_NEXT, &stray.entropy()).unwrap();
     let r = Replica::open(cfg(), env, secrets.clone()).unwrap();
     assert_eq!(r.user_key(), new);
-    assert!(secrets.load(osaurus_sync_core::replica::USER_SECRET_NEXT).is_none());
+    assert!(secrets.get(osaurus_sync_core::replica::USER_SECRET_NEXT).is_none());
+}
+
+/// A Keychain before the first unlock: items exist but can't be read.
+struct Locked(MemorySecretStore);
+
+impl SecretStore for Locked {
+    fn load(&self, _: &str) -> osaurus_sync_core::Result<Option<Vec<u8>>> {
+        Err(Error::KeyStore("interaction not allowed".into()))
+    }
+    fn store(&self, name: &str, value: &[u8]) -> osaurus_sync_core::Result<()> {
+        self.0.store(name, value)
+    }
+    fn delete(&self, name: &str) -> osaurus_sync_core::Result<()> {
+        self.0.delete(name)
+    }
+}
+
+#[test]
+fn an_unreadable_key_store_keeps_the_identity() {
+    let env = Arc::new(TestEnv::new(1, 1_700_000_000_000));
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(MemorySecretStore::default());
+    let cfg = ReplicaConfig::new(dir.path(), "Phone", Platform::Ios);
+    let device = Replica::open(cfg.clone(), env.clone(), secrets.clone()).unwrap().device_key();
+    let saved = secrets.get("device-key").unwrap();
+
+    let locked = Arc::new(Locked(MemorySecretStore::default()));
+    assert!(matches!(Replica::open(cfg.clone(), env.clone(), locked.clone()).err(), Some(Error::KeyStore(_))));
+    assert!(locked.0.get("device-key").is_none(), "no new identity was stored");
+
+    assert_eq!(secrets.get("device-key").unwrap(), saved);
+    assert_eq!(Replica::open(cfg, env, secrets).unwrap().device_key(), device);
 }

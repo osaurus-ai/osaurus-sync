@@ -99,7 +99,7 @@ fn generate() {
     std::fs::write(d.join("manifest.txt"), manifest).unwrap();
     let mut identity = String::new();
     for k in ["device-key", "user-secret"] {
-        identity.push_str(&format!("{k} {}\n", hex(&secrets.load(k).unwrap())));
+        identity.push_str(&format!("{k} {}\n", hex(&secrets.get(k).unwrap())));
     }
     identity.push_str(&format!("scope {}\n", scope.to_hex()));
     std::fs::write(d.join("identity.txt"), identity).unwrap();

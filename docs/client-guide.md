@@ -53,6 +53,12 @@ optional parameters are:
 | `history` | Platform default | iOS: last 90 days. macOS and Windows: full history |
 | `network` | `defaultNetworkConfig()`: LAN only until the app sets relays and discovery | See [Network configuration](#network-configuration) |
 
+A custom key store must return nil from `load` only when the item doesn't exist, and throw
+`SyncError.keyStore` for anything else. If a read failure looked like a missing item, the core
+would create a new identity. The built-in stores already do this: before the first unlock after
+a reboot, `KeychainKeyStore` throws and open fails with `keyStore`, so open again after the
+device is unlocked (for example on `protectedDataDidBecomeAvailable`).
+
 On first open the core creates a device key and a user identity. Opening also brings the network
 up, unless `network.enabled` is false.
 
@@ -572,7 +578,7 @@ a stable numeric code. Map codes to user-facing text, and use `detail` only for 
 | 110 | `incompatibleVersion` | The bindings and native library don't match |
 | 111 | `pairing` | Pairing failed |
 | 112 | `closed` | The core was closed |
-| 113 | `keyStore` | The key store callback failed |
+| 113 | `keyStore` | The key store failed, for example a Keychain read before the first unlock |
 | 114 | `corrupt` | The database is damaged beyond repair; offer `reset` and sync again from other devices |
 | 115 | `newerDatabase` | The data directory was written by a newer release; ask the user to update |
 | 199 | `internal` | A bug; please report it |

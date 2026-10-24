@@ -53,7 +53,7 @@ fn write_fixture() {
     std::fs::remove_file(file).unwrap();
     std::fs::create_dir_all(out.join("secrets")).unwrap();
     for name in SECRETS {
-        std::fs::write(out.join("secrets").join(name), secrets.load(name).unwrap()).unwrap();
+        std::fs::write(out.join("secrets").join(name), secrets.get(name).unwrap()).unwrap();
     }
 }
 

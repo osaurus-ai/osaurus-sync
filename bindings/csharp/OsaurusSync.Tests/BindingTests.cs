@@ -296,6 +296,9 @@ public sealed class BindingTests : IDisposable
         store.Delete("k");
         Assert.Null(store.Load("k"));
 
+        File.WriteAllBytes(Path.Combine(_dir, "keys", "bad.dpapi"), [1, 2, 3]);
+        Assert.Throws<SyncException.KeyStore>(() => store.Load("bad"));
+
         using var core = SyncCore.Open(
             new CoreConfig(Path.Combine(_dir, "dpapi"), "dpapi", Platform.Windows, null, OsaurusSyncFfiMethods.LocalNetworkConfig() with { Enabled = false }, OsaurusSyncFfiMethods.ApiVersion()),
             store);

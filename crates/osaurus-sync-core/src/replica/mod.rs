@@ -45,8 +45,11 @@ pub use rotate::SUCCESSION_GRACE_MS;
 pub use sync::{HELD_MAX_BYTES, HELD_MAX_EVENTS, HELD_TTL_MS, IngestOutcome, ReconKey};
 
 /// Where device and user secrets live: the Keychain on Apple platforms, DPAPI on Windows.
+///
+/// `load` returns `Ok(None)` only when the item doesn't exist. Any other failure must be an
+/// error: the replica creates a new identity when a secret is missing.
 pub trait SecretStore: Send + Sync {
-    fn load(&self, name: &str) -> Option<Vec<u8>>;
+    fn load(&self, name: &str) -> Result<Option<Vec<u8>>>;
     fn store(&self, name: &str, value: &[u8]) -> Result<()>;
     fn delete(&self, name: &str) -> Result<()>;
 }
@@ -54,9 +57,15 @@ pub trait SecretStore: Send + Sync {
 #[derive(Default)]
 pub struct MemorySecretStore(Mutex<HashMap<String, Vec<u8>>>);
 
-impl SecretStore for MemorySecretStore {
-    fn load(&self, name: &str) -> Option<Vec<u8>> {
+impl MemorySecretStore {
+    pub fn get(&self, name: &str) -> Option<Vec<u8>> {
         self.0.lock().unwrap().get(name).cloned()
+    }
+}
+
+impl SecretStore for MemorySecretStore {
+    fn load(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.get(name))
     }
     fn store(&self, name: &str, value: &[u8]) -> Result<()> {
         self.0.lock().unwrap().insert(name.into(), value.to_vec());
@@ -205,7 +214,7 @@ impl Replica {
         }
         let db_path = cfg.data_dir.join("sync.db");
 
-        let device = match secrets.load(DEVICE_SECRET) {
+        let device = match secrets.load(DEVICE_SECRET)? {
             Some(b) => DeviceSecret::from_bytes(&b)?,
             None => {
                 let d = DeviceSecret::generate(env.as_ref());
@@ -236,7 +245,7 @@ impl Replica {
             )?;
         }
 
-        let mut user = match secrets.load(USER_SECRET) {
+        let mut user = match secrets.load(USER_SECRET)? {
             Some(b) => UserSecret::from_entropy(b.try_into().map_err(|_| Error::Crypto("bad user secret".into()))?),
             None => {
                 let u = UserSecret::generate(env.as_ref());
@@ -245,7 +254,7 @@ impl Replica {
             }
         };
         // An identity rotation that stopped between committing and storing its secret.
-        if let Some(b) = secrets.load(USER_SECRET_NEXT) {
+        if let Some(b) = secrets.load(USER_SECRET_NEXT)? {
             let next = UserSecret::from_entropy(b.try_into().map_err(|_| Error::Crypto("bad user secret".into()))?);
             let committed: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM retired_users WHERE user = ? AND successor = ?)",
