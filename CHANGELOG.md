@@ -4,6 +4,16 @@ Each release lists what changed for the apps that use the library. Versions foll
 versioning; `API_VERSION` and `PROTOCOL_VERSION` are listed whenever they change. The release
 workflow copies a version's section into its GitHub release notes.
 
+## Unreleased
+
+**App data**
+
+- [docs/app-data.md](docs/app-data.md) describes hosted runs, where one of the user's devices runs
+  the agent for a chat on another: the session's `hostDevice`, the user turn's `hostRun` request,
+  each device's agent directory (`ai.osaurus.directory/1`), and the stop and approval namespaces
+  (`ai.osaurus.run/1`, `ai.osaurus.approval/1`, `ai.osaurus.approval-answer/1`). New fixtures:
+  `hosted.json` and `agent-directory.json`. The library itself is unchanged.
+
 ## 0.1.0-beta.3 - 2026-10-24
 
 `API_VERSION` 2: apps built against beta.2 need the signature changes below. `PROTOCOL_VERSION`

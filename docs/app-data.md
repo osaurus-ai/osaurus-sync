@@ -106,6 +106,7 @@ Conversation-level, written with `setConversationAppData`.
 | `conversationSummary` | object | `{ id, summaryText, coveredTurnIds, createdAt, modelIdentifier, savedTokensEstimate }` |
 | `workspace` | object | The shared-agent context (`workspaceId`, `agentAddress`, caller fields) |
 | `parkedWorkflowRuns` | object[] | `{ run_id, call_id, tool_name }` |
+| `hostDevice` | string | The device id that runs the session's agent. Absent means the device that sends a turn runs it. See [Hosted runs](#hosted-runs) |
 | `updatedAt` | number | When the session last changed, if it differs from the last message |
 | `truncated` | boolean | |
 
@@ -137,11 +138,83 @@ or onto it later (`setMessageAppData`).
 | `injectedContextPrefix` | string | The context block a user turn was sent with |
 | `author` | object | Who wrote the turn in a shared conversation |
 | `remoteParticipantMessageId` | string | |
+| `hostRun` | object | On a user turn: `{ device, requestedMs }`, a request for `device` to run the agent on this turn. See [Hosted runs](#hosted-runs) |
 | `truncated` | boolean | |
+
+## Hosted runs
+
+A session can run its agent on another of the user's devices: you chat on one Mac with an agent
+that lives on another. The device that runs the agent is the *host*; the device you type on is
+the *caller*. Only the host runs anything; the caller never runs the turn itself.
+
+### Requesting a run
+
+- The session's `hostDevice` names the host.
+- Each user turn the caller wants answered carries `hostRun: { device, requestedMs }`, with
+  `device` equal to `hostDevice`. A turn without `hostRun` is never run: history, imports and
+  edits don't start runs on their own.
+- The host runs each `hostRun` turn addressed to it at most once. It records the turn as handled
+  before it starts, so a crash or quit never runs it twice. A run that was interrupted is not
+  retried; the host answers it with an assistant turn whose `terminalStopReason` is
+  `interrupted`, and the user can send again.
+- A host that doesn't run agents for other devices answers with an assistant turn whose
+  `terminalStopReason` is `host_declined`.
+- `agentId` is the agent's id on the host. The caller doesn't need that agent; it shows the
+  name and avatar from the host's directory.
+
+### Replies
+
+The host assigns the agent to the conversation (`assignAgent`, with the agent's own secret, so
+its `0x` address is the agent's address) and sends the reply `asAgent`, streamed with
+`openStream(asAgent:)`. The reply turns are ordinary `ai.osaurus.turn/1` turns. A reader shows
+the agent by matching the message's agent address to an entry in the host's directory.
+
+### Agent directory
+
+Each device that hosts agents keeps one conversation listing them, and writes only its own, so
+two devices never write the same value.
+
+| Tag | Value |
+| --- | --- |
+| `ai.osaurus.kind` | `agent-directory` |
+| `device` | The device id |
+
+The conversation has no messages. Its app data, namespace `ai.osaurus.directory/1`:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `v` | number | `1`. Required |
+| `device` | string | The device id, the same as the tag. Required |
+| `agents` | object[] | `{ id, address, name, description?, avatar? }`. `id` is the agent's id on the device, `address` its lowercase `0x` sync agent address, `avatar` an emoji or short text. Empty when the device doesn't run agents for other devices |
+| `updatedMs` | number | When the list last changed |
+
+Readers take the union of the directories whose device is one of the user's non-revoked devices
+and ignore the rest. Apps don't show directory conversations as chats.
+
+### Stop and approvals
+
+Caller and host each write their own namespace on the session's conversation, so neither's
+write replaces the other's:
+
+| Namespace | Written by | Fields |
+| --- | --- | --- |
+| `ai.osaurus.run/1` | Caller | `v`; `stop`: the id of the user turn whose run should stop; `stopMs` |
+| `ai.osaurus.approval/1` | Host | `v`; `pending`: the tool calls waiting for the user, `{ id, turnId, tool, description, arguments, surface?, offersRunLease, requestedMs }` |
+| `ai.osaurus.approval-answer/1` | Caller | `v`; `answers`: approval id to `denied`, `allowOnce`, `allowForRun` or `alwaysAllow` |
+
+- The host stops the run whose user turn is `stop`, and ignores a `stop` naming any other turn.
+- `arguments` is the tool call's JSON arguments as a string. `surface` says where the call runs on
+  the host: `sandboxVM`, `nativeHost` or `remoteServer`. `offersRunLease` says whether `allowForRun` ("Allow for This
+  Task") is on offer.
+- The host removes an approval from `pending` once it is answered, denied, or its run ended.
+  It ignores answers for ids that aren't pending. The caller drops answers whose ids are no
+  longer pending.
+- `alwaysAllow` changes the agent's tool policy on the host, as if it had been chosen there.
 
 ## Fixtures
 
-Each fixture describes a conversation (native fields, tags and session app data) and its
+`hosted.json` is a hosted run with a pending approval and a stop request; `agent-directory.json`
+is a device's directory. Each fixture describes a conversation (native fields, tags and session app data) and its
 messages (native fields, `attachments`, `app_data` and, per namespace, `app_data_blobs`).
 Attachment and blob entries carry their content as `text`; a test writes each to a file, imports the conversation with
 `importLegacyConversation`, and checks that every field reads back unchanged. Indexes in the JSON

@@ -78,7 +78,7 @@ fn fixtures_round_trip() {
     let core = SyncCore::open(cfg, Box::new(Keys::default())).unwrap();
     let mut names: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).collect();
     names.sort();
-    assert_eq!(names.len(), 3);
+    assert_eq!(names.len(), 5);
     for path in names {
         let f: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let c = &f["conversation"];
