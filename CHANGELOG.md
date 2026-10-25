@@ -9,9 +9,10 @@ workflow copies a version's section into its GitHub release notes.
 **App data**
 
 - [docs/app-data.md](docs/app-data.md) describes hosted runs, where one of the user's devices runs
-  the agent for a chat on another: the session's `hostDevice`, the user turn's `hostRun` request,
-  each device's agent directory (`ai.osaurus.directory/1`), and the stop and approval namespaces
-  (`ai.osaurus.run/1`, `ai.osaurus.approval/1`, `ai.osaurus.approval-answer/1`). New fixtures:
+  the agent for a chat on another: the session's `hostDevice` (also a tag), the user turn's
+  `hostRun` request, each device's agent directory (`ai.osaurus.directory/1`), the host's run
+  state (`ai.osaurus.host-run/1`), and the stop and approval namespaces (`ai.osaurus.run/1`,
+  `ai.osaurus.approval/1`, `ai.osaurus.approval-answer/1`). New fixtures:
   `hosted.json` and `agent-directory.json`. The library itself is unchanged.
 
 ## 0.1.0-beta.3 - 2026-10-24

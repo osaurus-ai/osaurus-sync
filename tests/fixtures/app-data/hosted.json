@@ -8,7 +8,8 @@
     "tags": {
       "osaurus.session": "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b",
       "source": "chat",
-      "agentId": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+      "agentId": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      "hostDevice": "7c1f0e2d9a8b4c3d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5"
     },
     "app_data": {
       "ai.osaurus.session/1": {
@@ -41,6 +42,12 @@
         "v": 1,
         "stop": "d0000000-0000-4000-8000-000000000003",
         "stopMs": 1767398470000
+      },
+      "ai.osaurus.host-run/1": {
+        "v": 1,
+        "turn": "d0000000-0000-4000-8000-000000000003",
+        "state": "running",
+        "updatedMs": 1767398450500
       }
     }
   },

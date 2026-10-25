@@ -84,6 +84,7 @@ Tags are small strings for indexed lookups (`conversations(filter:)`). Osaurus w
 | `projectId` | The project id, when set |
 | `externalSessionKey` | The caller's grouping key, when set |
 | `dispatchTaskId` | The dispatch task id, when set |
+| `hostDevice` | The host's device id, when the session is hosted (see [Hosted runs](#hosted-runs)) |
 
 ## `ai.osaurus.session/1`
 
@@ -149,7 +150,8 @@ the *caller*. Only the host runs anything; the caller never runs the turn itself
 
 ### Requesting a run
 
-- The session's `hostDevice` names the host.
+- The session's `hostDevice` names the host, and the conversation carries the same value as its
+  `hostDevice` tag so the host can find the sessions it hosts.
 - Each user turn the caller wants answered carries `hostRun: { device, requestedMs }`, with
   `device` equal to `hostDevice`. A turn without `hostRun` is never run: history, imports and
   edits don't start runs on their own.
@@ -185,7 +187,7 @@ The conversation has no messages. Its app data, namespace `ai.osaurus.directory/
 | --- | --- | --- |
 | `v` | number | `1`. Required |
 | `device` | string | The device id, the same as the tag. Required |
-| `agents` | object[] | `{ id, address, name, description?, avatar? }`. `id` is the agent's id on the device, `address` its lowercase `0x` sync agent address, `avatar` an emoji or short text. Empty when the device doesn't run agents for other devices |
+| `agents` | object[] | `{ id, address?, name, description?, avatar? }`. `id` is the agent's id on the device, `address` its lowercase `0x` sync agent address (absent before the agent has a key), `avatar` an emoji or short text. Empty when the device doesn't run agents for other devices |
 | `updatedMs` | number | When the list last changed |
 
 Readers take the union of the directories whose device is one of the user's non-revoked devices
@@ -199,10 +201,13 @@ write replaces the other's:
 | Namespace | Written by | Fields |
 | --- | --- | --- |
 | `ai.osaurus.run/1` | Caller | `v`; `stop`: the id of the user turn whose run should stop; `stopMs` |
+| `ai.osaurus.host-run/1` | Host | `v`; `turn`: the user turn the host is running or last ran; `state`: `running` or `done`; `updatedMs` |
 | `ai.osaurus.approval/1` | Host | `v`; `pending`: the tool calls waiting for the user, `{ id, turnId, tool, description, arguments, surface?, offersRunLease, requestedMs }` |
 | `ai.osaurus.approval-answer/1` | Caller | `v`; `answers`: approval id to `denied`, `allowOnce`, `allowForRun` or `alwaysAllow` |
 
 - The host stops the run whose user turn is `stop`, and ignores a `stop` naming any other turn.
+- The caller treats its latest `hostRun` turn as answered once `host-run/1` says that turn is
+  `done`, or once an assistant turn follows it.
 - `arguments` is the tool call's JSON arguments as a string. `surface` says where the call runs on
   the host: `sandboxVM`, `nativeHost` or `remoteServer`. `offersRunLease` says whether `allowForRun` ("Allow for This
   Task") is on offer.
