@@ -54,3 +54,9 @@ lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
 
+# The static libraries in the Swift xcframework. Fat LTO leaves one object without the embedded
+# bitcode thin LTO needs, which keeps the libraries a fifth of the size.
+[profile.staticlib]
+inherits = "release"
+lto = "fat"
+

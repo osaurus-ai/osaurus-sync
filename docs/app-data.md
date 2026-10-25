@@ -124,7 +124,7 @@ or onto it later (`setMessageAppData`).
 | `toolCalls` | object[] | `{ id, type: "function", function: { name, arguments }, geminiThoughtSignature? }` |
 | `toolResults` | object | Tool call id to result text |
 | `toolCallDurations` | object | Tool call id to seconds |
-| `attachments` | object[] | One per native attachment: `{ id, kind, index, filename?, fileSize?, format?, structuredDocumentMetadata? }`. `index` is the attachment's position in `Message.blobs`; `kind` is `image`, `document` or `audio` |
+| `attachments` | object[] | One per native attachment: `{ id, kind, index, filename?, fileSize?, format?, sha256?, structuredDocumentMetadata? }`. `index` is the attachment's position in `Message.blobs`; `kind` is `image`, `document`, `audio` or `video`; `sha256` is the lowercase hex SHA-256 of the file, which a client can use to find its own cached copy |
 | `sharedArtifacts` | object[] | `{ id, contextId, contextType, filename, mimeType, fileSize, hostPath, ... }` |
 | `createdAt`, `completedAt`, `lastOutputAt`, `requestedAt` | number | |
 | `generationTokenCount`, `inputTokenCount`, `cachedInputTokenCount` | number | |
