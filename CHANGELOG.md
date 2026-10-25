@@ -46,6 +46,9 @@ written by a beta.3 device are kept, but not shown, by older ones.
 
 - `signOut(keepConversations:)`: with true, the device leaves the identity but keeps the
   conversations it owned as device-local ones.
+- Removing a member, or rotating the identity, keeps what that member's revoked devices wrote
+  before. It used to read as written after the removal, so a device that had joined an
+  identity couldn't sign out.
 
 **Other changes**
 

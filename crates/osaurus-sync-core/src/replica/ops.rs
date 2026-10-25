@@ -475,7 +475,7 @@ impl Replica {
         self.tx(|r| {
             let st = r.auth_mut(scope)?.full_state();
             let devices: Vec<DeviceKey> = match subject {
-                Principal::User(u) => st.devices_of(&u),
+                Principal::User(u) => st.devices_ever_of(&u),
                 Principal::Agent(a) => st.agent_hosts.get(&a).map(|b| b.host_device).into_iter().collect(),
             };
             let mut cutoffs = Vec::new();

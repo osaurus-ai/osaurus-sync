@@ -119,7 +119,7 @@ impl Replica {
                     self.append_control(scope, &Control::DeviceCert(c.clone()))?;
                 }
             }
-            let cutoffs = self.cutoffs_of(scope, &st.devices_of(&old))?;
+            let cutoffs = self.cutoffs_of(scope, &st.devices_ever_of(&old))?;
             self.append_control(scope, &Control::MemberRemove(MemberRemovePayload { subject: old_p, cutoffs }))?;
             self.rotate_key(scope)?;
             self.refresh_conversation(scope)?;
@@ -127,7 +127,7 @@ impl Replica {
         }
         let others: Vec<DeviceKey> = st.certs.keys().copied().filter(|d| st.acting(d).iter().any(|(p, _)| *p != old_p)).collect();
         self.rotate_key_to(scope, &others)?;
-        let cutoffs = self.cutoffs_of(scope, &st.devices_of(&old))?;
+        let cutoffs = self.cutoffs_of(scope, &st.devices_ever_of(&old))?;
         self.append_control(scope, &Control::MemberRemove(MemberRemovePayload { subject: old_p, cutoffs }))?;
         self.refresh_conversation(scope)?;
         Ok(Some(false))
