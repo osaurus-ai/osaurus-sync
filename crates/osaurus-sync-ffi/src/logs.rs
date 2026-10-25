@@ -255,7 +255,10 @@ impl Redactor {
                 let end = i + b[i..].iter().take_while(|c| c.is_ascii_hexdigit()).count();
                 let run = &s[i..end];
                 let bounded = end == b.len() || !b[end].is_ascii_alphanumeric();
-                if bounded && run.len() >= 12 && run.bytes().any(|c| c.is_ascii_alphabetic()) {
+                // An id's 12-digit prefix or full 64 digits can be all decimal, so those lengths
+                // are ids even without a letter. Other all-digit runs are numbers (hlc, sizes).
+                let id_like = run.len() >= 12 && run.bytes().any(|c| c.is_ascii_alphabetic());
+                if bounded && (id_like || run.len() == 12 || run.len() == 64) {
                     out.push_str(&self.id(run));
                     i = end;
                     continue;
@@ -344,5 +347,7 @@ mod tests {
         // A full id redacts to the same token as its prefix.
         assert_eq!(r.id("01977420dd83ffffffffffffffff"), id);
         assert_eq!(r.text("version 1.2.3, café"), "version 1.2.3, café");
+        let digits = r.id("019774201234");
+        assert_eq!(r.text("scope 019774201234 at 1767225600000"), format!("scope {digits} at 1767225600000"));
     }
 }

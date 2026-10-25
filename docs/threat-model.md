@@ -38,8 +38,8 @@ flowchart LR
   subgraph Device["One device (trusted)"]
     App[App] --> Ffi[FFI]
     Ffi --> Core[Core and engine]
-    Core --> Db[(SQLite: ciphertext events, plaintext views)]
-    Core --> Ks[OS key store: device key, user secret]
+    Core --> Db[(SQLCipher: events and views)]
+    Core --> Ks[OS key store: device key, user secret, view key]
   end
   Core <-- "QUIC, authenticated by device key" --> Peers[Other devices: own, members, strangers]
   Core <-- "encrypted QUIC" --> Relay[Relay servers]
@@ -148,8 +148,16 @@ devices, but the permission engine is built for sharing.
 Someone with access to the files of a device: another account on a shared machine, malware in
 the user's account, or a copied disk.
 
-- Event payloads are encrypted, but the view tables, including full-text search, hold
-  plaintext. Phase 1 relies on full-disk encryption and the OS's per-user file permissions.
+- The whole database, views and full-text search included, is encrypted with SQLCipher under a
+  random view key kept in the OS key store (`view-key`). A copied disk without the key store
+  reveals file sizes and nothing else. The view key is also sealed to the recovery key
+  (`view-key.sealed`), so a restored backup whose key store lost the key is moved aside and
+  unlocked with the phrase rather than lost.
+- Attachments are stored encrypted. `fetchAttachment` decrypts one into a cache so the app can
+  open the file; the cache is trimmed and emptied when the core opens and closes, but a
+  decrypted copy exists on disk while it's there. `readAttachment` decrypts in memory.
+- SQLite's temporary files and the OS page cache are outside SQLCipher's protection while the
+  app runs.
 - Secrets are in the OS key store. The Keychain items are `AfterFirstUnlockThisDeviceOnly`, so
   a backup can't restore them onto another device. A DPAPI blob copied to another account
   doesn't decrypt.
@@ -190,7 +198,8 @@ external review.
 - **Metadata.** Relays, discovery servers and the local network see device ids, addresses and
   traffic patterns. Control events (membership and roles) are plaintext to every device that
   syncs the scope's control layer.
-- **Plaintext views at rest.** See [local attacker](#local-attacker).
+- **Decrypted attachments in the cache.** Opened attachments sit decrypted on disk until the
+  cache is trimmed or the core closes. See [local attacker](#local-attacker).
 - **Storing peers are trusted for compaction.** Any trusted peer can claim the storage role.
   Before a storage server ships, the role should be limited to the user's own devices or to
   certified servers.

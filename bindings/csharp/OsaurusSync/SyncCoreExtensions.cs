@@ -54,7 +54,7 @@ public static class OsaurusSync
     /// Opens the core with the bindings' API version filled in. On Windows the default key store
     /// is <see cref="DpapiKeyStore"/>.
     /// </summary>
-    public static SyncCore Open(string dataDirectory, string deviceName, KeyStore? keyStore = null, NetworkConfig? network = null, HistoryMode? history = null)
+    public static SyncCore Open(string dataDirectory, string deviceName, KeyStore? keyStore = null, NetworkConfig? network = null, HistoryMode? history = null, uint? maxAppDataBytes = null)
     {
         var platform = OperatingSystem.IsWindows() ? Platform.Windows : OperatingSystem.IsMacOS() ? Platform.MacOs : Platform.Other;
         if (keyStore is null)
@@ -63,12 +63,47 @@ public static class OsaurusSync
                 throw new ArgumentNullException(nameof(keyStore), "a key store is required on this platform");
             keyStore = new DpapiKeyStore();
         }
-        var config = new CoreConfig(dataDirectory, deviceName, platform, history, network ?? OsaurusSyncFfiMethods.DefaultNetworkConfig(), OsaurusSyncFfiMethods.ApiVersion());
+        var config = new CoreConfig(dataDirectory, deviceName, platform, history, network ?? OsaurusSyncFfiMethods.DefaultNetworkConfig(), maxAppDataBytes, OsaurusSyncFfiMethods.ApiVersion());
         return SyncCore.Open(config, keyStore);
     }
 
     public static OutgoingMessage Text(string content, MessageRole role = MessageRole.User) =>
-        new(role, content, Array.Empty<AttachmentFile>(), null, null, null, null);
+        new(role, content, Array.Empty<AttachmentFile>(), null, null, null, null, Array.Empty<AppDataWrite>());
+
+    public static LegacyMessage LegacyText(string content, ulong createdMs, MessageRole role = MessageRole.User) =>
+        new(role, content, createdMs, Array.Empty<AttachmentFile>(), null, null, Array.Empty<AppDataWrite>());
+
+    public static LegacyConversation Legacy(string title, ulong createdMs, Replication replication = Replication.Synced) =>
+        new(title, createdMs, replication, false, false, Array.Empty<Tag>(), Array.Empty<AppDataEntry>());
+
+    /// <summary>
+    /// A conversation filter. Use this rather than the generated record's defaults, which leave
+    /// the list fields null.
+    /// </summary>
+    public static ConversationFilter Filter(
+        IDictionary<string, string>? tags = null, string[]? hasTags = null, ScopeKind? kind = null, Replication? replication = null,
+        bool? archived = null, bool? pinned = null, uint offset = 0, uint limit = 0) =>
+        new(ToTags(tags), hasTags ?? Array.Empty<string>(), kind, replication, archived, pinned, offset, limit);
+
+    public static string CreateConversation(this SyncCore core, string title) => core.CreateConversation(title, Replication.Synced);
+
+    public static Conversation[] Conversations(this SyncCore core, IDictionary<string, string> tagged) => core.ConversationsFiltered(Filter(tagged));
+
+    public static string Finish(this OutgoingStream stream, string? content = null) => stream.Finish(content, Array.Empty<AppDataWrite>());
+
+    public static string? GetTag(this Conversation c, string key) => Array.Find(c.Tags, t => t.Key == key)?.Value;
+
+    public static byte[]? GetAppData(this Conversation c, string ns) => Array.Find(c.AppData, e => e.Namespace == ns)?.Bytes;
+
+    public static AppData? GetAppData(this Message m, string ns) => Array.Find(m.AppData, e => e.Namespace == ns);
+
+    private static Tag[] ToTags(IDictionary<string, string>? tags)
+    {
+        if (tags is null) return Array.Empty<Tag>();
+        var list = new List<Tag>();
+        foreach (var (k, v) in tags) list.Add(new Tag(k, v));
+        return list.ToArray();
+    }
 
     public static Subscription Subscribe(this SyncCore core, string scope, Action<ScopeChange[]> onChanges) =>
         core.Subscribe(scope, new ScopeCallback(onChanges));

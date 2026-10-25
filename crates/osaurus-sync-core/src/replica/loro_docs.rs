@@ -32,6 +32,10 @@ impl LoroCache {
         Self { peer_id, docs: HashMap::new(), lru: VecDeque::new() }
     }
 
+    pub fn peer_id(&self) -> u64 {
+        self.peer_id
+    }
+
     pub fn clear(&mut self) {
         self.docs.clear();
         self.lru.clear();
@@ -55,6 +59,10 @@ pub struct ScopeMeta {
     pub pinned: bool,
     pub sort_order: Option<f64>,
     pub archived: bool,
+    /// Sorted by key.
+    pub tags: Vec<(String, String)>,
+    /// Sorted by namespace.
+    pub app_data: Vec<(String, Vec<u8>)>,
 }
 
 /// Imports one update. A shallow snapshot only takes effect in an empty document, so when the
@@ -94,7 +102,29 @@ pub(crate) fn meta_of(doc: &LoroDoc) -> ScopeMeta {
             _ => None,
         },
         archived: matches!(value(&m, "archived"), Some(LoroValue::Bool(true))),
+        tags: entries(&doc.get_map("tags"), |v| match v {
+            LoroValue::String(s) => Some(s.to_string()),
+            _ => None,
+        }),
+        app_data: entries(&doc.get_map("app_data"), |v| match v {
+            LoroValue::Binary(b) => Some(b.to_vec()),
+            _ => None,
+        }),
     }
+}
+
+/// A map's plain values that `f` accepts, sorted by key. Deleted keys and containers are skipped.
+fn entries<T>(m: &loro::LoroMap, f: impl Fn(LoroValue) -> Option<T>) -> Vec<(String, T)> {
+    let mut out = Vec::new();
+    m.for_each(|k, v| {
+        if let ValueOrContainer::Value(v) = v
+            && let Some(t) = f(v)
+        {
+            out.push((k.to_string(), t));
+        }
+    });
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 fn value(m: &loro::LoroMap, key: &str) -> Option<LoroValue> {

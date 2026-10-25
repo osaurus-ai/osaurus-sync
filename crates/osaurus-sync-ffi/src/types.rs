@@ -156,11 +156,48 @@ pub enum ScopeKind {
     Workspace,
 }
 
+impl From<ScopeKind> for CoreScopeKind {
+    fn from(k: ScopeKind) -> Self {
+        match k {
+            ScopeKind::Conversation => CoreScopeKind::Conversation,
+            ScopeKind::Workspace => CoreScopeKind::Workspace,
+        }
+    }
+}
+
 impl From<CoreScopeKind> for ScopeKind {
     fn from(k: CoreScopeKind) -> Self {
         match k {
             CoreScopeKind::Conversation => ScopeKind::Conversation,
             CoreScopeKind::Workspace => ScopeKind::Workspace,
+        }
+    }
+}
+
+/// Whether a conversation leaves this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Replication {
+    /// Shared with this user's other devices and the conversation's members.
+    Synced,
+    /// Kept on this device only. Encrypted like a synced one, and restorable from a backup with
+    /// the recovery phrase, but never offered to another device and never shareable.
+    DeviceLocal,
+}
+
+impl From<Replication> for ct::Replication {
+    fn from(r: Replication) -> Self {
+        match r {
+            Replication::Synced => ct::Replication::Synced,
+            Replication::DeviceLocal => ct::Replication::DeviceLocal,
+        }
+    }
+}
+
+impl From<ct::Replication> for Replication {
+    fn from(r: ct::Replication) -> Self {
+        match r {
+            ct::Replication::Synced => Replication::Synced,
+            ct::Replication::DeviceLocal => Replication::DeviceLocal,
         }
     }
 }
@@ -215,6 +252,9 @@ pub struct CoreConfig {
     /// None uses the platform default (recent 90 days on iOS, full elsewhere).
     pub history: Option<HistoryMode>,
     pub network: NetworkConfig,
+    /// The largest app data value one write may carry, in bytes. None uses the default (64 KiB).
+    /// Larger values belong in app data attachments.
+    pub max_app_data_bytes: Option<u32>,
     /// The API version the bindings were generated for. Must equal `api_version()`.
     pub api_version: u32,
 }
@@ -226,6 +266,100 @@ pub struct Blob {
     pub media_type: String,
     pub name: String,
     pub available: bool,
+}
+
+impl From<ct::BlobInfo> for Blob {
+    fn from(b: ct::BlobInfo) -> Self {
+        Blob { hash: hex(&b.hash), size: b.size, media_type: b.media_type, name: b.name, available: b.available }
+    }
+}
+
+/// An app's data on a message, under a namespace it owns (such as `ai.osaurus.turn/1`). The
+/// newest write by the message's author wins.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AppData {
+    pub namespace: String,
+    pub bytes: Vec<u8>,
+    /// Attachments written with the data. Fetch them with `fetch_attachment`.
+    pub blobs: Vec<Blob>,
+}
+
+/// One namespace of app data to write with or onto a message. Writing empty `bytes` and no
+/// attachments clears the namespace.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AppDataWrite {
+    pub namespace: String,
+    pub bytes: Vec<u8>,
+    pub attachments: Vec<AttachmentFile>,
+}
+
+impl AppDataWrite {
+    pub(crate) fn to_core(&self) -> ct::AppDataWrite {
+        ct::AppDataWrite {
+            namespace: self.namespace.clone(),
+            bytes: self.bytes.clone(),
+            attachments: self.attachments.iter().map(AttachmentFile::to_core).collect(),
+        }
+    }
+}
+
+/// Conversation-level app data under one namespace.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AppDataEntry {
+    pub namespace: String,
+    pub bytes: Vec<u8>,
+}
+
+/// A conversation tag, for finding conversations with `conversations_filtered`. Tags sync with
+/// the conversation; keep values non-sensitive identifiers such as an agent id.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Tag {
+    pub key: String,
+    pub value: String,
+}
+
+pub(crate) fn tag_pairs(tags: &[Tag]) -> Vec<(String, String)> {
+    tags.iter().map(|t| (t.key.clone(), t.value.clone())).collect()
+}
+
+/// Which conversations to list or search. Every set field must match.
+#[derive(Debug, Clone, PartialEq, Eq, Default, uniffi::Record)]
+pub struct ConversationFilter {
+    /// All of these key and value pairs.
+    #[uniffi(default)]
+    pub tags: Vec<Tag>,
+    /// Every one of these tag keys, whatever the value.
+    #[uniffi(default)]
+    pub has_tags: Vec<String>,
+    #[uniffi(default)]
+    pub kind: Option<ScopeKind>,
+    #[uniffi(default)]
+    pub replication: Option<Replication>,
+    #[uniffi(default)]
+    pub archived: Option<bool>,
+    #[uniffi(default)]
+    pub pinned: Option<bool>,
+    /// Skip this many results, for paging.
+    #[uniffi(default)]
+    pub offset: u32,
+    /// At most this many; 0 means no limit.
+    #[uniffi(default)]
+    pub limit: u32,
+}
+
+impl ConversationFilter {
+    pub(crate) fn to_core(&self) -> ct::ConversationFilter {
+        ct::ConversationFilter {
+            tags: tag_pairs(&self.tags),
+            has_tags: self.has_tags.clone(),
+            kind: self.kind.map(Into::into),
+            replication: self.replication.map(Into::into),
+            archived: self.archived,
+            pinned: self.pinned,
+            offset: self.offset,
+            limit: self.limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -266,6 +400,7 @@ pub struct Message {
     pub edited: bool,
     pub delivery: Delivery,
     pub reactions: Vec<Reaction>,
+    pub app_data: Vec<AppData>,
 }
 
 impl From<ct::MessageView> for Message {
@@ -280,11 +415,7 @@ impl From<ct::MessageView> for Message {
             is_agent: m.is_agent,
             role: m.role.into(),
             content: m.content,
-            blobs: m
-                .blobs
-                .into_iter()
-                .map(|b| Blob { hash: hex(&b.hash), size: b.size, media_type: b.media_type, name: b.name, available: b.available })
-                .collect(),
+            blobs: m.blobs.into_iter().map(Into::into).collect(),
             reply_to: m.reply_to.map(|i| i.to_hex()),
             tool_call_id: m.tool_call_id,
             tool_name: m.tool_name,
@@ -295,6 +426,11 @@ impl From<ct::MessageView> for Message {
                 ct::DeliveryStatus::Rejected(r) => Delivery::Rejected { reason_code: r as u32, reason: format!("{r:?}") },
             },
             reactions: m.reactions.into_iter().map(|r| Reaction { value: r.reaction, count: r.count, mine: r.mine }).collect(),
+            app_data: m
+                .app_data
+                .into_iter()
+                .map(|a| AppData { namespace: a.namespace, bytes: a.bytes, blobs: a.blobs.into_iter().map(Into::into).collect() })
+                .collect(),
         }
     }
 }
@@ -389,6 +525,12 @@ pub struct Conversation {
     pub unread: u32,
     pub my_role: Option<MemberRole>,
     pub members: Vec<Member>,
+    pub replication: Replication,
+    /// When the conversation was created: the original time for an imported one.
+    pub created_ms: u64,
+    pub message_count: u32,
+    pub tags: Vec<Tag>,
+    pub app_data: Vec<AppDataEntry>,
 }
 
 impl From<ct::ConversationSummary> for Conversation {
@@ -405,6 +547,11 @@ impl From<ct::ConversationSummary> for Conversation {
             unread: c.unread,
             my_role: c.my_role.map(Into::into),
             members: c.members.into_iter().map(|m| Member { principal: m.principal.to_hex(), role: m.role.into() }).collect(),
+            replication: c.replication.into(),
+            created_ms: c.created_ms,
+            message_count: c.message_count,
+            tags: c.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
+            app_data: c.app_data.into_iter().map(|(namespace, bytes)| AppDataEntry { namespace, bytes }).collect(),
         }
     }
 }
@@ -449,6 +596,12 @@ pub struct AttachmentFile {
     pub name: String,
 }
 
+impl AttachmentFile {
+    pub(crate) fn to_core(&self) -> ct::Attachment {
+        ct::Attachment { path: self.path.clone().into(), media_type: self.media_type.clone(), name: self.name.clone() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct OutgoingMessage {
     pub role: MessageRole,
@@ -459,6 +612,8 @@ pub struct OutgoingMessage {
     pub as_agent: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
+    /// Written with the message, in the same commit.
+    pub app_data: Vec<AppDataWrite>,
 }
 
 impl OutgoingMessage {
@@ -466,17 +621,40 @@ impl OutgoingMessage {
         Ok(ct::NewMessage {
             role: self.role.into(),
             content: self.content.clone(),
-            attachments: self
-                .attachments
-                .iter()
-                .map(|a| ct::Attachment { path: a.path.clone().into(), media_type: a.media_type.clone(), name: a.name.clone() })
-                .collect(),
+            attachments: self.attachments.iter().map(AttachmentFile::to_core).collect(),
             reply_to: self.reply_to.as_deref().map(event_id).transpose()?,
             as_agent: self.as_agent.as_deref().map(agent_id).transpose()?,
             tool_call_id: self.tool_call_id.clone(),
             tool_name: self.tool_name.clone(),
             id: None,
+            app_data: self.app_data.iter().map(AppDataWrite::to_core).collect(),
         })
+    }
+}
+
+/// A conversation from the app's own store, for `import_legacy_conversation`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LegacyConversation {
+    pub title: String,
+    pub created_ms: u64,
+    pub replication: Replication,
+    pub pinned: bool,
+    pub archived: bool,
+    pub tags: Vec<Tag>,
+    pub app_data: Vec<AppDataEntry>,
+}
+
+impl LegacyConversation {
+    pub(crate) fn to_core(&self) -> ct::ImportOptions {
+        ct::ImportOptions {
+            title: self.title.clone(),
+            created_ms: self.created_ms,
+            replication: self.replication.into(),
+            pinned: self.pinned,
+            archived: self.archived,
+            tags: tag_pairs(&self.tags),
+            app_data: self.app_data.iter().map(|a| (a.namespace.clone(), a.bytes.clone())).collect(),
+        }
     }
 }
 
@@ -485,6 +663,24 @@ pub struct LegacyMessage {
     pub role: MessageRole,
     pub content: String,
     pub created_ms: u64,
+    pub attachments: Vec<AttachmentFile>,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub app_data: Vec<AppDataWrite>,
+}
+
+impl LegacyMessage {
+    pub(crate) fn to_core(&self) -> ct::ImportedMessage {
+        ct::ImportedMessage {
+            role: self.role.into(),
+            content: self.content.clone(),
+            created_ms: self.created_ms,
+            attachments: self.attachments.iter().map(AttachmentFile::to_core).collect(),
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+            app_data: self.app_data.iter().map(AppDataWrite::to_core).collect(),
+        }
+    }
 }
 
 /// Result of `revoke_and_rotate`.
@@ -574,6 +770,10 @@ pub struct PeerConnection {
 pub struct StorageUsage {
     /// The database with its write-ahead log.
     pub database_bytes: u64,
+    /// Stored events of synced conversations, a share of `database_bytes`.
+    pub synced_event_bytes: u64,
+    /// Stored events of device-local conversations, a share of `database_bytes`.
+    pub local_event_bytes: u64,
     /// Encrypted attachments, including partial downloads.
     pub attachment_bytes: u64,
     /// Decrypted copies of opened attachments, evicted automatically past the cap.
@@ -582,7 +782,13 @@ pub struct StorageUsage {
 
 impl From<osaurus_sync_core::replica::StorageUsage> for StorageUsage {
     fn from(u: osaurus_sync_core::replica::StorageUsage) -> Self {
-        StorageUsage { database_bytes: u.database_bytes, attachment_bytes: u.blob_bytes, attachment_cache_bytes: u.attachment_cache_bytes }
+        StorageUsage {
+            database_bytes: u.database_bytes,
+            synced_event_bytes: u.synced_event_bytes,
+            local_event_bytes: u.local_event_bytes,
+            attachment_bytes: u.blob_bytes,
+            attachment_cache_bytes: u.attachment_cache_bytes,
+        }
     }
 }
 

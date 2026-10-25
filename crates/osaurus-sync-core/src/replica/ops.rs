@@ -14,10 +14,17 @@ use crate::identity::{AgentBinding, DeviceCert};
 use crate::ids::{AgentId, DeviceKey, EventId, Principal, Role, ScopeId, UserKey};
 use crate::keys::UserSecret;
 use crate::payload::{
-    Content, Control, DeviceRevokePayload, EditPayload, GenesisPayload, InvitePayload, KeyGrant, KeyUpdatePayload, MemberAddPayload, MemberRemovePayload,
-    MessagePayload, MessageRole, ReactionOp, ReactionPayload, RoleChangePayload, ScopeKind, TombstonePayload,
+    AppDataPayload, BlobRef, Content, Control, DeviceRevokePayload, EditPayload, GenesisPayload, InvitePayload, KeyGrant, KeyUpdatePayload, MemberAddPayload,
+    MemberRemovePayload, MessagePayload, MessageRole, ReactionOp, ReactionPayload, RoleChangePayload, ScopeKind, TombstonePayload,
 };
-use crate::types::{Change, ImportedMessage, NewMessage};
+use crate::store::replication;
+use crate::types::{AppDataWrite, Attachment, Change, ImportOptions, ImportedMessage, NewMessage, Replication};
+
+/// Longest app data namespace, in bytes.
+const MAX_NAMESPACE_BYTES: usize = 128;
+/// Longest conversation tag key or value, in bytes.
+const MAX_TAG_BYTES: usize = 256;
+const MAX_TAGS: usize = 64;
 
 /// A one-time invitation to a scope. Encoded into a link or QR code by the app.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -71,15 +78,24 @@ impl Replica {
 
     /// Creates a conversation or workspace scope owned by this user.
     pub fn create_scope(&mut self, kind_: ScopeKind, title: &str) -> Result<ScopeId> {
-        self.tx(|r| r.create_scope_inner(kind_, title, None))
+        self.create_scope_with(kind_, title, Replication::Synced)
     }
 
-    fn create_scope_inner(&mut self, kind_: ScopeKind, title: &str, created_ms: Option<u64>) -> Result<ScopeId> {
+    /// Creates a scope that syncs, or one that never leaves this device.
+    pub fn create_scope_with(&mut self, kind_: ScopeKind, title: &str, replication: Replication) -> Result<ScopeId> {
+        self.tx(|r| r.create_scope_inner(kind_, title, None, replication))
+    }
+
+    fn create_scope_inner(&mut self, kind_: ScopeKind, title: &str, created_ms: Option<u64>, repl: Replication) -> Result<ScopeId> {
         let id = self.new_event_id();
         let scope = ScopeId::from(id);
         self.join_scope(scope)?;
+        let local = repl == Replication::DeviceLocal;
         // A scope created here is complete by definition.
-        self.db.execute("UPDATE scopes SET synced_from_hlc = 0 WHERE scope = ?", [&scope.0[..]])?;
+        self.db.execute(
+            "UPDATE scopes SET synced_from_hlc = 0, replication = ? WHERE scope = ?",
+            params![if local { replication::DEVICE_LOCAL } else { replication::SYNCED }, &scope.0[..]],
+        )?;
         let genesis = Control::Genesis(GenesisPayload {
             owner: self.user_key(),
             owner_device: self.cert.clone(),
@@ -87,7 +103,7 @@ impl Replica {
             created_ms: created_ms.unwrap_or_else(|| self.env.now_ms()),
         });
         self.append(scope, kind::GENESIS, 0, genesis.encode(), Some(id), None)?;
-        let others = self.my_other_devices()?;
+        let others = if local { vec![] } else { self.my_other_devices()? };
         for c in &others {
             self.append_control(scope, &Control::DeviceCert(c.clone()))?;
         }
@@ -105,24 +121,79 @@ impl Replica {
 
     /// Imports an existing local conversation, keeping original timestamps for display order.
     pub fn import_conversation(&mut self, title: &str, created_ms: u64, messages: &[ImportedMessage]) -> Result<ScopeId> {
+        self.import_conversation_with(&ImportOptions { title: title.into(), created_ms, ..Default::default() }, messages)
+    }
+
+    /// Imports a legacy conversation with its metadata, attachments and app data in one
+    /// transaction, so an interrupted import leaves nothing behind.
+    pub fn import_conversation_with(&mut self, opts: &ImportOptions, messages: &[ImportedMessage]) -> Result<ScopeId> {
+        for m in messages {
+            for w in &m.app_data {
+                self.check_app_data(&w.namespace, &w.bytes)?;
+            }
+        }
+        for (ns, b) in &opts.app_data {
+            self.check_app_data(ns, b)?;
+        }
+        check_tags(&opts.tags)?;
         self.tx(|r| {
-            let scope = r.create_scope_inner(ScopeKind::Conversation, title, Some(created_ms))?;
+            let scope = r.create_scope_inner(ScopeKind::Conversation, &opts.title, Some(opts.created_ms), opts.replication)?;
+            if opts.pinned || opts.archived || !opts.tags.is_empty() || !opts.app_data.is_empty() {
+                r.loro_write(scope, |doc| {
+                    let meta = doc.get_map("meta");
+                    if opts.pinned {
+                        meta.insert("pinned", true)?;
+                    }
+                    if opts.archived {
+                        meta.insert("archived", true)?;
+                    }
+                    let tags = doc.get_map("tags");
+                    for (k, v) in &opts.tags {
+                        tags.insert(k, v.as_str())?;
+                    }
+                    let data = doc.get_map("app_data");
+                    for (ns, b) in &opts.app_data {
+                        data.insert(ns, LoroValue::Binary(b.clone().into()))?;
+                    }
+                    Ok(())
+                })?;
+                r.refresh_conversation(scope)?;
+            }
+            // Order by the original times, but never past now: a later edit must sort after
+            // the message it changes, even if the legacy clock ran fast.
+            let now = r.env.now_ms();
             for (i, m) in messages.iter().enumerate() {
-                let hlc = crate::hlc::pack(m.created_ms, (i % 0xffff) as u16);
-                let payload = MessagePayload {
-                    role: m.role,
-                    content: m.content.clone(),
-                    blobs: vec![],
-                    reply_to: None,
-                    as_agent: None,
-                    tool_call_id: None,
-                    tool_name: None,
-                    imported_at_ms: Some(m.created_ms),
-                };
-                r.append_content(scope, &Content::Message(payload), None, Some(hlc))?;
+                let hlc = crate::hlc::pack(m.created_ms.min(now), (i % 0xffff) as u16);
+                let mut payload = r.message_payload(m.role, &m.content, &m.attachments)?;
+                payload.tool_call_id = m.tool_call_id.clone();
+                payload.tool_name = m.tool_name.clone();
+                payload.imported_at_ms = Some(m.created_ms);
+                let id = r.append_content(scope, &Content::Message(payload), None, Some(hlc))?;
+                for w in &m.app_data {
+                    r.append_app_data(scope, id, w, Some(hlc))?;
+                }
             }
             Ok(scope)
         })
+    }
+
+    /// Encrypts attachments into the blob store and spills a long tool result into a blob.
+    fn message_payload(&mut self, role: MessageRole, content: &str, attachments: &[Attachment]) -> Result<MessagePayload> {
+        let mut blobs = Vec::new();
+        for a in attachments {
+            blobs.push(self.blobs.import(self.env.as_ref(), &a.path, &a.media_type, &a.name)?);
+        }
+        let mut content = content.to_owned();
+        if role == MessageRole::ToolResult && content.len() > self.cfg.tool_output_blob_threshold {
+            let b = self.blobs.import_bytes(self.env.as_ref(), content.as_bytes(), "text/plain", "tool-output.txt")?;
+            let mut cut = 512.min(content.len());
+            while !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            content = format!("{}…", &content[..cut]);
+            blobs.push(b);
+        }
+        Ok(MessagePayload { role, content, blobs, reply_to: None, as_agent: None, tool_call_id: None, tool_name: None, imported_at_ms: None })
     }
 
     pub fn send_message(&mut self, scope: ScopeId, msg: NewMessage) -> Result<EventId> {
@@ -131,32 +202,149 @@ impl Replica {
         {
             return Err(Error::PermissionDenied("this device does not host the agent".into()));
         }
+        for w in &msg.app_data {
+            self.check_app_data(&w.namespace, &w.bytes)?;
+        }
         self.tx(|r| {
-            let mut blobs = Vec::new();
-            for a in &msg.attachments {
-                blobs.push(r.blobs.import(r.env.as_ref(), &a.path, &a.media_type, &a.name)?);
+            let mut payload = r.message_payload(msg.role, &msg.content, &msg.attachments)?;
+            payload.reply_to = msg.reply_to;
+            payload.as_agent = msg.as_agent;
+            payload.tool_call_id = msg.tool_call_id.clone();
+            payload.tool_name = msg.tool_name.clone();
+            let id = r.append_content(scope, &Content::Message(payload), msg.id, None)?;
+            for w in &msg.app_data {
+                r.append_app_data(scope, id, w, None)?;
             }
-            let mut content = msg.content.clone();
-            if msg.role == MessageRole::ToolResult && content.len() > r.cfg.tool_output_blob_threshold {
-                let b = r.blobs.import_bytes(r.env.as_ref(), content.as_bytes(), "text/plain", "tool-output.txt")?;
-                let mut cut = 512.min(content.len());
-                while !content.is_char_boundary(cut) {
-                    cut -= 1;
+            Ok(id)
+        })
+    }
+
+    // ---- app data ----
+
+    fn check_app_data(&self, namespace: &str, bytes: &[u8]) -> Result<()> {
+        if namespace.is_empty() || namespace.len() > MAX_NAMESPACE_BYTES {
+            return Err(Error::InvalidInput(format!("app data namespace must be 1 to {MAX_NAMESPACE_BYTES} bytes")));
+        }
+        if bytes.len() > self.cfg.max_app_data_bytes {
+            return Err(Error::InvalidInput(format!(
+                "app data for {namespace} is {} bytes; the limit is {}. Store large values as app data attachments",
+                bytes.len(),
+                self.cfg.max_app_data_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn append_app_data(&mut self, scope: ScopeId, target: EventId, w: &AppDataWrite, hlc: Option<u64>) -> Result<()> {
+        let mut blobs: Vec<BlobRef> = Vec::new();
+        for a in &w.attachments {
+            blobs.push(self.blobs.import(self.env.as_ref(), &a.path, &a.media_type, &a.name)?);
+        }
+        let p = AppDataPayload { target, namespace: w.namespace.clone(), bytes: w.bytes.clone(), blobs };
+        self.append_content(scope, &Content::AppData(p), None, hlc)?;
+        Ok(())
+    }
+
+    /// Replaces app data on one of this user's own messages, one namespace per write. Empty
+    /// bytes without attachments clear the namespace.
+    pub fn set_message_app_data(&mut self, target: EventId, writes: &[AppDataWrite]) -> Result<()> {
+        let (scope, principal) = self.message_scope_and_principal(&target)?;
+        if principal != self.me().to_hex() {
+            return Err(Error::PermissionDenied("only the author can set a message's app data".into()));
+        }
+        for w in writes {
+            self.check_app_data(&w.namespace, &w.bytes)?;
+        }
+        self.tx(|r| {
+            for w in writes {
+                r.append_app_data(scope, target, w, None)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Sets (or with `None`, removes) one namespace of conversation-level app data.
+    pub fn set_conversation_app_data(&mut self, scope: ScopeId, namespace: &str, bytes: Option<&[u8]>) -> Result<()> {
+        self.check_app_data(namespace, bytes.unwrap_or_default())?;
+        let ns = namespace.to_owned();
+        let value = bytes.map(|b| LoroValue::Binary(b.to_vec().into()));
+        self.tx(|r| {
+            r.loro_write(scope, |doc| {
+                let m = doc.get_map("app_data");
+                match value {
+                    Some(v) => m.insert(&ns, v),
+                    None => m.delete(&ns),
                 }
-                content = format!("{}…", &content[..cut]);
-                blobs.push(b);
+            })
+        })
+    }
+
+    /// Replaces the conversation's tags. Tags are indexed for `conversations_filtered` and sync
+    /// like the title.
+    pub fn set_conversation_tags(&mut self, scope: ScopeId, tags: &[(String, String)]) -> Result<()> {
+        check_tags(tags)?;
+        let current = self.scope_meta(scope)?.tags;
+        let removed: Vec<String> = current.iter().filter(|(k, _)| !tags.iter().any(|(t, _)| t == k)).map(|(k, _)| k.clone()).collect();
+        let changed: Vec<(String, String)> = tags.iter().filter(|t| !current.contains(t)).cloned().collect();
+        if removed.is_empty() && changed.is_empty() {
+            return Ok(());
+        }
+        self.tx(|r| {
+            r.loro_write(scope, |doc| {
+                let m = doc.get_map("tags");
+                for k in &removed {
+                    m.delete(k)?;
+                }
+                for (k, v) in &changed {
+                    m.insert(k, v.as_str())?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    // ---- device-local scopes ----
+
+    fn require_synced(&self, scope: ScopeId) -> Result<()> {
+        if self.is_device_local(scope)? {
+            return Err(Error::PermissionDenied("a device-local conversation can't be shared".into()));
+        }
+        Ok(())
+    }
+
+    /// Deletes a device-local conversation outright. Synced ones are left with `leave_scope`.
+    pub fn delete_local_scope(&mut self, scope: ScopeId) -> Result<()> {
+        if !self.scope_exists(scope)? {
+            return Err(Error::NotFound("scope".into()));
+        }
+        if !self.is_device_local(scope)? {
+            return Err(Error::InvalidInput("only a device-local conversation can be deleted; leave a synced one".into()));
+        }
+        self.purge_scope(scope)
+    }
+
+    /// Starts syncing a device-local scope with this user's other devices. Its history goes
+    /// with it.
+    pub fn promote_to_synced(&mut self, scope: ScopeId) -> Result<()> {
+        if !self.is_device_local(scope)? {
+            return Ok(());
+        }
+        if self.my_role(scope)? != Some(Role::Owner) {
+            return Err(Error::PermissionDenied("only the owner can sync a conversation".into()));
+        }
+        self.tx(|r| {
+            r.db.execute("UPDATE scopes SET replication = ? WHERE scope = ?", params![replication::SYNCED, &scope.0[..]])?;
+            let others = r.my_other_devices()?;
+            let keys = r.all_keys(scope)?;
+            for c in &others {
+                r.append_control(scope, &Control::DeviceCert(c.clone()))?;
             }
-            let payload = MessagePayload {
-                role: msg.role,
-                content,
-                blobs,
-                reply_to: msg.reply_to,
-                as_agent: msg.as_agent,
-                tool_call_id: msg.tool_call_id.clone(),
-                tool_name: msg.tool_name.clone(),
-                imported_at_ms: None,
-            };
-            r.append_content(scope, &Content::Message(payload), msg.id, None)
+            if !others.is_empty() && !keys.is_empty() {
+                let devices: Vec<DeviceKey> = others.iter().map(|c| c.device).collect();
+                let grants = r.grants_for(&devices, &keys)?;
+                r.append_control(scope, &Control::KeyUpdate(KeyUpdatePayload { grants }))?;
+            }
+            r.refresh_conversation(scope)
         })
     }
 
@@ -262,6 +450,7 @@ impl Replica {
 
     /// Adds a user to a scope directly. Their devices are admitted when they connect.
     pub fn add_member(&mut self, scope: ScopeId, user: UserKey, role: Role) -> Result<()> {
+        self.require_synced(scope)?;
         self.tx(|r| {
             r.append_control(scope, &Control::MemberAdd(MemberAddPayload { subject: Principal::User(user), role, invite: None }))?;
             Ok(())
@@ -363,6 +552,9 @@ impl Replica {
             r.upsert_known_device(cert)?;
             let mut admitted = Vec::new();
             for scope in scopes {
+                if r.is_device_local(scope)? {
+                    continue;
+                }
                 let st = r.auth_mut(scope)?.full_state();
                 if st.revoked.contains(&cert.device) || st.max_role(&me).is_none() || !st.members.contains_key(&Principal::User(cert.user)) {
                     continue;
@@ -490,6 +682,7 @@ impl Replica {
     }
 
     fn issue_invite(&mut self, scope: ScopeId, role: Role, ttl_ms: u64, for_user: Option<UserKey>) -> Result<InviteToken> {
+        self.require_synced(scope)?;
         let token: [u8; 32] = random_array(self.env.as_ref());
         let expires_ms = self.env.now_ms() + ttl_ms;
         let token_hash = crypto::hash(&token);
@@ -510,6 +703,7 @@ impl Replica {
         if !cert.verify() {
             return Err(Error::InvalidInput("bad certificate".into()));
         }
+        self.require_synced(scope)?;
         let hash = crypto::hash(&token);
         let st = self.auth_mut(scope)?.full_state();
         let invite = st.invites.get(&hash).cloned().ok_or_else(|| Error::PermissionDenied("unknown invite".into()))?;
@@ -545,6 +739,9 @@ impl Replica {
     /// Adds an agent to a scope (if needed) and binds it to a host device. Only the host runs it.
     pub fn assign_agent(&mut self, scope: ScopeId, agent_secret: &[u8], host: Option<DeviceKey>, role: Role, ttl_ms: u64) -> Result<AgentId> {
         let host = host.unwrap_or_else(|| self.device_key());
+        if host != self.device_key() {
+            self.require_synced(scope)?;
+        }
         let binding = AgentBinding::sign(agent_secret, host, self.env.now_ms() + ttl_ms)?;
         let agent = binding.agent;
         self.tx(|r| {
@@ -581,7 +778,11 @@ impl Replica {
     /// Switches this device to another user identity (after pairing or recovery). Local scopes
     /// owned by the previous identity add the new user as Owner so nothing is orphaned.
     pub fn adopt_user(&mut self, user: UserSecret) -> Result<()> {
+        let unlocked = self.unlock_with(&user)?;
         if user.public() == self.user_key() {
+            if unlocked && self.restored_user()? == Some(user.public()) {
+                self.finish_recovery()?;
+            }
             return Ok(());
         }
         if self.is_retired(&user.public())? {
@@ -612,6 +813,7 @@ impl Replica {
         self.cert = cert.clone();
         self.upsert_known_device(&cert)?;
         self.finish_recovery()?;
+        self.seal_view_key()?;
         self.changes.push(Change::IdentityChanged);
         Ok(())
     }
@@ -621,4 +823,19 @@ impl Replica {
         let rows: Vec<Vec<u8>> = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
         Ok(rows.into_iter().filter_map(|b| ScopeId::from_slice(&b)).collect())
     }
+}
+
+fn check_tags(tags: &[(String, String)]) -> Result<()> {
+    if tags.len() > MAX_TAGS {
+        return Err(Error::InvalidInput(format!("at most {MAX_TAGS} tags")));
+    }
+    for (i, (k, v)) in tags.iter().enumerate() {
+        if k.is_empty() || k.len() > MAX_TAG_BYTES || v.len() > MAX_TAG_BYTES {
+            return Err(Error::InvalidInput(format!("tag keys must be 1 to {MAX_TAG_BYTES} bytes, values up to {MAX_TAG_BYTES}")));
+        }
+        if tags[..i].iter().any(|(o, _)| o == k) {
+            return Err(Error::InvalidInput(format!("duplicate tag {k}")));
+        }
+    }
+    Ok(())
 }

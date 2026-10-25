@@ -21,9 +21,9 @@ Prereleases are only attached to the GitHub release. Download the `.nupkg` into 
 that folder as a package source:
 
 ```sh
-gh release download v0.1.0-beta.2 -R osaurus-ai/osaurus-sync -p '*.nupkg' -D packages
+gh release download v0.1.0-beta.3 -R osaurus-ai/osaurus-sync -p '*.nupkg' -D packages
 dotnet nuget add source "$PWD/packages" --name osaurus-local
-dotnet add package Osaurus.Sync --version 0.1.0-beta.2
+dotnet add package Osaurus.Sync --version 0.1.0-beta.3
 ```
 
 To keep the source with the project, use a `nuget.config` next to the solution instead:

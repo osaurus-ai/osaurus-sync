@@ -13,6 +13,7 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::Replica;
 use crate::error::Result;
+use crate::store::DbKey;
 
 /// Pages the write-ahead log may reach before a commit checkpoints it inline, once a
 /// `Checkpointer` is in use (about 40 MB).
@@ -23,6 +24,7 @@ pub struct Checkpointer(Arc<Gate>);
 
 struct Gate {
     path: PathBuf,
+    key: DbKey,
     state: Mutex<State>,
 }
 
@@ -44,6 +46,7 @@ impl Checkpointer {
         }
         if st.conn.is_none() {
             let conn = Connection::open_with_flags(&self.0.path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+            crate::store::apply_key(&conn, &self.0.key)?;
             st.conn = Some(conn);
         }
         let conn = st.conn.as_ref().expect("just opened");
@@ -51,8 +54,13 @@ impl Checkpointer {
         Ok(())
     }
 
-    pub(super) fn new(path: PathBuf) -> Self {
-        Checkpointer(Arc::new(Gate { path, state: Mutex::new(State::default()) }))
+    pub(super) fn new(path: PathBuf, key: DbKey) -> Self {
+        Checkpointer(Arc::new(Gate { path, key, state: Mutex::new(State::default()) }))
+    }
+
+    /// Drops the second connection; the next run reopens the file. For when the file was replaced.
+    pub(super) fn reopen(&self) {
+        self.0.state.lock().unwrap_or_else(|e| e.into_inner()).conn = None;
     }
 
     /// Closes the second connection for good, so the database files can be deleted.

@@ -15,6 +15,7 @@ use osaurus_sync_core::env::{SystemEnv, random_array};
 use osaurus_sync_core::ids::{EventId, ScopeId};
 use osaurus_sync_core::keys::UserSecret;
 use osaurus_sync_core::payload::ScopeKind as CoreScopeKind;
+use osaurus_sync_core::types as ct;
 use osaurus_sync_core::types::{ImportedMessage, NewMessage, StreamState as CoreStreamState};
 use osaurus_sync_core::{Replica, ReplicaConfig, SecretStore};
 use osaurus_sync_net::SyncNode;
@@ -28,7 +29,7 @@ pub use types::*;
 uniffi::setup_scaffolding!();
 
 /// Bumped whenever the exported surface changes incompatibly.
-pub const API_VERSION: u32 = 1;
+pub const API_VERSION: u32 = 2;
 
 #[uniffi::export]
 pub fn api_version() -> u32 {
@@ -174,6 +175,9 @@ impl SyncCore {
             .map_err(|e| osaurus_sync_core::Error::Internal(e.to_string()))?;
         let mut rcfg = ReplicaConfig::new(&config.data_dir, &config.device_name, config.platform.into());
         rcfg.history_mode = config.history.map(Into::into);
+        if let Some(max) = config.max_app_data_bytes {
+            rcfg.max_app_data_bytes = max as usize;
+        }
         let replica = Replica::open(rcfg, Arc::new(SystemEnv), Arc::new(KeyStoreAdapter(key_store)))?;
         let hub = hub::Hub::start();
         let node = SyncNode::offline(replica, net_cfg, hub.clone(), rt.handle().clone());
@@ -269,25 +273,62 @@ impl SyncCore {
 
     // ---- conversations and messages ----
 
-    pub fn create_conversation(&self, title: String) -> R<String> {
-        self.write(|r| r.create_scope(CoreScopeKind::Conversation, &title)).map(|s| s.to_hex())
+    pub fn create_conversation(&self, title: String, replication: Replication) -> R<String> {
+        self.write(|r| r.create_scope_with(CoreScopeKind::Conversation, &title, replication.into())).map(|s| s.to_hex())
     }
 
     pub fn create_workspace(&self, title: String) -> R<String> {
         self.write(|r| r.create_scope(CoreScopeKind::Workspace, &title)).map(|s| s.to_hex())
     }
 
-    /// First run: imports a legacy conversation, keeping its timestamps in the HLC.
-    pub fn import_legacy_conversation(&self, title: String, created_ms: u64, messages: Vec<LegacyMessage>) -> R<String> {
-        let msgs: Vec<ImportedMessage> =
-            messages.into_iter().map(|m| ImportedMessage { role: m.role.into(), content: m.content, created_ms: m.created_ms }).collect();
-        self.write(|r| r.import_conversation(&title, created_ms, &msgs)).map(|s| s.to_hex())
+    /// Imports a conversation from the app's own store, keeping its timestamps in the HLC.
+    /// Each call creates a new conversation; record the returned id to avoid importing twice.
+    pub fn import_legacy_conversation(&self, conversation: LegacyConversation, messages: Vec<LegacyMessage>) -> R<String> {
+        let opts = conversation.to_core();
+        let msgs: Vec<ImportedMessage> = messages.iter().map(LegacyMessage::to_core).collect();
+        self.write(|r| r.import_conversation_with(&opts, &msgs)).map(|s| s.to_hex())
     }
 
     pub fn send_message(&self, scope: String, message: OutgoingMessage) -> R<String> {
         let scope = scope_id(&scope)?;
         let m = message.to_core()?;
         self.write(|r| r.send_message(scope, m)).map(|id| id.to_hex())
+    }
+
+    /// Writes app data onto a message this user or a hosted agent authored. Each namespace
+    /// replaces what was there; empty bytes with no attachments clears it.
+    pub fn set_message_app_data(&self, id: String, app_data: Vec<AppDataWrite>) -> R<()> {
+        let id = event_id(&id)?;
+        let writes: Vec<ct::AppDataWrite> = app_data.iter().map(AppDataWrite::to_core).collect();
+        self.write(|r| r.set_message_app_data(id, &writes))
+    }
+
+    /// Sets or (with None) removes conversation-level app data under `namespace`.
+    pub fn set_conversation_app_data(&self, scope: String, namespace: String, bytes: Option<Vec<u8>>) -> R<()> {
+        let scope = scope_id(&scope)?;
+        self.write(|r| r.set_conversation_app_data(scope, &namespace, bytes.as_deref()))
+    }
+
+    /// Replaces the conversation's tags.
+    pub fn set_conversation_tags(&self, scope: String, tags: Vec<Tag>) -> R<()> {
+        let scope = scope_id(&scope)?;
+        let tags = types::tag_pairs(&tags);
+        self.write(|r| r.set_conversation_tags(scope, &tags))
+    }
+
+    /// Deletes a device-local conversation outright. Leave a synced one instead.
+    pub fn delete_local_conversation(&self, scope: String) -> R<()> {
+        let scope = scope_id(&scope)?;
+        self.write(|r| r.delete_local_scope(scope))
+    }
+
+    /// Makes a device-local conversation synced: this user's other devices get it, with its
+    /// history.
+    pub fn promote_to_synced(&self, scope: String) -> R<()> {
+        let scope = scope_id(&scope)?;
+        self.write(|r| r.promote_to_synced(scope))?;
+        self.node.sync_now();
+        Ok(())
     }
 
     pub fn edit_message(&self, id: String, content: String) -> R<()> {
@@ -316,6 +357,12 @@ impl SyncCore {
         self.read(|r| r.conversations()).map(|v| v.into_iter().map(Into::into).collect())
     }
 
+    /// Conversations matching `filter`, in list order (pinned, then manual order, then recent).
+    pub fn conversations_filtered(&self, filter: ConversationFilter) -> R<Vec<Conversation>> {
+        let f = filter.to_core();
+        self.read(|r| r.conversations_filtered(&f)).map(|v| v.into_iter().map(Into::into).collect())
+    }
+
     pub fn conversation(&self, scope: String) -> R<Option<Conversation>> {
         let scope = scope_id(&scope)?;
         self.read(|r| r.conversation(scope)).map(|c| c.map(Into::into))
@@ -336,6 +383,13 @@ impl SyncCore {
 
     pub fn search(&self, query: String, limit: u32) -> R<Vec<SearchResult>> {
         self.read(|r| r.search(&query, limit))
+            .map(|v| v.into_iter().map(|h| SearchResult { scope: h.scope.to_hex(), id: h.id.to_hex(), snippet: h.snippet, hlc: h.hlc }).collect())
+    }
+
+    /// Full-text search within conversations matching `filter`.
+    pub fn search_filtered(&self, query: String, filter: ConversationFilter, limit: u32) -> R<Vec<SearchResult>> {
+        let f = filter.to_core();
+        self.read(|r| r.search_filtered(&query, &f, limit))
             .map(|v| v.into_iter().map(|h| SearchResult { scope: h.scope.to_hex(), id: h.id.to_hex(), snippet: h.snippet, hlc: h.hlc }).collect())
     }
 
@@ -375,7 +429,17 @@ impl SyncCore {
         self.write(|r| r.remove_reaction(id, &reaction))
     }
 
-    /// Path to the decrypted attachment, downloading it from a peer if needed.
+    /// The decrypted bytes of an attachment (or app data blob), downloading it from a peer if
+    /// needed. Unlike `fetch_attachment`, no plaintext copy is written to disk.
+    pub async fn read_attachment(&self, scope: String, hash: String) -> R<Vec<u8>> {
+        let scope = scope_id(&scope)?;
+        let hash = hash32(&hash)?;
+        let node = self.node.clone();
+        self.on_runtime(async move { Ok(node.fetch_blob_bytes(scope, hash).await?) }).await
+    }
+
+    /// Path to a decrypted copy of the attachment, downloading it from a peer if needed. The
+    /// copy lives in a cache that is trimmed past its cap and cleared when the core closes.
     pub async fn fetch_attachment(&self, scope: String, hash: String) -> R<String> {
         let scope = scope_id(&scope)?;
         let hash = hash32(&hash)?;
@@ -632,6 +696,30 @@ impl SyncCore {
         res
     }
 
+    /// Signs this device out of the user identity. With `keep_conversations` false this is
+    /// `reset`. With true, the identity is replaced, this user's other devices are revoked
+    /// here, and the conversations this user owned stay on this device as device-local ones;
+    /// conversations others shared are removed. Either way the core closes; open a new one to
+    /// continue (with a new identity, ready to pair).
+    pub async fn sign_out(&self, keep_conversations: bool) -> R<()> {
+        if !keep_conversations {
+            return self.reset().await;
+        }
+        let node = self.node.clone();
+        let res = self
+            .on_runtime(async move {
+                node.shutdown().await?;
+                Ok(node.write(|r| {
+                    r.sign_out_keeping_data()?;
+                    r.flush()
+                })?)
+            })
+            .await;
+        self.closed.store(true, Ordering::Release);
+        self.hub.stop();
+        res
+    }
+
     pub fn diagnostics(&self) -> Diagnostics {
         self.node.diagnostics().into()
     }
@@ -699,6 +787,8 @@ impl SyncCore {
             "local_addresses": d.local_addrs.len(),
             "storage": self.node.read(|r| r.storage_usage()).ok().map(|u| serde_json::json!({
                 "database_bytes": u.database_bytes,
+                "synced_event_bytes": u.synced_event_bytes,
+                "local_event_bytes": u.local_event_bytes,
                 "attachment_bytes": u.blob_bytes,
                 "attachment_cache_bytes": u.attachment_cache_bytes,
             })),
@@ -781,8 +871,9 @@ impl OutgoingStream {
         Ok(())
     }
 
-    /// Commits the message (the streamed text, or `content` if given) and ends the stream.
-    pub fn finish(&self, content: Option<String>) -> R<String> {
+    /// Commits the message (the streamed text, or `content` if given) with `app_data`, and
+    /// ends the stream.
+    pub fn finish(&self, content: Option<String>, app_data: Vec<AppDataWrite>) -> R<String> {
         let mut b = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if b.done {
             return Err(SyncError::invalid("stream already ended"));
@@ -793,6 +884,7 @@ impl OutgoingStream {
         let mut m = NewMessage::text(self.role.into(), b.text.clone());
         m.as_agent = self.as_agent;
         m.id = Some(self.id);
+        m.app_data = app_data.iter().map(AppDataWrite::to_core).collect();
         self.node.write(|r| r.send_message(self.scope, m))?;
         b.done = true;
         self.emit(&mut b, CoreStreamState::Finished);

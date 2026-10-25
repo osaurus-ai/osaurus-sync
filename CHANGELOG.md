@@ -4,6 +4,58 @@ Each release lists what changed for the apps that use the library. Versions foll
 versioning; `API_VERSION` and `PROTOCOL_VERSION` are listed whenever they change. The release
 workflow copies a version's section into its GitHub release notes.
 
+## 0.1.0-beta.3 - 2026-10-24
+
+`API_VERSION` 2: apps built against beta.2 need the signature changes below. `PROTOCOL_VERSION`
+is unchanged, so beta.3 devices keep syncing with beta.1 and beta.2 ones; app data and tags
+written by a beta.3 device are kept, but not shown, by older ones.
+
+**App data**
+
+- Apps can attach their own structured data to conversations (`setConversationAppData`) and
+  messages (`OutgoingMessage.appData`, `setMessageAppData`, `OutgoingStream.finish(content:appData:)`),
+  under a namespace, with encrypted blob attachments for large values. The last write wins per
+  namespace; superseded values are dropped at compaction.
+- `CoreConfig.maxAppDataBytes` sets the largest value this device writes (64 KiB by default).
+- `readAttachment(scope:hash:)` returns an attachment's bytes without leaving a decrypted file.
+- [docs/app-data.md](docs/app-data.md) is Osaurus's contract for its app data, with fixtures in
+  `tests/fixtures/app-data` that the Rust, Swift and C# tests import.
+
+**Device-local conversations**
+
+- `createConversation(title:replication:)` with `.deviceLocal` creates a conversation that is
+  never sent to other devices and compacts on its own. `promoteToSynced` syncs it later;
+  `deleteLocalConversation` deletes one.
+- `Conversation.replication`, and `StorageUsage.syncedEventBytes` and `localEventBytes`.
+
+**Tags and queries**
+
+- `setConversationTags`, `Conversation.tags`, `createdMs` and `messageCount`.
+- `conversationsFiltered(filter:)` and `searchFiltered(query:filter:limit:)` filter by tags,
+  kind, replication, archived and pinned, with paging.
+
+**Encrypted at rest**
+
+- The whole database, views and search index included, is now encrypted with SQLCipher. Existing
+  databases are encrypted in place on first open. The key is kept in the key store
+  (`view-key`) and sealed to the recovery key, so restoring a backup without the key store
+  moves the database aside until the phrase is entered.
+- The decrypted attachment cache is emptied when the core opens and closes.
+
+**Signing out**
+
+- `signOut(keepConversations:)`: with true, the device leaves the identity but keeps the
+  conversations it owned as device-local ones.
+
+**Other changes**
+
+- `importLegacyConversation(conversation:messages:)` takes a `LegacyConversation` (metadata,
+  tags and app data), and `LegacyMessage` gains attachments, tool fields and app data.
+- `OutgoingStream.finish` takes app data. The Swift and C# helpers keep `finish(content:)`,
+  `createConversation(title:)` and `LegacyMessage.text` working as before.
+- The data directory moves to store version 4. Earlier releases can't open it afterwards.
+- Support bundles now also redact ids whose 12-digit prefix happens to be all decimal digits.
+
 ## 0.1.0-beta.2 - 2026-10-24
 
 `API_VERSION` and `PROTOCOL_VERSION` are unchanged; every addition is a new call.

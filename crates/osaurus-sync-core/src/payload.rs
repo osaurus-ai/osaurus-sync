@@ -45,6 +45,17 @@ pub struct MessagePayload {
     pub imported_at_ms: Option<u64>,
 }
 
+/// App-defined bytes attached to a message under a namespace. Opaque to the core. The latest
+/// write per (target, namespace) by the target's author wins. `blobs` are internal to the app:
+/// they sync and purge like attachments but are never listed as the message's attachments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppDataPayload {
+    pub target: EventId,
+    pub namespace: String,
+    pub bytes: Vec<u8>,
+    pub blobs: Vec<BlobRef>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditPayload {
     pub target: EventId,
@@ -211,6 +222,7 @@ pub enum Content {
     Tombstone(TombstonePayload),
     Reaction(ReactionPayload),
     Loro(LoroUpdatePayload),
+    AppData(AppDataPayload),
 }
 
 impl Content {
@@ -221,6 +233,7 @@ impl Content {
             Content::Tombstone(_) => kind::TOMBSTONE,
             Content::Reaction(_) => kind::REACTION,
             Content::Loro(_) => kind::LORO_UPDATE,
+            Content::AppData(_) => kind::APP_DATA,
         }
     }
 
@@ -231,6 +244,7 @@ impl Content {
             Content::Tombstone(p) => encode(p),
             Content::Reaction(p) => encode(p),
             Content::Loro(p) => encode(p),
+            Content::AppData(p) => encode(p),
         }
     }
 
@@ -241,6 +255,7 @@ impl Content {
             kind::TOMBSTONE => Content::Tombstone(decode(bytes)?),
             kind::REACTION => Content::Reaction(decode(bytes)?),
             kind::LORO_UPDATE => Content::Loro(decode(bytes)?),
+            kind::APP_DATA => Content::AppData(decode(bytes)?),
             _ => return Ok(None),
         }))
     }

@@ -137,10 +137,8 @@ fn recent_only_device_fetches_older_history_on_demand() {
     let mac = sim.add_node("Mac", Platform::MacOs);
     let phone = sim.add_node_with("iPhone", Platform::Ios, None, 0);
     let now = sim.clock;
-    let old: Vec<ImportedMessage> = [400u64, 200, 100, 60, 10, 2]
-        .iter()
-        .map(|d| ImportedMessage { role: MessageRole::User, content: format!("{d} days ago"), created_ms: now - d * DAY })
-        .collect();
+    let old: Vec<ImportedMessage> =
+        [400u64, 200, 100, 60, 10, 2].iter().map(|d| ImportedMessage::text(MessageRole::User, format!("{d} days ago"), now - d * DAY)).collect();
     let scope = sim.r(mac).import_conversation("Imported", now - 400 * DAY, &old).unwrap();
     sim.pair(mac, phone);
     sim.run(10_000);
@@ -165,8 +163,7 @@ fn paused_backfill_keeps_only_the_last_week() {
     let mac = sim.add_node("Mac", Platform::MacOs);
     let pc = sim.add_node("PC", Platform::Windows);
     let now = sim.clock;
-    let old: Vec<ImportedMessage> =
-        [30u64, 3, 0].iter().map(|d| ImportedMessage { role: MessageRole::User, content: format!("{d}d"), created_ms: now - d * DAY - 1000 }).collect();
+    let old: Vec<ImportedMessage> = [30u64, 3, 0].iter().map(|d| ImportedMessage::text(MessageRole::User, format!("{d}d"), now - d * DAY - 1000)).collect();
     let scope = sim.r(mac).import_conversation("x", now - 31 * DAY, &old).unwrap();
     {
         let n = &mut sim.nodes[pc];
@@ -547,4 +544,39 @@ fn stolen_device_scenario(seed: u64) {
         sim.r(phone).ingest(&e).unwrap();
     }
     assert_eq!(contents(&mut sim, phone, mine), vec!["before"]);
+}
+
+#[test]
+fn app_data_and_tags_sync_but_device_local_scopes_stay_put() {
+    use osaurus_sync_core::types::{AppDataWrite, Replication};
+    let mut sim = Sim::new(41);
+    let mac = sim.add_node("Mac", Platform::MacOs);
+    let pc = sim.add_node("PC", Platform::Windows);
+    let chat = sim.r(mac).create_scope(ScopeKind::Conversation, "Chat").unwrap();
+    let local = sim.r(mac).create_scope_with(ScopeKind::Conversation, "Webhook run", Replication::DeviceLocal).unwrap();
+    sim.r(mac).send_message(local, text("headless")).unwrap();
+    let mut m = NewMessage::text(MessageRole::Assistant, "answer");
+    m.app_data.push(AppDataWrite { namespace: "ai.osaurus.turn/1".into(), bytes: b"{\"thinking\":\"t\"}".to_vec(), attachments: vec![] });
+    let id = sim.r(mac).send_message(chat, m).unwrap();
+    sim.r(mac).set_conversation_tags(chat, &[("agent".into(), "coder".into())]).unwrap();
+    sim.pair(mac, pc);
+    sim.run(10_000);
+
+    let v = sim.r(pc).message_view(&id).unwrap().unwrap();
+    assert_eq!(v.app_data[0].bytes, b"{\"thinking\":\"t\"}");
+    assert_eq!(sim.r(pc).conversation(chat).unwrap().unwrap().tags, vec![("agent".to_string(), "coder".to_string())]);
+    assert!(sim.r(pc).conversation(local).unwrap().is_none());
+    assert!(sim.r(pc).all_hashes(local).unwrap().is_empty());
+
+    // Live edits to app data reach the other device.
+    sim.r(pc).set_message_app_data(id, &[AppDataWrite { namespace: "ai.osaurus.turn/1".into(), bytes: b"{}".to_vec(), attachments: vec![] }]).unwrap();
+    sim.poll(pc);
+    sim.run(10_000);
+    assert_eq!(sim.r(mac).message_view(&id).unwrap().unwrap().app_data[0].bytes, b"{}");
+
+    // Promoted, the local scope follows with its history.
+    sim.r(mac).promote_to_synced(local).unwrap();
+    sim.poll(mac);
+    sim.run(10_000);
+    assert_eq!(contents(&mut sim, pc, local), vec!["headless"]);
 }

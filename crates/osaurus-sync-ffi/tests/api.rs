@@ -56,6 +56,7 @@ fn config(dir: &std::path::Path, name: &str, platform: Platform, network: bool) 
         platform,
         history: None,
         network: NetworkConfig { enabled: network, ..local_network_config() },
+        max_app_data_bytes: None,
         api_version: api_version(),
     }
 }
@@ -69,7 +70,16 @@ fn until(what: &str, mut f: impl FnMut() -> bool) {
 }
 
 fn text(s: &str) -> OutgoingMessage {
-    OutgoingMessage { role: MessageRole::User, content: s.into(), attachments: vec![], reply_to: None, as_agent: None, tool_call_id: None, tool_name: None }
+    OutgoingMessage {
+        role: MessageRole::User,
+        content: s.into(),
+        attachments: vec![],
+        reply_to: None,
+        as_agent: None,
+        tool_call_id: None,
+        tool_name: None,
+        app_data: vec![],
+    }
 }
 
 fn contents(c: &SyncCore, scope: &str) -> Vec<String> {
@@ -102,7 +112,7 @@ fn local_api_and_callbacks() {
     let convs = ConvLog::default();
     let _cs = c.subscribe_conversations(Box::new(convs.clone()));
 
-    let scope = c.create_conversation("Plans".into()).unwrap();
+    let scope = c.create_conversation("Plans".into(), Replication::Synced).unwrap();
     let log = ScopeLog::default();
     let sub = c.subscribe(scope.clone(), Box::new(log.clone())).unwrap();
     let id = c.send_message(scope.clone(), text("hello world")).unwrap();
@@ -133,15 +143,30 @@ fn local_api_and_callbacks() {
 
     let legacy = c
         .import_legacy_conversation(
-            "Old chat".into(),
-            1_600_000_000_000,
-            vec![LegacyMessage { role: MessageRole::User, content: "from 2020".into(), created_ms: 1_600_000_000_000 }],
+            LegacyConversation {
+                title: "Old chat".into(),
+                created_ms: 1_600_000_000_000,
+                replication: Replication::Synced,
+                pinned: false,
+                archived: false,
+                tags: vec![],
+                app_data: vec![],
+            },
+            vec![LegacyMessage {
+                role: MessageRole::User,
+                content: "from 2020".into(),
+                created_ms: 1_600_000_000_000,
+                attachments: vec![],
+                tool_call_id: None,
+                tool_name: None,
+                app_data: vec![],
+            }],
         )
         .unwrap();
     let page = c.messages(legacy, None, 10).unwrap();
     assert_eq!(page.messages[0].timestamp_ms, 1_600_000_000_000);
 
-    let notes = c.create_conversation("Notes".into()).unwrap();
+    let notes = c.create_conversation("Notes".into(), Replication::Synced).unwrap();
     let first = c.send_message(notes.clone(), text("first")).unwrap();
     let then = c.message(first).unwrap().unwrap().timestamp_ms;
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -165,7 +190,7 @@ fn local_api_and_callbacks() {
     let s = c.open_stream(scope.clone(), MessageRole::Assistant, None).unwrap();
     s.push("Hel".into()).unwrap();
     s.push("lo".into()).unwrap();
-    let mid = s.finish(None).unwrap();
+    let mid = s.finish(None, vec![]).unwrap();
     assert_eq!(c.message(mid).unwrap().unwrap().content, "Hello");
     assert!(s.push("more".into()).is_err());
 
@@ -182,7 +207,7 @@ fn pairing_sync_and_streams_over_loopback() {
     let phone_events = Events::default();
     phone.set_listener(Some(Box::new(phone_events.clone())));
 
-    let scope = mac.create_conversation("Shared".into()).unwrap();
+    let scope = mac.create_conversation("Shared".into(), Replication::Synced).unwrap();
     mac.send_message(scope.clone(), text("before pairing")).unwrap();
     mac.add_peer_address(phone.local_address().unwrap()).unwrap();
     phone.add_peer_address(mac.local_address().unwrap()).unwrap();
@@ -199,7 +224,7 @@ fn pairing_sync_and_streams_over_loopback() {
     let s = mac.open_stream(scope.clone(), MessageRole::Assistant, None).unwrap();
     s.push("Thinking".into()).unwrap();
     until("stream tokens", || log.0.lock().unwrap().iter().any(|c| matches!(c, ScopeChange::Stream { update } if update.text == "Thinking")));
-    s.finish(Some("Done thinking".into())).unwrap();
+    s.finish(Some("Done thinking".into()), vec![]).unwrap();
     until("committed", || contents(&phone, &scope).contains(&"Done thinking".to_string()));
 
     let d = mac.diagnostics();
@@ -241,7 +266,7 @@ fn rotated_identity_reaches_the_other_device() {
     let pc = SyncCore::open(config(dir.path(), "pc", Platform::Windows, true), Box::new(Keys::default())).unwrap();
     let events = Events::default();
     pc.set_listener(Some(Box::new(events.clone())));
-    let scope = mac.create_conversation("Notes".into()).unwrap();
+    let scope = mac.create_conversation("Notes".into(), Replication::Synced).unwrap();
     mac.send_message(scope.clone(), text("before")).unwrap();
     mac.add_peer_address(pc.local_address().unwrap()).unwrap();
     pc.add_peer_address(mac.local_address().unwrap()).unwrap();
@@ -270,7 +295,7 @@ fn rotated_identity_reaches_the_other_device() {
 fn restored_backup_unlocks_with_the_phrase() {
     let dir = tempfile::tempdir().unwrap();
     let old = SyncCore::open(config(dir.path(), "old", Platform::MacOs, false), Box::new(Keys::default())).unwrap();
-    let scope = old.create_conversation("Kept".into()).unwrap();
+    let scope = old.create_conversation("Kept".into(), Replication::Synced).unwrap();
     old.send_message(scope.clone(), text("from the old Mac")).unwrap();
     let phrase = old.recovery_phrase().unwrap().join(" ");
     let user = old.user_key().unwrap();
@@ -304,7 +329,7 @@ fn agent_card_bootstraps_a_workspace_invite() {
 
     // The host runs the agent and serves its card.
     let secret = generate_agent_secret();
-    let home = host.create_conversation("Agent home".into()).unwrap();
+    let home = host.create_conversation("Agent home".into(), Replication::Synced).unwrap();
     let agent = host.assign_agent(home.clone(), secret.clone(), None, MemberRole::Member, 86_400_000).unwrap();
     let address = agent_address(agent.clone()).unwrap();
     assert_eq!(agent_address(format!("a:{agent}")).unwrap(), address);
@@ -361,7 +386,7 @@ fn data_management() {
     let tmp = tempfile::tempdir().unwrap();
     let keys = Keys::default();
     let c = SyncCore::open(config(tmp.path(), "Mac", Platform::MacOs, false), Box::new(keys.clone())).unwrap();
-    let keep = c.create_conversation("Keep".into()).unwrap();
+    let keep = c.create_conversation("Keep".into(), Replication::Synced).unwrap();
     let file = tmp.path().join("notes.txt");
     std::fs::write(&file, b"attached").unwrap();
     let mut m = text("hello");
@@ -376,7 +401,7 @@ fn data_management() {
     assert_eq!(summary, ExportSummary { messages: 1, attachments: 1, missing_attachments: 0 });
     assert!(out.join("conversation.json").exists());
 
-    let gone = c.create_conversation("Leave".into()).unwrap();
+    let gone = c.create_conversation("Leave".into(), Replication::Synced).unwrap();
     c.leave_conversation(gone.clone()).unwrap();
     assert_eq!(c.conversations().unwrap().iter().map(|x| x.scope.clone()).collect::<Vec<_>>(), [keep]);
     assert!(c.support_bundle().contains("\"database_bytes\""));
@@ -406,4 +431,68 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
             std::fs::copy(e.path(), to.join(name)).unwrap();
         }
     }
+}
+
+#[test]
+fn app_data_tags_local_conversations_and_sign_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = Keys::default();
+    let cfg = config(dir.path(), "mac", Platform::MacOs, false);
+    let c = SyncCore::open(cfg.clone(), Box::new(keys.clone())).unwrap();
+    let chat = c.create_conversation("Chat".into(), Replication::Synced).unwrap();
+    let local = c.create_conversation("Automation".into(), Replication::DeviceLocal).unwrap();
+
+    let blob_file = dir.path().join("trace.bin");
+    std::fs::write(&blob_file, b"large internal payload").unwrap();
+    let mut m = text("question");
+    m.app_data.push(AppDataWrite {
+        namespace: "ai.osaurus.turn/1".into(),
+        bytes: b"{\"a\":1}".to_vec(),
+        attachments: vec![AttachmentFile {
+            path: blob_file.to_string_lossy().into_owned(),
+            media_type: "application/octet-stream".into(),
+            name: "trace.bin".into(),
+        }],
+    });
+    let id = c.send_message(chat.clone(), m).unwrap();
+    let sent = c.message(id.clone()).unwrap().unwrap();
+    assert_eq!(sent.app_data[0].bytes, b"{\"a\":1}");
+    assert!(sent.blobs.is_empty(), "app data blobs aren't message attachments");
+    let hash = sent.app_data[0].blobs[0].hash.clone();
+    assert_eq!(block_on(c.read_attachment(chat.clone(), hash)).unwrap(), b"large internal payload");
+    c.set_message_app_data(id.clone(), vec![AppDataWrite { namespace: "ai.osaurus.turn/1".into(), bytes: b"{\"a\":2}".to_vec(), attachments: vec![] }])
+        .unwrap();
+    assert_eq!(c.message(id).unwrap().unwrap().app_data[0].bytes, b"{\"a\":2}");
+
+    let s = c.open_stream(chat.clone(), MessageRole::Assistant, None).unwrap();
+    s.push("partial".into()).unwrap();
+    let streamed = s.finish(None, vec![AppDataWrite { namespace: "ai.osaurus.turn/1".into(), bytes: b"{}".to_vec(), attachments: vec![] }]).unwrap();
+    assert_eq!(c.message(streamed).unwrap().unwrap().app_data.len(), 1);
+
+    c.set_conversation_tags(chat.clone(), vec![Tag { key: "agent".into(), value: "coder".into() }]).unwrap();
+    c.set_conversation_app_data(chat.clone(), "ai.osaurus.session/1".into(), Some(b"{}".to_vec())).unwrap();
+    let conv = c.conversation(chat.clone()).unwrap().unwrap();
+    assert_eq!(conv.tags, vec![Tag { key: "agent".into(), value: "coder".into() }]);
+    assert_eq!(conv.app_data[0].namespace, "ai.osaurus.session/1");
+    assert_eq!(conv.message_count, 2);
+    let filter = ConversationFilter { tags: vec![Tag { key: "agent".into(), value: "coder".into() }], ..Default::default() };
+    assert_eq!(c.conversations_filtered(filter.clone()).unwrap().len(), 1);
+    assert_eq!(c.search_filtered("question".into(), filter, 10).unwrap().len(), 1);
+    let locals = ConversationFilter { replication: Some(Replication::DeviceLocal), ..Default::default() };
+    assert_eq!(c.conversations_filtered(locals.clone()).unwrap()[0].scope, local);
+    assert!(matches!(c.create_invite(local.clone(), MemberRole::Member, 60_000), Err(SyncError::PermissionDenied { .. })));
+    let usage = c.storage_usage().unwrap();
+    assert!(usage.synced_event_bytes > 0 && usage.local_event_bytes > 0);
+
+    // Signing out keeps this user's conversations, now device-local, under a new identity.
+    let user = c.user_key().unwrap();
+    block_on(c.sign_out(true)).unwrap();
+    assert!(matches!(c.conversations(), Err(SyncError::Closed { .. })));
+    let c = SyncCore::open(cfg, Box::new(keys)).unwrap();
+    assert_ne!(c.user_key().unwrap(), user);
+    assert_eq!(c.conversations_filtered(locals).unwrap().len(), 2);
+    c.delete_local_conversation(local).unwrap();
+    c.promote_to_synced(chat.clone()).unwrap();
+    assert_eq!(c.conversation(chat).unwrap().unwrap().replication, Replication::Synced);
+    block_on(c.close()).unwrap();
 }

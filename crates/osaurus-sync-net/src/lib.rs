@@ -411,6 +411,11 @@ impl SyncNode {
         self.inner.clone().fetch_blob(scope, hash).await
     }
 
+    /// Like `fetch_blob`, but returns the decrypted bytes and leaves no plaintext file.
+    pub async fn fetch_blob_bytes(&self, scope: ScopeId, hash: [u8; 32]) -> Result<Vec<u8>> {
+        self.inner.clone().fetch_blob_bytes(scope, hash).await
+    }
+
     /// Publishes a signed agent binding in this device's discovery record.
     pub fn publish_agent(&self, binding: Option<AgentBinding>) -> Result<()> {
         if let Some(b) = &binding
@@ -965,7 +970,7 @@ impl Inner {
                 storage_role: s.storage_role,
             });
         }
-        let scopes_ids = st.replica.scope_ids().unwrap_or_default();
+        let scopes_ids = st.replica.synced_scope_ids().unwrap_or_default();
         drop(st);
         let scopes = scopes_ids.into_iter().filter_map(|s| self.sync_status(s).ok()).collect();
         Diagnostics {

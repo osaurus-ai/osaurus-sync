@@ -30,16 +30,16 @@ These hold for the current release. Design the UI around them rather than hiding
   both are online at the same time. Show `delivery = pending` on messages that no other device
   has acknowledged yet, and avoid copy that promises the message "synced". `syncStatus` reports
   `pendingOutbox` per scope.
-- **History only grows.** Compaction waits for a storing peer, so nothing is compacted until a
-  storage server exists. Show `storageUsage()` in settings, and offer `leaveConversation` for
-  conversations the user wants gone from this device.
+- **Synced history only grows.** Compaction of synced conversations waits for a storing peer,
+  so nothing synced is compacted until a storage server exists. Device-local conversations
+  compact on their own. Show `storageUsage()` in settings, and offer `leaveConversation` (or
+  `deleteLocalConversation`) for conversations the user wants gone from this device.
 - **Some extra traffic.** A device pulling from several peers at once can fetch some events more
   than once. Duplicates are discarded and counted (`diagnostics().counters`); only bandwidth is
   wasted.
-- **Views are stored in plaintext.** Events are encrypted on disk, but the views the app reads
-  (titles, message text, the search index) aren't. The protection is the OS: FileVault, iOS data
-  protection and BitLocker, plus per-user file permissions. Keep the data directory inside the
-  app's own container or the user's profile.
+- **Attachments are decrypted into a cache to be opened.** `fetchAttachment` returns a path to
+  a plaintext copy, kept until the cache is trimmed or the core opens or closes. Use
+  `readAttachment` when the bytes are enough; it leaves no file.
 - **iOS keeps recent history by default.** The last 90 days sync; older messages arrive when the
   user scrolls past `atSyncBoundary` and the app calls `requestHistory`. Desktop apps keep
   everything.
@@ -79,6 +79,7 @@ optional parameters are:
 | `keyStore` | Keychain (Swift), DPAPI (C# on Windows) | Use `MemoryKeyStore` only in tests |
 | `history` | Platform default | iOS: last 90 days. macOS and Windows: full history |
 | `network` | `defaultNetworkConfig()`: LAN only until the app sets relays and discovery | See [Network configuration](#network-configuration) |
+| `maxAppDataBytes` | 64 KiB | The largest app data value this device writes; see [Tags and app data](#tags-and-app-data) |
 
 A custom key store must return nil from `load` only when the item doesn't exist, and throw
 `SyncError.keyStore` for anything else. If a read failure looked like a missing item, the core
@@ -88,6 +89,11 @@ device is unlocked (for example on `protectedDataDidBecomeAvailable`).
 
 On first open the core creates a device key and a user identity. Opening also brings the network
 up, unless `network.enabled` is false.
+
+The database is encrypted with a key the core keeps in the key store as `view-key`. If the key
+store loses it (a backup restored onto a new device, say), the old database is moved aside and
+a fresh one opens; recovering with the phrase unlocks and brings the old one back. A database
+that is damaged rather than locked fails with `Corrupt`.
 
 Before exit, call `close()`. It stops networking, flushes state and releases the data directory.
 Any call after `close` fails with `Closed`.
@@ -104,6 +110,11 @@ if let cursor = page.nextCursor {
     let older = try core.messages(scope: scope, before: cursor, limit: 50)
 }
 let hits = try core.search(query: "flight", limit: 20)     // [SearchResult]
+
+// Filtered by tags, replication, kind, archived or pinned, with paging.
+let chats = try core.conversationsFiltered(filter: ConversationFilter(
+    tags: [Tag(key: "source", value: "chat")], archived: false, limit: 50))
+let synced = try core.searchFiltered(query: "flight", filter: ConversationFilter(replication: .synced), limit: 20)
 ```
 
 ```csharp
@@ -114,16 +125,24 @@ if (page.NextCursor is { } cursor)
     var older = core.Messages(scope, cursor, 50);
 }
 var hits = core.Search("flight", 20);
+var chats = core.ConversationsFiltered(OsaurusSync.Filter(tags: new Dictionary<string, string> { ["source"] = "chat" }, limit: 50));
 ```
+
+In C#, build filters with `OsaurusSync.Filter(...)`: the generated record's defaults leave its
+list fields null, which can't be sent.
 
 - **`messages`** returns one page, oldest first. Pass `nextCursor` as `before` to page back.
 - **`atSyncBoundary`** is true when older history may exist on other devices but isn't synced
   here (recent-only mode). Offer a "load older messages" action that calls `requestHistory`.
 - **`conversation(scope:)`** and **`message(id:)`** return one item, or nil.
-- A **`Conversation`** has its title, pinned, archived and sort order, a preview of the last
-  message, the unread count, your role and the member list.
+- A **`Conversation`** has its title, pinned, archived and sort order, creation time, message
+  count, a preview of the last message, the unread count, your role, the member list, its
+  `replication`, its tags and its app data.
 - A **`Message`** has its role, content, author, attachments (`blobs`), reply and tool-call
-  fields, whether it was `edited`, its reactions and its `delivery` state.
+  fields, whether it was `edited`, its reactions, its `delivery` state and its app data.
+- **`conversationsFiltered`** pages through conversations matching a `ConversationFilter`:
+  all of `tags`, every key in `hasTags`, and optionally `kind`, `replication`, `archived` and
+  `pinned`. `offset` and `limit` page the results (0 means no limit), most recent first.
 
 **Delivery** is `delivered`, `pending` (written here, not yet acknowledged by another device), or
 `rejected` with a stable `reasonCode`:
@@ -173,7 +192,56 @@ views, and before it syncs.
   purges the content on every device.
 - **`createWorkspace`** creates a scope for a team or project instead of a single conversation.
 - **Messages with more fields.** `OutgoingMessage` also has `attachments`, `replyTo`, `asAgent`
-  (to post as an agent this device hosts), and `toolCallId` and `toolName` for tool messages.
+  (to post as an agent this device hosts), `toolCallId` and `toolName` for tool messages, and
+  `appData`.
+
+### Device-local conversations
+
+```swift
+let run = try core.createConversation(title: "Nightly report", replication: .deviceLocal)
+try core.promoteToSynced(scope: run)       // later, if the user wants it everywhere
+try core.deleteLocalConversation(scope: other)
+```
+
+A device-local conversation is stored, encrypted and searchable like any other, but never leaves
+this device: other devices aren't given its key, it can't be shared, and its history compacts
+without waiting for a peer. Use it for conversations the app creates on its own (automations,
+background runs) that aren't worth syncing. `promoteToSynced` grants this user's other devices
+the key and syncs the full history. `deleteLocalConversation` deletes one outright; synced ones
+use `leaveConversation`. `createConversation(title:)` in the Swift and C# helpers creates a
+synced one.
+
+### Tags and app data
+
+Tags are short key and value strings on a conversation, for the app's own grouping and lookup.
+App data is the app's own structured data, attached to a conversation or a message under a
+namespace. Both sync with the conversation and stay encrypted like its messages.
+
+```swift
+try core.setConversationTags(scope: scope, tags: [Tag(key: "source", value: "chat")])
+try core.setConversationAppData(scope: scope, namespace: "com.example.chat/1", bytes: json)
+
+var msg = OutgoingMessage.text("Done")
+msg.appData = [AppDataWrite(namespace: "com.example.turn/1", bytes: turnJson,
+                            attachments: [AttachmentFile(path: big.path, mediaType: "application/json", name: "result")])]
+let id = try core.sendMessage(scope: scope, message: msg)
+try core.setMessageAppData(id: id, appData: [AppDataWrite(namespace: "com.example.turn/1", bytes: newJson)])
+
+let turn = try core.message(id: id)?.appData("com.example.turn/1")   // bytes and blobs
+let big = try await core.readAttachment(scope: scope, hash: turn!.blobs[0].hash)
+```
+
+- **Each write replaces** the namespace's value for that conversation or message, attachments
+  included, and the last write wins. Pass nil (conversation) or an empty write (message) to
+  clear one. Only a message's author can set its app data.
+- **Size.** Each value is limited to `maxAppDataBytes` (64 KiB unless the config says
+  otherwise). Put anything larger in the write's attachments, which are encrypted blobs like
+  message attachments. The limit applies to this device's writes; values from other devices are
+  accepted as long as they're valid events.
+- **Formats** are the app's own. Version the namespace (`/1`), keep fields you don't know when
+  rewriting a value, and make a new namespace for breaking changes. Osaurus's contract is in
+  [app-data.md](app-data.md).
+- Tags are set as a whole with `setConversationTags`; `Conversation.tag(_:)` reads one.
 
 ### Attachments
 
@@ -190,7 +258,8 @@ let path = try await core.fetchAttachment(scope: scope, hash: blob.hash)
 ```
 
 `fetchAttachment` returns a path to the decrypted file, downloading it from a peer first if
-`available` is false.
+`available` is false. `readAttachment` does the same but returns the bytes, leaving no decrypted
+file behind. Both work for message attachments and app data attachments.
 
 ### Importing existing conversations
 
@@ -199,9 +268,14 @@ timestamps are kept, so imported messages sort correctly among new ones.
 
 ```swift
 let scope = try core.importLegacyConversation(
-    title: old.title, createdMs: old.createdMs,
-    messages: old.messages.map { LegacyMessage(role: .user, content: $0.text, createdMs: $0.createdMs) })
+    conversation: LegacyConversation(title: old.title, createdMs: old.createdMs, replication: .synced,
+                                     pinned: old.pinned, archived: false, tags: [], appData: []),
+    messages: old.messages.map { .text($0.text, role: .user, createdMs: $0.createdMs) })
 ```
+
+`LegacyConversation` carries the conversation's metadata, tags and app data; `LegacyMessage`
+carries attachments, tool fields and app data. The whole conversation is written in one
+transaction.
 
 ## Live updates
 
@@ -278,12 +352,13 @@ for try await token in model.generate(prompt) {
     try stream.push(delta: token)
 }
 let id = try stream.finish(content: nil)     // commits the streamed text; pass content to replace it
+// or: try stream.finish(content: nil, appData: [AppDataWrite(namespace: ns, bytes: json)])
 ```
 
 ```csharp
 using var stream = core.OpenStream(scope, MessageRole.Assistant, null);
 await foreach (var token in model.Generate(prompt)) stream.Push(token);
-var id = stream.Finish(null);
+var id = stream.Finish();                    // or stream.Finish(null, appData)
 ```
 
 Other devices receive `stream` changes with the full text so far and a state of `streaming`,
@@ -501,6 +576,7 @@ try core.leaveConversation(scope: scope)
 let usage = try core.storageUsage()          // databaseBytes, attachmentBytes, attachmentCacheBytes
 let summary = try await core.exportConversation(scope: scope, path: folder.path)
 try await core.reset()                       // sign out: deletes this device's data and keys
+try await core.signOut(keepConversations: true)   // sign out, keeping this user's conversations here
 ```
 
 - **`leaveConversation`** removes this user from the conversation and deletes the local
@@ -511,7 +587,9 @@ try await core.reset()                       // sign out: deletes this device's 
   when it leaves. An invite brings the conversation back. The last owner of a conversation
   shared with others gets `PermissionDenied`; make someone else an owner first.
 - **`storageUsage`** reports the database (including its write-ahead log), the encrypted
-  attachments and the cache of decrypted attachments. The cache is trimmed automatically.
+  attachments and the cache of decrypted attachments, plus the event bytes of synced and of
+  device-local conversations. The cache is trimmed automatically and emptied when the core opens
+  and closes.
 - **`exportConversation`** writes `conversation.json` and an `attachments/` folder into the
   given directory, creating it if needed. The JSON has `format: "osaurus-sync-conversation"`
   and `version: 1`, the title, members and roles, and each message with its author, device
@@ -520,9 +598,14 @@ try await core.reset()                       // sign out: deletes this device's 
   device doesn't hold the whole history: older messages outside its history window, or
   history it compacted. Call `requestHistory` first to export more.
 - **`reset`** is for signing out. It stops networking, deletes the data directory and the
-  key store entries (`device-key`, `user-secret`, `user-secret-next`), and closes the core.
+  key store entries (`device-key`, `user-secret`, `user-secret-next`, `view-key`), and closes the core.
   Open a new core to start again as a new device. Other devices and members keep their
   data; revoke this device from another one to stop it being admitted with old keys.
+- **`signOut(keepConversations:)`** with false is `reset`. With true, this device leaves the
+  user's identity but keeps the conversations: it takes a new identity, revokes the user's
+  other devices locally, turns the conversations it owned into device-local ones, and removes
+  the ones others shared. The core closes; open a new one, ready to pair as a new device. Other
+  devices should revoke this one.
 
 ## App lifecycle
 

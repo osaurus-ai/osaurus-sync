@@ -32,7 +32,7 @@ loro = "1.17"
 postcard = { version = "1", features = ["alloc"] }
 rand_chacha = "0.9"
 rand_core = "0.9"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -53,4 +53,10 @@ too_many_arguments = "allow"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# The static libraries in the Swift xcframework. Fat LTO leaves one object without the embedded
+# bitcode thin LTO needs, which keeps the libraries a fifth of the size.
+[profile.staticlib]
+inherits = "release"
+lto = "fat"
 

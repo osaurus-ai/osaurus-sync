@@ -32,6 +32,10 @@ tracing.workspace = true
 uuid.workspace = true
 x25519-dalek.workspace = true
 
+# Windows has no system libcrypto for SQLCipher; build OpenSSL's from source.
+[target.'cfg(windows)'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
+
 [dev-dependencies]
 criterion.workspace = true
 proptest = "1"

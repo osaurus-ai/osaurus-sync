@@ -51,13 +51,14 @@ extension SyncCore {
     /// Opens the core with the bindings' API version filled in.
     ///
     /// `history` nil picks the platform default: the last 90 days on iOS with older ranges on
-    /// demand, everything on macOS.
+    /// demand, everything on macOS. `maxAppDataBytes` nil keeps the 64 KiB default.
     public static func open(
         dataDirectory: URL,
         deviceName: String,
         platform: Platform = .current,
         history: HistoryMode? = nil,
         network: NetworkConfig = defaultNetworkConfig(),
+        maxAppDataBytes: UInt32? = nil,
         keyStore: KeyStore = KeychainKeyStore()
     ) throws -> SyncCore {
         let config = CoreConfig(
@@ -66,6 +67,7 @@ extension SyncCore {
             platform: platform,
             history: history,
             network: network,
+            maxAppDataBytes: maxAppDataBytes,
             apiVersion: OsaurusSync.apiVersion()
         )
         return try SyncCore.open(config: config, keyStore: keyStore)
@@ -83,11 +85,66 @@ extension SyncCore {
     public func setListener(_ onEvent: @escaping @Sendable (CoreEvent) -> Void) {
         setListener(listener: ClosureCoreListener(onEvent))
     }
+
+    /// Creates a conversation that syncs with this user's other devices.
+    public func createConversation(title: String) throws -> String {
+        try createConversation(title: title, replication: .synced)
+    }
+
+    /// Conversations carrying every given tag, in list order.
+    public func conversations(tagged tags: [String: String]) throws -> [Conversation] {
+        try conversationsFiltered(filter: ConversationFilter(tags: tags.sorted { $0.key < $1.key }.map { Tag(key: $0.key, value: $0.value) }))
+    }
+}
+
+extension Conversation {
+    /// The value of tag `key`, if set.
+    public func tag(_ key: String) -> String? {
+        tags.first { $0.key == key }?.value
+    }
+
+    /// Conversation-level app data under `namespace`.
+    public func appData(_ namespace: String) -> Data? {
+        appData.first { $0.namespace == namespace }?.bytes
+    }
+}
+
+extension Message {
+    /// This message's app data under `namespace`.
+    public func appData(_ namespace: String) -> AppData? {
+        appData.first { $0.namespace == namespace }
+    }
+}
+
+extension AppDataWrite {
+    public init(namespace: String, bytes: Data) {
+        self.init(namespace: namespace, bytes: bytes, attachments: [])
+    }
+}
+
+extension OutgoingStream {
+    /// Commits the streamed text (or `content`) with no app data.
+    @discardableResult
+    public func finish(content: String? = nil) throws -> String {
+        try finish(content: content, appData: [])
+    }
+}
+
+extension LegacyConversation {
+    public init(title: String, createdMs: UInt64, replication: Replication = .synced) {
+        self.init(title: title, createdMs: createdMs, replication: replication, pinned: false, archived: false, tags: [], appData: [])
+    }
+}
+
+extension LegacyMessage {
+    public static func text(_ content: String, role: MessageRole = .user, createdMs: UInt64) -> LegacyMessage {
+        LegacyMessage(role: role, content: content, createdMs: createdMs, attachments: [], toolCallId: nil, toolName: nil, appData: [])
+    }
 }
 
 extension OutgoingMessage {
     public static func text(_ content: String, role: MessageRole = .user) -> OutgoingMessage {
-        OutgoingMessage(role: role, content: content, attachments: [], replyTo: nil, asAgent: nil, toolCallId: nil, toolName: nil)
+        OutgoingMessage(role: role, content: content, attachments: [], replyTo: nil, asAgent: nil, toolCallId: nil, toolName: nil, appData: [])
     }
 }
 

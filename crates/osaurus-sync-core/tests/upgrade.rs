@@ -18,10 +18,11 @@ use osaurus_sync_core::ids::Role;
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
 use osaurus_sync_core::replica::MemorySecretStore;
 use osaurus_sync_core::store;
-use osaurus_sync_core::types::{Attachment, NewMessage};
+use osaurus_sync_core::types::{AppDataWrite, Attachment, NewMessage, Replication};
 use osaurus_sync_core::{Replica, ReplicaConfig, SecretStore};
 
-const SECRETS: &[&str] = &["device-key", "user-secret"];
+/// Fixtures from before encryption at rest (store version 3 and earlier) have no `view-key`.
+const SECRETS: &[&str] = &["device-key", "user-secret", "view-key"];
 const ATTACHMENT: &[u8] = b"fixture attachment bytes";
 
 fn text(s: &str) -> NewMessage {
@@ -50,6 +51,13 @@ fn write_fixture() {
     r.set_pinned(scope, true).unwrap();
     let ws = r.create_scope(ScopeKind::Workspace, "Projects").unwrap();
     r.send_message(ws, text("workspace note")).unwrap();
+    // Since store version 4: app data, tags and a device-local scope.
+    let mut m = text("with app data");
+    m.app_data.push(AppDataWrite { namespace: "ai.osaurus.turn/1".into(), bytes: b"{\"v\":1}".to_vec(), attachments: vec![] });
+    r.send_message(scope, m).unwrap();
+    r.set_conversation_tags(scope, &[("source".into(), "chat".into())]).unwrap();
+    let local = r.create_scope_with(ScopeKind::Conversation, "Automation run", Replication::DeviceLocal).unwrap();
+    r.send_message(local, text("headless")).unwrap();
     r.close().unwrap();
     std::fs::remove_file(file).unwrap();
     std::fs::create_dir_all(out.join("secrets")).unwrap();
@@ -76,7 +84,9 @@ fn open_fixture(version: u32) -> (Replica, tempfile::TempDir) {
     copy_dir(&src.join("data"), &tmp.path().join("data"));
     let secrets = Arc::new(MemorySecretStore::default());
     for name in SECRETS {
-        secrets.store(name, &std::fs::read(src.join("secrets").join(name)).unwrap()).unwrap();
+        if let Ok(b) = std::fs::read(src.join("secrets").join(name)) {
+            secrets.store(name, &b).unwrap();
+        }
     }
     let r = Replica::open(ReplicaConfig::new(tmp.path().join("data"), "Fixture Mac", Platform::MacOs), Arc::new(SystemEnv), secrets).unwrap();
     (r, tmp)
@@ -92,9 +102,16 @@ fn opens_a_version_2_database() {
     opens_fixture(2);
 }
 
+#[test]
+fn opens_a_version_3_database() {
+    opens_fixture(3);
+}
+
 fn opens_fixture(version: u32) {
     let (mut r, _tmp) = open_fixture(version);
     assert_eq!(store::store_version(r.db_for_tests()).unwrap(), Some(store::STORE_VERSION));
+    // Databases from before encryption at rest are encrypted on open.
+    assert!(!store::is_plaintext(&r.config().data_dir.join("sync.db")));
     let list = r.conversations().unwrap();
     assert_eq!(list.len(), 2);
     let trip = list.iter().find(|c| c.title == "Trip to Lisbon").expect("renamed conversation");
@@ -109,6 +126,12 @@ fn opens_fixture(version: u32) {
     assert_eq!(std::fs::read(path).unwrap(), ATTACHMENT);
     // New writes, and features added since, work on the upgraded database.
     r.send_message(trip.scope, text("after the upgrade")).unwrap();
+    assert_eq!(trip.replication, Replication::Synced);
+    assert_eq!(trip.message_count, 3);
+    let mut m = text("with app data");
+    m.app_data.push(AppDataWrite { namespace: "ai.osaurus.turn/1".into(), bytes: b"{}".to_vec(), attachments: vec![] });
+    let id = r.send_message(trip.scope, m).unwrap();
+    assert_eq!(r.message_view(&id).unwrap().unwrap().app_data.len(), 1);
     let ws = list.iter().find(|c| c.title == "Projects").unwrap().scope;
     r.create_invite_for(ws, Role::Member, r.user_key(), 60_000).unwrap();
     r.leave_scope(ws).unwrap();
@@ -140,7 +163,8 @@ fn a_damaged_view_is_rebuilt_after_a_crash() {
         r.send_message(scope, text(&format!("message number {i} with enough text to fill several pages"))).unwrap();
     }
     let root: i64 = r.db_for_tests().query_row("SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'messages_view'", [], |x| x.get(0)).unwrap();
-    let page_size: i64 = r.db_for_tests().query_row("PRAGMA page_size", [], |x| x.get(0)).unwrap();
+    // SQLCipher reports its page size as text.
+    let page_size: i64 = r.db_for_tests().query_row("PRAGMA cipher_page_size", [], |x| x.get::<_, String>(0)).unwrap().parse().unwrap();
     r.close().unwrap();
     drop(r);
 
