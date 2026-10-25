@@ -2,7 +2,7 @@
   "description": "Written by a newer client: unknown fields, an unknown namespace and a blob reference. Readers must ignore what they don't know and writers must keep it.",
   "conversation": {
     "title": "From the future",
-    "created_ms": 1798761600000,
+    "created_ms": 1767312000000,
     "pinned": false,
     "archived": true,
     "tags": {
@@ -24,7 +24,7 @@
     {
       "role": "assistant",
       "content": "An answer with a large tool result.",
-      "created_ms": 1798761600000,
+      "created_ms": 1767312000000,
       "app_data_blobs": {
         "ai.osaurus.turn/1": [
           { "name": "toolResults.call_9", "media_type": "application/json", "text": "\"a very long tool result\"" }

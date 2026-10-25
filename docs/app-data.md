@@ -103,7 +103,7 @@ Conversation-level, written with `setConversationAppData`.
 | `selectedModel` | string | |
 | `capabilities` | string[] | `vision`, `voice`, `code`, `search` |
 | `folderPath` | string | Display path only. The folder bookmark is device-only |
-| `conversationSummary` | object | `{ id, summaryText, coveredTurnIds, createdAt, modelIdentifier }` |
+| `conversationSummary` | object | `{ id, summaryText, coveredTurnIds, createdAt, modelIdentifier, savedTokensEstimate }` |
 | `workspace` | object | The shared-agent context (`workspaceId`, `agentAddress`, caller fields) |
 | `parkedWorkflowRuns` | object[] | `{ run_id, call_id, tool_name }` |
 | `updatedAt` | number | When the session last changed, if it differs from the last message |

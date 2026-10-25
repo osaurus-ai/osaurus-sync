@@ -159,8 +159,11 @@ impl Replica {
                 })?;
                 r.refresh_conversation(scope)?;
             }
+            // Order by the original times, but never past now: a later edit must sort after
+            // the message it changes, even if the legacy clock ran fast.
+            let now = r.env.now_ms();
             for (i, m) in messages.iter().enumerate() {
-                let hlc = crate::hlc::pack(m.created_ms, (i % 0xffff) as u16);
+                let hlc = crate::hlc::pack(m.created_ms.min(now), (i % 0xffff) as u16);
                 let mut payload = r.message_payload(m.role, &m.content, &m.attachments)?;
                 payload.tool_call_id = m.tool_call_id.clone();
                 payload.tool_name = m.tool_name.clone();

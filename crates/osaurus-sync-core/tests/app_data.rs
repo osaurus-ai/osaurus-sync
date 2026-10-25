@@ -266,6 +266,23 @@ fn import_keeps_metadata_tool_fields_and_app_data() {
 }
 
 #[test]
+fn edits_after_a_future_dated_import_still_win() {
+    let env = Arc::new(TestEnv::new(9, 1_700_000_000_000));
+    let mut a = open("Mac", env.clone());
+    let opts = ImportOptions { title: "Skewed".into(), created_ms: 1_800_000_000_000, ..Default::default() };
+    let mut m = ImportedMessage::text(MessageRole::Assistant, "from a fast clock", 1_800_000_000_000);
+    m.app_data.push(data(TURN, b"{\"t\":1}"));
+    let scope = a.replica.import_conversation_with(&opts, &[m]).unwrap();
+    let page = a.replica.messages(scope, None, 10).unwrap().messages;
+    assert_eq!(osaurus_sync_core::hlc::physical_ms(page[0].hlc), 1_700_000_000_000);
+
+    a.replica.set_message_app_data(page[0].id, &[data(TURN, b"{\"t\":2}")]).unwrap();
+    assert_eq!(app_data(&a.replica, &page[0].id, TURN).unwrap(), b"{\"t\":2}");
+    a.replica.edit_message(page[0].id, "edited").unwrap();
+    assert_eq!(a.replica.messages(scope, None, 10).unwrap().messages[0].content, "edited");
+}
+
+#[test]
 fn device_local_scopes_never_leave_the_device() {
     let env = Arc::new(TestEnv::new(7, 1_700_000_000_000));
     let mut a = open("Mac", env.clone());

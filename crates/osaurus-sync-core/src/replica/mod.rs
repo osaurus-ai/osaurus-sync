@@ -1026,7 +1026,13 @@ impl Replica {
             return Err(Error::DeviceRevoked);
         }
         let now = self.env.now_ms();
-        let hlc = hlc.unwrap_or_else(|| self.clock.tick(now));
+        let hlc = match hlc {
+            Some(hlc) => {
+                self.clock.observe(hlc, now);
+                hlc
+            }
+            None => self.clock.tick(now),
+        };
         let id = id.unwrap_or_else(|| EventId::new_v7(now, crate::env::random_array(self.env.as_ref())));
         let (control_parents, parents) = self.heads(scope)?;
         let e = Envelope::sign(Draft { id, scope, hlc, control_parents, parents, kind: kind_, epoch, payload }, &self.device);

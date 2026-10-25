@@ -26,7 +26,8 @@
           "summaryText": "The user is planning a trip to Lisbon.",
           "coveredTurnIds": ["b0000000-0000-4000-8000-000000000001"],
           "createdAt": 1767225700000,
-          "modelIdentifier": "OsaurusAI/gemma-4-qat-mxfp4"
+          "modelIdentifier": "OsaurusAI/gemma-4-qat-mxfp4",
+          "savedTokensEstimate": 1200
         },
         "parkedWorkflowRuns": [
           { "run_id": "f0e1d2c3-b4a5-4968-8776-655443322110", "call_id": "call_wf", "tool_name": "run_workflow" }
