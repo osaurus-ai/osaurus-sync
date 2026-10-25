@@ -39,6 +39,7 @@ pub mod kind {
     pub const TOMBSTONE: u16 = 3;
     pub const REACTION: u16 = 4;
     pub const LORO_UPDATE: u16 = 5;
+    pub const APP_DATA: u16 = 6;
 
     pub const GENESIS: u16 = 16;
     pub const MEMBER_ADD: u16 = 17;
@@ -63,7 +64,7 @@ pub mod kind {
     }
 
     pub fn is_known(kind: u16) -> bool {
-        matches!(kind, 1..=5 | 16..=24)
+        matches!(kind, 1..=6 | 16..=24)
     }
 
     /// Content whose effect gets purged for good: a tombstone removes its target and compaction
@@ -80,6 +81,7 @@ pub mod kind {
             TOMBSTONE => "tombstone",
             REACTION => "reaction",
             LORO_UPDATE => "loro_update",
+            APP_DATA => "app_data",
             GENESIS => "genesis",
             MEMBER_ADD => "member_add",
             MEMBER_REMOVE => "member_remove",

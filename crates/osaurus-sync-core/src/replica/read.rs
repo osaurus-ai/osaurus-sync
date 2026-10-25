@@ -7,8 +7,11 @@ use crate::auth::Reason;
 use crate::error::{Error, Result};
 use crate::ids::{DeviceKey, EventId, Principal, Role, ScopeId, UserKey};
 use crate::payload::{self, BlobRef, MessageRole, ScopeKind};
-use crate::store::delivery;
-use crate::types::{BlobInfo, ConversationSummary, Cursor, DeliveryStatus, DeviceInfo, MemberInfo, MessagePage, MessageView, ReactionSummary, SearchHit};
+use crate::store::{delivery, replication};
+use crate::types::{
+    AppDataView, BlobInfo, ConversationFilter, ConversationSummary, Cursor, DeliveryStatus, DeviceInfo, MemberInfo, MessagePage, MessageView, ReactionSummary,
+    Replication, SearchHit,
+};
 
 const MESSAGE_COLUMNS: &str =
     "id, scope, hlc, author_device, principal, is_agent, role, content, blobs, reply_to, tool_call_id, tool_name, edited, status, reason";
@@ -61,6 +64,45 @@ fn raw(r: &Row) -> rusqlite::Result<RawMessage> {
     })
 }
 
+/// SQL conditions (each starting with ` AND `) for a conversation filter, with their values
+/// numbered from `?{first}`. `scope_col` names the scope column; `c` must be
+/// `conversations_view`.
+fn filter_sql(f: &ConversationFilter, scope_col: &str, first: usize) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value;
+    let mut sql = String::new();
+    let mut values: Vec<Value> = Vec::new();
+    let next = |v: Value, values: &mut Vec<Value>| {
+        values.push(v);
+        format!("?{}", first + values.len() - 1)
+    };
+    for (k, v) in &f.tags {
+        let (pk, pv) = (next(k.clone().into(), &mut values), next(v.clone().into(), &mut values));
+        sql.push_str(&format!(" AND EXISTS(SELECT 1 FROM conversation_tags t WHERE t.scope = {scope_col} AND t.key = {pk} AND t.value = {pv})"));
+    }
+    for k in &f.has_tags {
+        let pk = next(k.clone().into(), &mut values);
+        sql.push_str(&format!(" AND EXISTS(SELECT 1 FROM conversation_tags t WHERE t.scope = {scope_col} AND t.key = {pk})"));
+    }
+    if let Some(kind) = f.kind {
+        let p = next(Value::Integer(if kind == ScopeKind::Workspace { 1 } else { 0 }), &mut values);
+        sql.push_str(&format!(" AND c.kind = {p}"));
+    }
+    if let Some(r) = f.replication {
+        let v = if r == Replication::DeviceLocal { replication::DEVICE_LOCAL } else { replication::SYNCED };
+        let p = next(Value::Integer(v), &mut values);
+        sql.push_str(&format!(" AND COALESCE((SELECT replication FROM scopes s WHERE s.scope = {scope_col}), 0) = {p}"));
+    }
+    if let Some(a) = f.archived {
+        let p = next(Value::Integer(a as i64), &mut values);
+        sql.push_str(&format!(" AND c.archived = {p}"));
+    }
+    if let Some(pin) = f.pinned {
+        let p = next(Value::Integer(pin as i64), &mut values);
+        sql.push_str(&format!(" AND c.pinned = {p}"));
+    }
+    (sql, values)
+}
+
 impl Replica {
     fn to_view(&self, m: RawMessage) -> Result<MessageView> {
         let bad = || Error::Storage("corrupt view row".into());
@@ -77,6 +119,24 @@ impl Replica {
             )?;
             stmt.query_map(params![me, &m.id], |r| Ok(ReactionSummary { reaction: r.get(0)?, count: r.get::<_, i64>(1)? as u32, mine: r.get(2)? }))?
                 .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let app_data = {
+            let mut stmt = self.db.prepare_cached("SELECT namespace, bytes, blobs FROM app_data_view WHERE target = ? AND principal = ? ORDER BY namespace")?;
+            let rows: Vec<(String, Vec<u8>, Vec<u8>)> =
+                stmt.query_map(params![&m.id, m.principal], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+            rows.into_iter()
+                .map(|(namespace, bytes, blobs)| AppDataView {
+                    namespace,
+                    bytes,
+                    blobs: payload::decode::<Vec<BlobRef>>(&blobs)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|b| BlobInfo { available: self.blobs.has(&b.hash), hash: b.hash, size: b.plain_size, media_type: b.media_type, name: b.name })
+                        .collect(),
+                })
+                // An empty write clears the namespace.
+                .filter(|a| !a.bytes.is_empty() || !a.blobs.is_empty())
+                .collect()
         };
         Ok(MessageView {
             id,
@@ -98,6 +158,7 @@ impl Replica {
                 _ => DeliveryStatus::Delivered,
             },
             reactions,
+            app_data,
         })
     }
 
@@ -138,23 +199,40 @@ impl Replica {
     }
 
     pub fn conversation(&self, scope: ScopeId) -> Result<Option<ConversationSummary>> {
-        Ok(self.conversations_where("c.scope = ?1", params![&scope.0[..], self.me().to_hex()])?.into_iter().next())
+        Ok(self.conversations_where("c.scope = ?1", "", params![&scope.0[..], self.me().to_hex()])?.into_iter().next())
     }
 
     pub fn conversations(&self) -> Result<Vec<ConversationSummary>> {
         // Scopes this user isn't a member of (removed, or offered but not joined) stay out of the list.
-        self.conversations_where("c.my_role IS NOT NULL AND ?1 IS NULL", params![Option::<Vec<u8>>::None, self.me().to_hex()])
+        self.conversations_where("c.my_role IS NOT NULL AND ?1 IS NULL", "", params![Option::<Vec<u8>>::None, self.me().to_hex()])
     }
 
-    fn conversations_where(&self, filter: &str, p: impl rusqlite::Params) -> Result<Vec<ConversationSummary>> {
+    /// The conversations matching `f`, in list order.
+    pub fn conversations_filtered(&self, f: &ConversationFilter) -> Result<Vec<ConversationSummary>> {
+        let (clause, mut values) = filter_sql(f, "c.scope", 3);
+        let tail = match (f.limit, f.offset) {
+            (0, 0) => String::new(),
+            (0, o) => format!(" LIMIT -1 OFFSET {o}"),
+            (l, o) => format!(" LIMIT {l} OFFSET {o}"),
+        };
+        let mut all: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Null, self.me().to_hex().into()];
+        all.append(&mut values);
+        self.conversations_where(&format!("c.my_role IS NOT NULL AND ?1 IS NULL{clause}"), &tail, rusqlite::params_from_iter(all))
+    }
+
+    fn conversations_where(&self, filter: &str, tail: &str, p: impl rusqlite::Params) -> Result<Vec<ConversationSummary>> {
         let sql = format!(
             "SELECT c.scope, c.kind, c.title, c.pinned, c.sort_order, c.archived, c.my_role, c.members,
                 MAX(c.created_hlc, COALESCE((SELECT MAX(hlc) FROM messages_view m WHERE m.scope = c.scope), 0)) AS activity,
                 (SELECT content FROM messages_view m WHERE m.scope = c.scope ORDER BY hlc DESC, author_device DESC, id DESC LIMIT 1),
                 (SELECT COUNT(*) FROM messages_view m WHERE m.scope = c.scope AND m.principal != ?2
-                    AND m.hlc > COALESCE((SELECT last_read_hlc FROM read_state r WHERE r.scope = c.scope), 0))
+                    AND m.hlc > COALESCE((SELECT last_read_hlc FROM read_state r WHERE r.scope = c.scope), 0)),
+                COALESCE((SELECT replication FROM scopes s WHERE s.scope = c.scope), 0),
+                c.created_ms,
+                (SELECT COUNT(*) FROM messages_view m WHERE m.scope = c.scope),
+                c.app_data
              FROM conversations_view c WHERE {filter}
-             ORDER BY c.pinned DESC, c.sort_order IS NULL, c.sort_order, activity DESC"
+             ORDER BY c.pinned DESC, c.sort_order IS NULL, c.sort_order, activity DESC{tail}"
         );
         let mut stmt = self.db.prepare_cached(&sql)?;
         let rows = stmt.query_map(p, |r| {
@@ -170,13 +248,23 @@ impl Replica {
                 r.get::<_, i64>(8)?,
                 r.get::<_, Option<String>>(9)?,
                 r.get::<_, i64>(10)?,
+                (r.get::<_, i64>(11)?, r.get::<_, i64>(12)?, r.get::<_, i64>(13)?, r.get::<_, Option<Vec<u8>>>(14)?),
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (scope, kind, title, pinned, sort_order, archived, my_role, members, activity, preview, unread) = row?;
+            let (scope, kind, title, pinned, sort_order, archived, my_role, members, activity, preview, unread, (repl, created_ms, count, app_data)) = row?;
             let members: Vec<(String, i64)> = members.and_then(|b| payload::decode(&b).ok()).unwrap_or_default();
+            let tags: Vec<(String, String)> = {
+                let mut stmt = self.db.prepare_cached("SELECT key, value FROM conversation_tags WHERE scope = ? ORDER BY key")?;
+                stmt.query_map([&scope], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?
+            };
             out.push(ConversationSummary {
+                replication: if repl == replication::DEVICE_LOCAL { Replication::DeviceLocal } else { Replication::Synced },
+                created_ms: created_ms as u64,
+                message_count: count as u32,
+                tags,
+                app_data: app_data.and_then(|b| payload::decode(&b).ok()).unwrap_or_default(),
                 scope: ScopeId::from_slice(&scope).ok_or_else(|| Error::Storage("bad scope".into()))?,
                 kind: if kind == 1 { ScopeKind::Workspace } else { ScopeKind::Conversation },
                 title,
@@ -198,16 +286,27 @@ impl Replica {
 
     /// Full-text search over decrypted, synced history.
     pub fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>> {
+        self.search_filtered(query, &ConversationFilter::default(), limit)
+    }
+
+    /// Full-text search within the conversations matching `f` (its paging fields are ignored).
+    pub fn search_filtered(&self, query: &str, f: &ConversationFilter, limit: u32) -> Result<Vec<SearchHit>> {
         let terms: Vec<String> = query.split_whitespace().map(|t| t.replace('"', "")).filter(|t| !t.is_empty()).map(|t| format!("\"{t}\"*")).collect();
         if terms.is_empty() {
             return Ok(vec![]);
         }
-        let mut stmt = self.db.prepare_cached(
+        let (clause, mut values) = filter_sql(f, "m.scope", 3);
+        let sql = format!(
             "SELECT m.scope, m.id, snippet(messages_fts, 0, '[', ']', '…', 12), m.hlc
              FROM messages_fts JOIN messages_view m ON m.rowid = messages_fts.rowid
-             WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?",
-        )?;
-        let rows = stmt.query_map(params![terms.join(" "), limit.clamp(1, 200)], |r| {
+             LEFT JOIN conversations_view c ON c.scope = m.scope
+             WHERE messages_fts MATCH ?1 AND ?2 IS NOT NULL{clause} ORDER BY rank LIMIT {}",
+            limit.clamp(1, 200)
+        );
+        let mut all: Vec<rusqlite::types::Value> = vec![terms.join(" ").into(), 1i64.into()];
+        all.append(&mut values);
+        let mut stmt = self.db.prepare_cached(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(all), |r| {
             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
         })?;
         let mut out = Vec::new();
@@ -252,7 +351,10 @@ impl Replica {
 
     /// Finds the blob reference (including its key) for a blob attached in a scope.
     pub fn blob_ref(&self, scope: ScopeId, hash: &[u8; 32]) -> Result<Option<BlobRef>> {
-        let mut stmt = self.db.prepare_cached("SELECT m.blobs FROM blob_refs b JOIN messages_view m ON m.id = b.event WHERE b.hash = ? AND b.scope = ?")?;
+        let mut stmt = self.db.prepare_cached(
+            "SELECT m.blobs FROM blob_refs b JOIN messages_view m ON m.id = b.event WHERE b.hash = ?1 AND b.scope = ?2
+             UNION ALL SELECT a.blobs FROM blob_refs b JOIN app_data_view a ON a.target = b.event WHERE b.hash = ?1 AND b.scope = ?2",
+        )?;
         let rows: Vec<Vec<u8>> = stmt.query_map(params![&hash[..], &scope.0[..]], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
         for b in rows {
             if let Ok(refs) = payload::decode::<Vec<BlobRef>>(&b)
@@ -271,6 +373,15 @@ impl Replica {
             return Ok(None);
         }
         Ok(Some(self.blobs.open_plain_capped(&r, self.cfg.plain_cache_bytes)?))
+    }
+
+    /// The decrypted bytes of a locally available blob, without a plaintext copy on disk.
+    pub fn blob_bytes(&self, scope: ScopeId, hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        let Some(r) = self.blob_ref(scope, hash)? else { return Err(Error::NotFound("blob".into())) };
+        if !self.blobs.has(hash) {
+            return Ok(None);
+        }
+        Ok(Some(self.blobs.read_plain(&r)?))
     }
 
     pub fn blob_store(&self) -> &crate::blobs::BlobStore {

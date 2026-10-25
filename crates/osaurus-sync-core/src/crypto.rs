@@ -217,6 +217,20 @@ pub fn encrypt_blob_file(env: &dyn Env, key: &[u8; 32], src: &Path, dst: &Path) 
 }
 
 pub fn decrypt_blob_file(key: &[u8; 32], src: &Path, dst: &Path) -> Result<u64> {
+    let mut out = BufWriter::new(File::create(dst)?);
+    let n = decrypt_blob_into(key, src, &mut out)?;
+    out.flush()?;
+    Ok(n)
+}
+
+/// Decrypts a blob into memory, for callers that shouldn't leave a plaintext copy on disk.
+pub fn decrypt_blob_bytes(key: &[u8; 32], src: &Path) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decrypt_blob_into(key, src, &mut out)?;
+    Ok(out)
+}
+
+fn decrypt_blob_into(key: &[u8; 32], src: &Path, out: &mut impl Write) -> Result<u64> {
     let c = cipher(key);
     let mut input = BufReader::new(File::open(src)?);
     let mut header = [0u8; 20];
@@ -225,7 +239,6 @@ pub fn decrypt_blob_file(key: &[u8; 32], src: &Path, dst: &Path) -> Result<u64> 
         return Err(Error::Crypto("not a blob".into()));
     }
     let prefix: [u8; 16] = header[4..].try_into().unwrap();
-    let mut out = BufWriter::new(File::create(dst)?);
     let mut cur = vec![0u8; BLOB_CHUNK + 16];
     let mut next = vec![0u8; BLOB_CHUNK + 16];
     let mut cur_len = read_full(&mut input, &mut cur)?;
@@ -246,7 +259,6 @@ pub fn decrypt_blob_file(key: &[u8; 32], src: &Path, dst: &Path) -> Result<u64> 
         cur_len = next_len;
         index += 1;
     }
-    out.flush()?;
     Ok(total)
 }
 

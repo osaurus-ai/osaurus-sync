@@ -15,8 +15,8 @@ XCFramework inside, so it needs no download at build time. This is the way to us
 because the main repository is private and SwiftPM can't fetch its release assets.
 
 ```sh
-gh release download v0.1.0-beta.2 -R osaurus-ai/osaurus-sync -p 'OsaurusSync-swift-local-*.zip'
-unzip OsaurusSync-swift-local-0.1.0-beta.2.zip -d Vendor     # creates Vendor/OsaurusSync
+gh release download v0.1.0-beta.3 -R osaurus-ai/osaurus-sync -p 'OsaurusSync-swift-local-*.zip'
+unzip OsaurusSync-swift-local-0.1.0-beta.3.zip -d Vendor     # creates Vendor/OsaurusSync
 ```
 
 Add `Vendor/OsaurusSync` in Xcode with **File > Add Package Dependencies > Add Local**, or from

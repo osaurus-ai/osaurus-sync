@@ -38,6 +38,7 @@ impl Replica {
             Ok(report) => {
                 self.secrets.store(USER_SECRET, &new.entropy())?;
                 self.secrets.delete(USER_SECRET_NEXT)?;
+                self.seal_view_key()?;
                 Ok(report)
             }
             Err(e) => {
@@ -198,6 +199,7 @@ impl Replica {
                 self.secrets.store(USER_SECRET, &new.entropy())?;
                 self.secrets.delete(USER_SECRET_NEXT)?;
                 self.recovery_checked.clear();
+                self.seal_view_key()?;
                 Ok(true)
             }
             Err(e) => {

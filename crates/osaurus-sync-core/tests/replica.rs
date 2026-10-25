@@ -7,6 +7,7 @@ use osaurus_sync_core::ids::ScopeId;
 use osaurus_sync_core::keys::UserSecret;
 use osaurus_sync_core::payload::{MessageRole, ScopeKind};
 use osaurus_sync_core::replica::{IngestOutcome, MemorySecretStore};
+use osaurus_sync_core::store::{self, DbKey};
 use osaurus_sync_core::types::{Attachment, Change, DeliveryStatus, NewMessage};
 use osaurus_sync_core::{Replica, ReplicaConfig, SecretStore};
 
@@ -152,7 +153,8 @@ fn reopen_keeps_state_and_rebuilds_views() {
     }
     // Force a view schema change: views are rebuilt from events.
     {
-        let conn = rusqlite::Connection::open(dir.path().join("sync.db")).unwrap();
+        let key = DbKey(secrets.get("view-key").unwrap().try_into().unwrap());
+        let conn = store::open(Some(&dir.path().join("sync.db")), Some(&key)).unwrap();
         conn.execute("UPDATE meta SET value = ? WHERE key = 'view_version'", [0i64.to_le_bytes().to_vec()]).unwrap();
     }
     let mut r = Replica::open(cfg(), env, secrets).unwrap();

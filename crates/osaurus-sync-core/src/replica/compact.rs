@@ -22,6 +22,7 @@ pub struct Compaction {
     pub upto_seq: i64,
     pub edits_dropped: u32,
     pub loro_folded: u32,
+    pub app_data_dropped: u32,
 }
 
 /// A scope rebuilt from its events up to a past version. Read-only: reverting means writing new
@@ -60,6 +61,10 @@ impl Replica {
 
     /// The local seq every known, unrevoked storing peer holds, or `None` without one.
     pub fn compactable_seq(&mut self, scope: ScopeId) -> Result<Option<i64>> {
+        // Nothing else holds a device-local scope, so there's no one to wait for.
+        if self.is_device_local(scope)? {
+            return Ok(Some(self.max_seq(scope)?).filter(|s| *s > 0));
+        }
         let rows: Vec<(Vec<u8>, i64)> = {
             let mut stmt = self.db.prepare_cached("SELECT device, seen_seq FROM storage_peers WHERE scope = ?")?;
             stmt.query_map([&scope.0[..]], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?
@@ -78,7 +83,8 @@ impl Replica {
         self.tx(|r| {
             let edits_dropped = r.drop_superseded_edits(scope, upto)?;
             let loro_folded = r.fold_loro(scope, upto)?;
-            Ok(Compaction { upto_seq: upto, edits_dropped, loro_folded })
+            let app_data_dropped = r.drop_superseded_app_data(scope, upto)?;
+            Ok(Compaction { upto_seq: upto, edits_dropped, loro_folded, app_data_dropped })
         })
     }
 
@@ -99,6 +105,27 @@ impl Replica {
         for h in hashes {
             if self.compact_event(&h)? {
                 self.db.execute("DELETE FROM edits WHERE hash = ?", [&h])?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// App data writes that lost to a later write in the same namespace by the same writer.
+    fn drop_superseded_app_data(&mut self, scope: ScopeId, upto_seq: i64) -> Result<u32> {
+        let hashes: Vec<Vec<u8>> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT a.hash FROM app_data_events a
+                 JOIN events ev ON ev.hash = a.hash
+                 WHERE a.scope = ? AND ev.seq <= ? AND ev.purged = ?
+                   AND a.hash NOT IN (SELECT hash FROM app_data_view WHERE scope = a.scope)",
+            )?;
+            stmt.query_map(params![&scope.0[..], upto_seq, purged::NONE], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+        };
+        let mut n = 0;
+        for h in hashes {
+            if self.compact_event(&h)? {
+                self.db.execute("DELETE FROM app_data_events WHERE hash = ?", [&h])?;
                 n += 1;
             }
         }

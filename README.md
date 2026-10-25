@@ -49,7 +49,7 @@ merge rules in detail.
 
 ## Status
 
-The current release is **`v0.1.0-beta.2`**, an internal prerelease for building the client
+The current release is **`v0.1.0-beta.3`**, an internal prerelease for building the client
 apps. "Beta" here means:
 
 - The API and the wire protocol are versioned from this release on. Beta builds on different
@@ -88,13 +88,14 @@ What's in it:
 - **Devices only sync while another device that has the changes is online.** There's no
   always-on peer yet, so with two devices, both have to be online at the same time. A storage
   server would remove this limit.
-- **History only grows.** Compaction waits for a storing peer to hold the history, so nothing is
-  compacted until a storage server exists.
+- **Synced history only grows.** Compaction waits for a storing peer to hold the history, so
+  nothing synced is compacted until a storage server exists. Device-local conversations compact
+  on their own.
 - **Some extra traffic.** A device pulling from several peers at once can fetch some events more
   than once. The duplicates are discarded; only bandwidth is wasted.
-- **Views are stored in plaintext.** Events are encrypted, but the local views (titles, message
-  text, the search index) aren't. Rely on OS disk encryption: FileVault, iOS data protection,
-  BitLocker.
+- **Opened attachments are decrypted into a cache.** `fetchAttachment` writes a plaintext copy
+  that stays until the cache is trimmed or the core opens or closes; `readAttachment` returns
+  bytes and leaves nothing on disk.
 - **iOS keeps recent history by default.** The last 90 days sync, and older messages are
   fetched when the user scrolls back.
 
@@ -129,7 +130,7 @@ Each release on GitHub has:
 The repository is private, so download the assets with the GitHub CLI:
 
 ```sh
-gh release download v0.1.0-beta.2 -R osaurus-ai/osaurus-sync \
+gh release download v0.1.0-beta.3 -R osaurus-ai/osaurus-sync \
   -p 'OsaurusSync-swift-local-*.zip' -p '*.nupkg'
 ```
 

@@ -50,8 +50,8 @@ final class BindingTests: XCTestCase {
     }
 
     func testVersionAndErrors() async throws {
-        XCTAssertEqual(apiVersion(), 1)
-        let config = CoreConfig(dataDir: dir.appendingPathComponent("v").path, deviceName: "v", platform: .macOs, history: nil, network: localNetworkConfig(), apiVersion: 999)
+        XCTAssertEqual(apiVersion(), 2)
+        let config = CoreConfig(dataDir: dir.appendingPathComponent("v").path, deviceName: "v", platform: .macOs, history: nil, network: localNetworkConfig(), maxAppDataBytes: nil, apiVersion: 999)
         XCTAssertThrowsError(try SyncCore.open(config: config, keyStore: MemoryKeyStore())) { e in
             XCTAssertEqual((e as? SyncError)?.code, SyncErrorCode.incompatibleVersion)
         }
@@ -133,8 +133,8 @@ final class BindingTests: XCTestCase {
         XCTAssertNil(try core.message(id: aborted.messageId()))
 
         let legacy = try core.importLegacyConversation(
-            title: "Old", createdMs: 1_600_000_000_000,
-            messages: [LegacyMessage(role: .user, content: "from 2020", createdMs: 1_600_000_000_000)])
+            conversation: LegacyConversation(title: "Old", createdMs: 1_600_000_000_000),
+            messages: [.text("from 2020", createdMs: 1_600_000_000_000)])
         XCTAssertEqual(try core.messages(scope: legacy, before: nil, limit: 10).messages.first?.timestampMs, 1_600_000_000_000)
 
         // A read-only view of a conversation as it was at a past moment.
@@ -263,6 +263,133 @@ final class BindingTests: XCTestCase {
         sub.cancel()
         try await mac.close()
         try await phone.close()
+    }
+
+    func testAppDataTagsAndLocalConversations() async throws {
+        let core = try open("app")
+        let scope = try core.createConversation(title: "Chat")
+        try core.setConversationTags(scope: scope, tags: [Tag(key: "source", value: "chat")])
+        try core.setConversationAppData(scope: scope, namespace: "ai.osaurus.session/1", bytes: Data(#"{"v":1}"#.utf8))
+
+        let file = dir.appendingPathComponent("result.json")
+        try Data(#""big""#.utf8).write(to: file)
+        var msg = OutgoingMessage.text("hi")
+        msg.appData = [AppDataWrite(namespace: "ai.osaurus.turn/1", bytes: Data(#"{"v":1,"id":"a"}"#.utf8),
+                                    attachments: [AttachmentFile(path: file.path, mediaType: "application/json", name: "toolResults.c1")])]
+        let id = try core.sendMessage(scope: scope, message: msg)
+        let turn = try XCTUnwrap(core.message(id: id)?.appData("ai.osaurus.turn/1"))
+        XCTAssertEqual(String(decoding: turn.bytes, as: UTF8.self), #"{"v":1,"id":"a"}"#)
+        let blob = try XCTUnwrap(turn.blobs.first)
+        let read = try await core.readAttachment(scope: scope, hash: blob.hash)
+        XCTAssertEqual(read, Data(#""big""#.utf8))
+        try core.setMessageAppData(id: id, appData: [AppDataWrite(namespace: "ai.osaurus.turn/1", bytes: Data(#"{"v":1,"id":"b"}"#.utf8))])
+        XCTAssertEqual(try core.message(id: id)?.appData("ai.osaurus.turn/1")?.blobs.count, 0)
+
+        let stream = try core.openStream(scope: scope, role: .assistant, asAgent: nil)
+        try stream.push(delta: "answer")
+        let streamed = try stream.finish(content: nil, appData: [AppDataWrite(namespace: "ai.osaurus.turn/1", bytes: Data(#"{"v":1}"#.utf8))])
+        XCTAssertNotNil(try core.message(id: streamed)?.appData("ai.osaurus.turn/1"))
+
+        let conv = try XCTUnwrap(core.conversation(scope: scope))
+        XCTAssertEqual(conv.tag("source"), "chat")
+        XCTAssertEqual(conv.appData("ai.osaurus.session/1"), Data(#"{"v":1}"#.utf8))
+        XCTAssertEqual(conv.messageCount, 2)
+        XCTAssertEqual(conv.replication, .synced)
+
+        let local = try core.createConversation(title: "Plugin run", replication: .deviceLocal)
+        try core.setConversationTags(scope: local, tags: [Tag(key: "source", value: "plugin")])
+        XCTAssertEqual(try core.conversations(tagged: ["source": "plugin"]).map(\.scope), [local])
+        XCTAssertEqual(try core.conversationsFiltered(filter: ConversationFilter(replication: .deviceLocal)).map(\.scope), [local])
+        XCTAssertEqual(try core.conversationsFiltered(filter: ConversationFilter(hasTags: ["source"], limit: 1)).count, 1)
+        _ = try core.sendMessage(scope: local, message: .text("headless"))
+        XCTAssertEqual(try core.searchFiltered(query: "headless", filter: ConversationFilter(replication: .synced), limit: 10).count, 0)
+        try core.promoteToSynced(scope: local)
+        XCTAssertEqual(try core.conversation(scope: local)?.replication, .synced)
+        let gone = try core.createConversation(title: "Scratch", replication: .deviceLocal)
+        try core.deleteLocalConversation(scope: gone)
+        XCTAssertNil(try core.conversation(scope: gone))
+
+        try await core.signOut(keepConversations: true)
+        XCTAssertThrowsError(try core.conversations()) { e in
+            XCTAssertEqual((e as? SyncError)?.code, SyncErrorCode.closed)
+        }
+    }
+
+    /// Imports the shared fixtures in tests/fixtures/app-data, as the Rust and C# tests do.
+    func testAppDataFixtures() async throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("../../../../tests/fixtures/app-data").standardized
+        let names = try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasSuffix(".json") }.sorted()
+        XCTAssertEqual(names.count, 3)
+        let core = try open("fixtures")
+        var n = 0
+        func files(_ list: Any?) throws -> [AttachmentFile] {
+            try ((list as? [[String: Any]]) ?? []).map { a in
+                n += 1
+                let name = a["name"] as! String
+                let url = dir.appendingPathComponent("\(n)-\(name)")
+                try Data((a["text"] as! String).utf8).write(to: url)
+                return AttachmentFile(path: url.path, mediaType: a["media_type"] as! String, name: name)
+            }
+        }
+        func json(_ v: Any) throws -> Data { try JSONSerialization.data(withJSONObject: v, options: [.sortedKeys]) }
+        func same(_ a: Data, _ b: Any) throws -> Bool {
+            try json(JSONSerialization.jsonObject(with: a)) == json(b)
+        }
+        func role(_ s: String) -> MessageRole {
+            ["user": .user, "assistant": .assistant, "system": .system, "tool_call": .toolCall, "tool_result": .toolResult][s]!
+        }
+        for name in names {
+            let f = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent(name))) as! [String: Any]
+            let c = f["conversation"] as! [String: Any]
+            let tags = (c["tags"] as! [String: String]).map { Tag(key: $0.key, value: $0.value) }.sorted { $0.key < $1.key }
+            let convData = try (c["app_data"] as! [String: Any]).map { AppDataEntry(namespace: $0.key, bytes: try json($0.value)) }
+            let msgs = f["messages"] as! [[String: Any]]
+            let legacy = try msgs.map { m in
+                let blobs = m["app_data_blobs"] as? [String: Any]
+                return LegacyMessage(
+                    role: role(m["role"] as! String), content: m["content"] as! String,
+                    createdMs: (m["created_ms"] as! NSNumber).uint64Value,
+                    attachments: try files(m["attachments"]),
+                    toolCallId: m["tool_call_id"] as? String, toolName: m["tool_name"] as? String,
+                    appData: try (m["app_data"] as! [String: Any]).map {
+                        AppDataWrite(namespace: $0.key, bytes: try json($0.value), attachments: try files(blobs?[$0.key]))
+                    })
+            }
+            let scope = try core.importLegacyConversation(
+                conversation: LegacyConversation(
+                    title: c["title"] as! String, createdMs: (c["created_ms"] as! NSNumber).uint64Value, replication: .synced,
+                    pinned: c["pinned"] as! Bool, archived: c["archived"] as! Bool, tags: tags, appData: convData),
+                messages: legacy)
+
+            let got = try XCTUnwrap(core.conversation(scope: scope))
+            XCTAssertEqual(got.title, c["title"] as? String, name)
+            XCTAssertEqual(got.tags, tags, name)
+            for (ns, v) in c["app_data"] as! [String: Any] {
+                XCTAssertTrue(try same(XCTUnwrap(got.appData(ns)), v), "\(name) \(ns)")
+            }
+            let page = try core.messages(scope: scope, before: nil, limit: 100).messages
+            XCTAssertEqual(page.count, msgs.count, name)
+            for (m, want) in zip(page, msgs) {
+                XCTAssertEqual(m.content, want["content"] as? String)
+                XCTAssertEqual(m.toolCallId, want["tool_call_id"] as? String)
+                for (i, a) in ((want["attachments"] as? [[String: Any]]) ?? []).enumerated() {
+                    let read = try await core.readAttachment(scope: scope, hash: m.blobs[i].hash)
+                    XCTAssertEqual(read, Data((a["text"] as! String).utf8))
+                }
+                for (ns, v) in want["app_data"] as! [String: Any] {
+                    let d = try XCTUnwrap(m.appData(ns), "\(name) \(ns)")
+                    XCTAssertTrue(try same(d.bytes, v), "\(name) \(ns)")
+                    let blobs = ((want["app_data_blobs"] as? [String: Any])?[ns] as? [[String: Any]]) ?? []
+                    XCTAssertEqual(d.blobs.count, blobs.count)
+                    for (i, b) in blobs.enumerated() {
+                        let read = try await core.readAttachment(scope: scope, hash: d.blobs[i].hash)
+                        XCTAssertEqual(read, Data((b["text"] as! String).utf8))
+                    }
+                }
+            }
+        }
+        try await core.close()
     }
 
     func testLogsAndSupportBundle() async throws {

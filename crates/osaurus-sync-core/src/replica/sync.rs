@@ -242,6 +242,9 @@ impl Replica {
     /// Whether a device may receive this scope's events: a certified, unrevoked device acting for
     /// a member.
     pub fn is_authorized(&mut self, scope: ScopeId, device: &DeviceKey) -> Result<bool> {
+        if *device != self.device_key() && self.is_device_local(scope)? {
+            return Ok(false);
+        }
         let st = self.auth_mut(scope)?.full_state();
         Ok(!st.acting(device).is_empty())
     }
@@ -250,6 +253,9 @@ impl Replica {
     /// and not revoked. Removed members learn of their removal this way; content after the
     /// removal is encrypted with keys they never receive.
     pub fn may_read_control(&mut self, scope: ScopeId, device: &DeviceKey) -> Result<bool> {
+        if *device != self.device_key() && self.is_device_local(scope)? {
+            return Ok(false);
+        }
         let st = self.auth_mut(scope)?.full_state();
         Ok(st.certs.contains_key(device) && !st.revoked.contains(device))
     }
@@ -284,6 +290,9 @@ impl Replica {
 
     /// Whether a peer presenting this certificate would be admitted automatically.
     pub fn would_admit(&mut self, scope: ScopeId, cert: &DeviceCert) -> Result<bool> {
+        if self.is_device_local(scope)? {
+            return Ok(false);
+        }
         let st = self.auth_mut(scope)?.full_state();
         Ok(cert.verify() && !st.revoked.contains(&cert.device) && st.members.contains_key(&crate::ids::Principal::User(cert.user)))
     }
@@ -346,7 +355,7 @@ impl Replica {
     pub fn known_peer_devices(&mut self) -> Result<Vec<DeviceKey>> {
         let me = self.device_key();
         let mut out = Vec::new();
-        for scope in self.scope_ids()? {
+        for scope in self.synced_scope_ids()? {
             let st = self.auth_mut(scope)?.full_state();
             for d in st.certs.keys() {
                 if *d != me && !st.revoked.contains(d) && !out.contains(d) {

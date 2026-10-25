@@ -18,7 +18,7 @@ public sealed class BindingTests : IDisposable
     private SyncCore Open(string name, Platform platform = Platform.Windows, bool online = false, KeyStore? keys = null)
     {
         var net = OsaurusSyncFfiMethods.LocalNetworkConfig() with { Enabled = online };
-        var config = new CoreConfig(Path.Combine(_dir, name), name, platform, null, net, OsaurusSyncFfiMethods.ApiVersion());
+        var config = new CoreConfig(Path.Combine(_dir, name), name, platform, null, net, null, OsaurusSyncFfiMethods.ApiVersion());
         return SyncCore.Open(config, keys ?? new MemoryKeyStore());
     }
 
@@ -38,8 +38,8 @@ public sealed class BindingTests : IDisposable
     [Fact]
     public async Task VersionAndErrors()
     {
-        Assert.Equal(1u, OsaurusSyncFfiMethods.ApiVersion());
-        var bad = new CoreConfig(Path.Combine(_dir, "v"), "v", Platform.Windows, null, OsaurusSyncFfiMethods.LocalNetworkConfig(), 999);
+        Assert.Equal(2u, OsaurusSyncFfiMethods.ApiVersion());
+        var bad = new CoreConfig(Path.Combine(_dir, "v"), "v", Platform.Windows, null, OsaurusSyncFfiMethods.LocalNetworkConfig(), null, 999);
         var e = Assert.ThrowsAny<SyncException>(() => SyncCore.Open(bad, new MemoryKeyStore()));
         Assert.Equal(SyncErrorCode.IncompatibleVersion, SyncErrorCode.CodeOf(e));
 
@@ -118,7 +118,7 @@ public sealed class BindingTests : IDisposable
         aborted.Abort();
         Assert.Null(core.Message(aborted.MessageId()));
 
-        var legacy = core.ImportLegacyConversation("Old", 1_600_000_000_000, [new LegacyMessage(MessageRole.User, "from 2020", 1_600_000_000_000)]);
+        var legacy = core.ImportLegacyConversation(OsaurusSync.Legacy("Old", 1_600_000_000_000), [OsaurusSync.LegacyText("from 2020", 1_600_000_000_000)]);
         Assert.Equal(1_600_000_000_000ul, core.Messages(legacy, null, 10).Messages[0].TimestampMs);
 
         var notes = core.CreateConversation("Notes");
@@ -264,6 +264,132 @@ public sealed class BindingTests : IDisposable
         }
     }
 
+    private static byte[] Utf8(string s) => System.Text.Encoding.UTF8.GetBytes(s);
+
+    [Fact]
+    public async Task AppDataTagsAndLocalConversations()
+    {
+        using var core = Open("app");
+        var scope = core.CreateConversation("Chat");
+        core.SetConversationTags(scope, [new Tag("source", "chat")]);
+        core.SetConversationAppData(scope, "ai.osaurus.session/1", Utf8("{\"v\":1}"));
+
+        var file = Path.Combine(_dir, "result.json");
+        File.WriteAllText(file, "\"big\"");
+        var id = core.SendMessage(scope, OsaurusSync.Text("hi") with
+        {
+            AppData = [new AppDataWrite("ai.osaurus.turn/1", Utf8("{\"v\":1,\"id\":\"a\"}"), [new AttachmentFile(file, "application/json", "toolResults.c1")])],
+        });
+        var turn = core.Message(id)!.GetAppData("ai.osaurus.turn/1")!;
+        Assert.Equal(Utf8("{\"v\":1,\"id\":\"a\"}"), turn.Bytes);
+        Assert.Equal(Utf8("\"big\""), await core.ReadAttachment(scope, turn.Blobs[0].Hash));
+        core.SetMessageAppData(id, [new AppDataWrite("ai.osaurus.turn/1", Utf8("{\"v\":1,\"id\":\"b\"}"), [])]);
+        Assert.Empty(core.Message(id)!.GetAppData("ai.osaurus.turn/1")!.Blobs);
+
+        using var stream = core.OpenStream(scope, MessageRole.Assistant, null);
+        stream.Push("answer");
+        var streamed = stream.Finish(null, [new AppDataWrite("ai.osaurus.turn/1", Utf8("{\"v\":1}"), [])]);
+        Assert.NotNull(core.Message(streamed)!.GetAppData("ai.osaurus.turn/1"));
+
+        var conv = core.Conversation(scope)!;
+        Assert.Equal("chat", conv.GetTag("source"));
+        Assert.Equal(Utf8("{\"v\":1}"), conv.GetAppData("ai.osaurus.session/1"));
+        Assert.Equal(2u, conv.MessageCount);
+        Assert.Equal(Replication.Synced, conv.Replication);
+
+        var local = core.CreateConversation("Plugin run", Replication.DeviceLocal);
+        core.SetConversationTags(local, [new Tag("source", "plugin")]);
+        Assert.Equal([local], core.Conversations(new Dictionary<string, string> { ["source"] = "plugin" }).Select(c => c.Scope));
+        Assert.Equal([local], core.ConversationsFiltered(OsaurusSync.Filter(replication: Replication.DeviceLocal)).Select(c => c.Scope));
+        Assert.Single(core.ConversationsFiltered(OsaurusSync.Filter(hasTags: ["source"], limit: 1)));
+        core.SendMessage(local, OsaurusSync.Text("headless"));
+        Assert.Empty(core.SearchFiltered("headless", OsaurusSync.Filter(replication: Replication.Synced), 10));
+        core.PromoteToSynced(local);
+        Assert.Equal(Replication.Synced, core.Conversation(local)!.Replication);
+        var gone = core.CreateConversation("Scratch", Replication.DeviceLocal);
+        core.DeleteLocalConversation(gone);
+        Assert.Null(core.Conversation(gone));
+
+        await core.SignOut(true);
+        var e = Assert.ThrowsAny<SyncException>(() => core.Conversations());
+        Assert.Equal(SyncErrorCode.Closed, SyncErrorCode.CodeOf(e));
+    }
+
+    /// <summary>Imports the shared fixtures in tests/fixtures/app-data, as the Rust and Swift tests do.</summary>
+    [Fact]
+    public async Task AppDataFixtures()
+    {
+        var root = FixtureDir();
+        var names = Directory.GetFiles(root, "*.json").OrderBy(n => n, StringComparer.Ordinal).ToArray();
+        Assert.Equal(3, names.Length);
+        using var core = Open("fixtures");
+        var n = 0;
+        AttachmentFile[] Files(System.Text.Json.Nodes.JsonNode? list) =>
+            list is null ? [] : list.AsArray().Select(a =>
+            {
+                var name = (string)a!["name"]!;
+                var path = Path.Combine(_dir, $"{n++}-{name}");
+                File.WriteAllText(path, (string)a["text"]!);
+                return new AttachmentFile(path, (string)a["media_type"]!, name);
+            }).ToArray();
+        static byte[] Json(System.Text.Json.Nodes.JsonNode? v) => Utf8(v!.ToJsonString());
+        static bool Same(byte[] a, System.Text.Json.Nodes.JsonNode? b) =>
+            System.Text.Json.Nodes.JsonNode.DeepEquals(System.Text.Json.Nodes.JsonNode.Parse(a), b);
+        static MessageRole Role(string s) => s switch
+        {
+            "user" => MessageRole.User,
+            "assistant" => MessageRole.Assistant,
+            "system" => MessageRole.System,
+            "tool_call" => MessageRole.ToolCall,
+            "tool_result" => MessageRole.ToolResult,
+            _ => throw new ArgumentException(s),
+        };
+        foreach (var name in names)
+        {
+            var f = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(name))!;
+            var c = f["conversation"]!;
+            var tags = c["tags"]!.AsObject().Select(t => new Tag(t.Key, (string)t.Value!)).OrderBy(t => t.Key, StringComparer.Ordinal).ToArray();
+            var convData = c["app_data"]!.AsObject().Select(e => new AppDataEntry(e.Key, Json(e.Value))).ToArray();
+            var msgs = f["messages"]!.AsArray();
+            var legacy = msgs.Select(m => new LegacyMessage(
+                Role((string)m!["role"]!), (string)m["content"]!, (ulong)m["created_ms"]!,
+                Files(m["attachments"]), (string?)m["tool_call_id"], (string?)m["tool_name"],
+                m["app_data"]!.AsObject().Select(e => new AppDataWrite(e.Key, Json(e.Value), Files(m["app_data_blobs"]?[e.Key]))).ToArray())).ToArray();
+            var scope = core.ImportLegacyConversation(
+                new LegacyConversation((string)c["title"]!, (ulong)c["created_ms"]!, Replication.Synced, (bool)c["pinned"]!, (bool)c["archived"]!, tags, convData),
+                legacy);
+
+            var got = core.Conversation(scope)!;
+            Assert.Equal((string)c["title"]!, got.Title);
+            Assert.Equal(tags, got.Tags);
+            foreach (var (ns, v) in c["app_data"]!.AsObject()) Assert.True(Same(got.GetAppData(ns)!, v), $"{name} {ns}");
+            var page = core.Messages(scope, null, 100).Messages;
+            Assert.Equal(msgs.Count, page.Length);
+            for (var i = 0; i < page.Length; i++)
+            {
+                var (m, want) = (page[i], msgs[i]!);
+                Assert.Equal((string)want["content"]!, m.Content);
+                Assert.Equal((string?)want["tool_call_id"], m.ToolCallId);
+                var atts = want["attachments"]?.AsArray() ?? [];
+                for (var j = 0; j < atts.Count; j++)
+                    Assert.Equal(Utf8((string)atts[j]!["text"]!), await core.ReadAttachment(scope, m.Blobs[j].Hash));
+                foreach (var (ns, v) in want["app_data"]!.AsObject())
+                {
+                    var d = m.GetAppData(ns)!;
+                    Assert.True(Same(d.Bytes, v), $"{name} {ns}");
+                    var blobs = want["app_data_blobs"]?[ns]?.AsArray() ?? [];
+                    Assert.Equal(blobs.Count, d.Blobs.Length);
+                    for (var j = 0; j < blobs.Count; j++)
+                        Assert.Equal(Utf8((string)blobs[j]!["text"]!), await core.ReadAttachment(scope, d.Blobs[j].Hash));
+                }
+            }
+        }
+        await core.Close();
+    }
+
+    private static string FixtureDir([System.Runtime.CompilerServices.CallerFilePath] string here = "") =>
+        Path.GetFullPath(Path.Combine(Path.GetDirectoryName(here)!, "../../../tests/fixtures/app-data"));
+
     [Fact]
     public async Task DataManagement()
     {
@@ -317,7 +443,7 @@ public sealed class BindingTests : IDisposable
         Assert.Throws<SyncException.KeyStore>(() => store.Load("bad"));
 
         using var core = SyncCore.Open(
-            new CoreConfig(Path.Combine(_dir, "dpapi"), "dpapi", Platform.Windows, null, OsaurusSyncFfiMethods.LocalNetworkConfig() with { Enabled = false }, OsaurusSyncFfiMethods.ApiVersion()),
+            new CoreConfig(Path.Combine(_dir, "dpapi"), "dpapi", Platform.Windows, null, OsaurusSyncFfiMethods.LocalNetworkConfig() with { Enabled = false }, null, OsaurusSyncFfiMethods.ApiVersion()),
             store);
         Assert.NotNull(store.Load("device-key"));
     }

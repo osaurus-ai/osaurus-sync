@@ -32,7 +32,7 @@ loro = "1.17"
 postcard = { version = "1", features = ["alloc"] }
 rand_chacha = "0.9"
 rand_core = "0.9"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

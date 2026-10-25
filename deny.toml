@@ -54,7 +54,9 @@ wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
     # Everything uses rustls with ring; a second TLS stack would add attack surface.
-    { crate = "openssl-sys", reason = "use rustls" },
+    # SQLCipher on Windows and Linux uses OpenSSL's libcrypto for page encryption only (Apple
+    # platforms use CommonCrypto). Nothing else may depend on it.
+    { crate = "openssl-sys", wrappers = ["libsqlite3-sys"], reason = "use rustls" },
     { crate = "native-tls", reason = "use rustls" },
 ]
 

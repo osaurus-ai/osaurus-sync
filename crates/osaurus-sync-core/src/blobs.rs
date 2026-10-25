@@ -109,6 +109,11 @@ impl BlobStore {
         Ok(dst)
     }
 
+    /// Decrypts a stored blob into memory. Nothing is written to disk.
+    pub fn read_plain(&self, r: &BlobRef) -> Result<Vec<u8>> {
+        crypto::decrypt_blob_bytes(&r.key, &self.path(&r.hash))
+    }
+
     /// Opens a decrypted copy and keeps the plaintext cache under `cap` bytes.
     pub fn open_plain_capped(&self, r: &BlobRef, cap: u64) -> Result<PathBuf> {
         let dst = self.open_plain(r)?;

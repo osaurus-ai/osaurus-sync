@@ -7,17 +7,22 @@ use std::path::Path;
 use rusqlite::Connection;
 use serde_json::json;
 
-use super::{DEVICE_SECRET, Replica, USER_SECRET, USER_SECRET_NEXT};
+use super::{DEVICE_SECRET, Replica, USER_SECRET, USER_SECRET_NEXT, VIEW_KEY};
 use crate::error::{Error, Result};
 use crate::hlc;
 use crate::ids::{DeviceKey, Principal, Role, ScopeId};
 use crate::payload::{Control, MemberRemovePayload};
+use crate::store::replication;
 use crate::types::DeliveryStatus;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorageUsage {
     /// The SQLite database with its write-ahead log.
     pub database_bytes: u64,
+    /// Stored events of synced scopes, a share of `database_bytes`.
+    pub synced_event_bytes: u64,
+    /// Stored events of device-local scopes, a share of `database_bytes`.
+    pub local_event_bytes: u64,
     /// Encrypted attachments, including partial downloads.
     pub blob_bytes: u64,
     /// Decrypted copies of opened attachments. Evicted automatically past the configured cap.
@@ -30,6 +35,16 @@ pub struct ExportSummary {
     pub attachments: u32,
     /// Attachments not downloaded to this device, listed in the export without a file.
     pub missing_attachments: u32,
+}
+
+/// App data for an export: JSON as it is, anything else as hex.
+fn app_data_json<'a>(items: impl Iterator<Item = (&'a String, &'a Vec<u8>)>) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (ns, bytes) in items {
+        let v = serde_json::from_slice::<serde_json::Value>(bytes).unwrap_or_else(|_| json!({ "hex": hex::encode(bytes) }));
+        out.insert(ns.clone(), v);
+    }
+    serde_json::Value::Object(out)
 }
 
 impl Replica {
@@ -121,7 +136,20 @@ impl Replica {
         let dir = &self.cfg.data_dir;
         let database_bytes = ["sync.db", "sync.db-wal", "sync.db-shm"].iter().filter_map(|f| fs::metadata(dir.join(f)).ok()).map(|m| m.len()).sum();
         let (blobs, cache) = self.blobs.usage();
-        Ok(StorageUsage { database_bytes, blob_bytes: blobs, attachment_cache_bytes: cache })
+        let (synced, local): (i64, i64) = self.db.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN s.replication = ?1 THEN 0 ELSE length(e.bytes) END), 0),
+                    COALESCE(SUM(CASE WHEN s.replication = ?1 THEN length(e.bytes) ELSE 0 END), 0)
+             FROM events e JOIN scopes s ON s.scope = e.scope",
+            [replication::DEVICE_LOCAL],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(StorageUsage {
+            database_bytes,
+            synced_event_bytes: synced as u64,
+            local_event_bytes: local as u64,
+            blob_bytes: blobs,
+            attachment_cache_bytes: cache,
+        })
     }
 
     /// Writes a scope to `dir` as `conversation.json`, with its attachments under
@@ -175,6 +203,7 @@ impl Replica {
                 "status": status,
                 "reactions": m.reactions.iter().map(|r| json!({ "reaction": r.reaction, "count": r.count })).collect::<Vec<_>>(),
                 "attachments": attachments,
+                "app_data": app_data_json(m.app_data.iter().map(|a| (&a.namespace, &a.bytes))),
             }));
             summary.messages += 1;
         }
@@ -189,6 +218,8 @@ impl Replica {
             "archived": c.archived,
             "members": c.members.iter().map(|m| json!({ "principal": m.principal.to_hex(), "role": format!("{:?}", m.role).to_lowercase() })).collect::<Vec<_>>(),
             "complete": !page.at_sync_boundary && self.compacted_events(scope)? == 0,
+            "tags": c.tags.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<String, serde_json::Value>>(),
+            "app_data": app_data_json(c.app_data.iter().map(|(n, b)| (n, b))),
             "messages": messages,
         });
         fs::write(dir.join("conversation.json"), serde_json::to_vec_pretty(&doc).map_err(|e| Error::Internal(e.to_string()))?)?;
@@ -197,7 +228,33 @@ impl Replica {
 
     /// Key store entries a replica may create.
     pub fn secret_names() -> &'static [&'static str] {
-        &[DEVICE_SECRET, USER_SECRET, USER_SECRET_NEXT]
+        &[DEVICE_SECRET, USER_SECRET, USER_SECRET_NEXT, VIEW_KEY]
+    }
+
+    /// Signs out of the current identity but keeps this device's conversations. The user
+    /// identity is replaced (as when a device is stolen), this user's other devices are revoked
+    /// here, and every conversation this device owned becomes device-local under the new
+    /// identity. Conversations owned by others are left. The other devices keep their own
+    /// copies; pairing again shares the conversations that are synced from then on.
+    pub fn sign_out_keeping_data(&mut self) -> Result<()> {
+        if self.is_self_revoked() {
+            return Err(Error::DeviceRevoked);
+        }
+        let others: Vec<DeviceKey> = self.my_other_devices()?.into_iter().map(|c| c.device).collect();
+        let report = self.rotate_identity(&others)?;
+        self.tx(|r| {
+            for scope in &report.rotated {
+                r.db.execute("UPDATE scopes SET replication = ? WHERE scope = ?", rusqlite::params![replication::DEVICE_LOCAL, &scope.0[..]])?;
+                r.db.execute("DELETE FROM outbox WHERE scope = ?", [&scope.0[..]])?;
+                r.refresh_conversation(*scope)?;
+            }
+            r.db.execute_batch("DELETE FROM peers; DELETE FROM storage_peers;")?;
+            Ok(())
+        })?;
+        for scope in report.left {
+            self.purge_scope(scope)?;
+        }
+        Ok(())
     }
 
     /// Signs this device out for good: deletes its key store entries and its data directory.
@@ -213,15 +270,17 @@ impl Replica {
             self.secrets.delete(name)?;
         }
         let dir = self.cfg.data_dir.clone();
-        for f in ["sync.db", "sync.db-wal", "sync.db-shm", super::UNCLEAN, ".lock"] {
+        for f in ["sync.db", "sync.db-wal", "sync.db-shm", super::VIEW_KEY_SEALED, super::UNCLEAN, ".lock"] {
             match fs::remove_file(dir.join(f)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
                 _ => {}
             }
         }
-        match fs::remove_dir_all(dir.join("blobs")) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
+        for d in ["blobs", super::LOCKED_DIR] {
+            match fs::remove_dir_all(dir.join(d)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
         }
         // Remove the directory itself if nothing else lives there.
         let _ = fs::remove_dir(&dir);

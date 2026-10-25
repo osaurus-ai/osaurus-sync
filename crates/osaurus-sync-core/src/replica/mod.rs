@@ -102,6 +102,15 @@ pub const DEVICE_SECRET: &str = "device-key";
 pub const USER_SECRET: &str = "user-secret";
 /// A rotated user secret, written before the rotation commits and promoted after.
 pub const USER_SECRET_NEXT: &str = "user-secret-next";
+/// The key `sync.db` is encrypted with.
+pub const VIEW_KEY: &str = "view-key";
+/// The view key sealed to the user's recovery key, so a backup restored without the key
+/// store opens with the recovery phrase. Holds the recipient key, then the sealed box.
+const VIEW_KEY_SEALED: &str = "view-key.sealed";
+/// A database whose key isn't in the key store waits here for the recovery phrase.
+const LOCKED_DIR: &str = "locked";
+/// Default cap on one app data write.
+pub const MAX_APP_DATA_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ReplicaConfig {
@@ -123,6 +132,10 @@ pub struct ReplicaConfig {
     /// Limits on events waiting for their control parents, per scope and per sending peer.
     pub held_max_events: usize,
     pub held_max_bytes: usize,
+    /// Largest app data this device writes in one namespace of one message or conversation.
+    /// Larger payloads belong in app data blobs. Received app data is bounded only by the
+    /// event size limit.
+    pub max_app_data_bytes: usize,
 }
 
 impl ReplicaConfig {
@@ -139,6 +152,7 @@ impl ReplicaConfig {
             plain_cache_bytes: 512 << 20,
             held_max_events: sync::HELD_MAX_EVENTS,
             held_max_bytes: sync::HELD_MAX_BYTES,
+            max_app_data_bytes: MAX_APP_DATA_BYTES,
         }
     }
 
@@ -194,6 +208,7 @@ pub struct Replica {
     pub(crate) keys: HashMap<ScopeId, ScopeKeys>,
     /// Keys known from outside the log (a point-in-time view borrows the live replica's keys).
     pub(crate) seeded_keys: HashMap<ScopeId, ScopeKeys>,
+    pub(crate) db_key: store::DbKey,
     pub(crate) loro: LoroCache,
     pub(crate) blobs: BlobStore,
     /// Number of keys per scope when recovery grants were last checked.
@@ -221,6 +236,13 @@ pub(crate) enum Accepted {
     Duplicate,
 }
 
+/// Names a database key without revealing it.
+fn view_key_id(key: &store::DbKey) -> [u8; 32] {
+    let mut b = b"osaurus-sync view key id".to_vec();
+    b.extend(key.0);
+    crypto::hash(&b)
+}
+
 impl Replica {
     /// Opens (or creates) the replica in `cfg.data_dir`. Only one instance may hold a data
     /// directory: two would share a Loro peer id and corrupt state.
@@ -241,10 +263,11 @@ impl Replica {
             }
         };
 
-        let mut db = store::open(Some(&db_path))?;
+        let db_key = Self::prepare_db_key(&cfg, secrets.as_ref(), env.as_ref(), &db_path)?;
+        let mut db = store::open(Some(&db_path), Some(&db_key))?;
         let unclean = cfg.data_dir.join(UNCLEAN);
         if unclean.exists() {
-            db = store::check_and_repair(db, &db_path)?;
+            db = store::check_and_repair(db, &db_path, &db_key)?;
         }
         File::create(&unclean)?;
         let initialized: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')", [], |r| r.get(0))?;
@@ -298,6 +321,8 @@ impl Replica {
         };
         let max_hlc: i64 = db.query_row("SELECT COALESCE(MAX(hlc), 0) FROM events", [], |r| r.get(0))?;
         let blobs = BlobStore::new(cfg.data_dir.join("blobs"))?;
+        // Decrypted attachment copies don't outlive a session.
+        blobs.evict_plain(0, None);
 
         let mut r = Replica {
             db,
@@ -311,6 +336,8 @@ impl Replica {
             auth: HashMap::new(),
             keys: HashMap::new(),
             seeded_keys: HashMap::new(),
+            checkpointer: Checkpointer::new(db_path, db_key.clone()),
+            db_key,
             loro: LoroCache::new(peer_id),
             blobs,
             recovery_checked: HashMap::new(),
@@ -319,7 +346,6 @@ impl Replica {
             pending_changes: Vec::new(),
             new_events: Vec::new(),
             pending_events: Vec::new(),
-            checkpointer: Checkpointer::new(db_path),
             self_revoked: false,
             unclean_marked: true,
             leaving: true,
@@ -336,12 +362,195 @@ impl Replica {
                 r.refresh_conversation(scope)?;
             }
         }
+        // A backup restored with its user secret but not its view key.
+        let user = r.user.clone();
+        r.unlock_with(&user)?;
         match r.restored_user()? {
             Some(u) if u == r.user_key() => r.finish_recovery()?,
             Some(_) => r.changes.push(Change::RecoveryAvailable),
+            None if r.locked_dir().is_some() => r.changes.push(Change::RecoveryAvailable),
             None => {}
         }
+        r.seal_view_key()?;
         Ok(r)
+    }
+
+    /// Loads the database key, or creates one. A database from before encryption at rest is
+    /// encrypted in place. One the key doesn't open (a backup restored without the key store)
+    /// moves to `locked/` until the recovery phrase unlocks it, and a new database starts.
+    fn prepare_db_key(cfg: &ReplicaConfig, secrets: &dyn SecretStore, env: &dyn Env, db_path: &std::path::Path) -> Result<store::DbKey> {
+        let (key, new) = match secrets.load(VIEW_KEY)? {
+            Some(b) => (store::DbKey(b.try_into().map_err(|_| Error::Crypto("bad view key".into()))?), false),
+            None => {
+                let k = store::DbKey(crate::env::random_array(env));
+                secrets.store(VIEW_KEY, &k.0)?;
+                (k, true)
+            }
+        };
+        if !db_path.exists() {
+            return Ok(key);
+        }
+        if store::is_plaintext(db_path) {
+            store::encrypt_in_place(db_path, &key)?;
+            return Ok(key);
+        }
+        match store::open(Some(db_path), Some(&key)) {
+            Ok(_) => Ok(key),
+            // SQLCipher can't tell a wrong key from a damaged file. The sealed key file names
+            // the key the database was written with: if that's ours, the file is damaged.
+            // Otherwise (or when this device had no key yet) it came from somewhere else.
+            Err(Error::Crypto(e)) if !new && Self::sealed_key_id(&cfg.data_dir).is_none_or(|id| id == view_key_id(&key)) => Err(Error::Corrupt(e)),
+            Err(Error::Crypto(_)) => {
+                let dir = cfg.data_dir.join(LOCKED_DIR);
+                if dir.join("sync.db").exists() {
+                    // An earlier locked database is still waiting; keep that one.
+                    std::fs::remove_file(db_path)?;
+                } else {
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::rename(db_path, dir.join("sync.db"))?;
+                    let sealed = cfg.data_dir.join(VIEW_KEY_SEALED);
+                    if sealed.exists() {
+                        std::fs::rename(&sealed, dir.join(VIEW_KEY_SEALED))?;
+                    }
+                }
+                for suffix in ["-wal", "-shm"] {
+                    let side = store::sidecar(db_path, suffix);
+                    if side.exists() {
+                        let _ = std::fs::rename(&side, store::sidecar(&dir.join("sync.db"), suffix));
+                    }
+                }
+                tracing::warn!("database key missing; the restored database waits for the recovery phrase");
+                Ok(key)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The id of the key in `dir`'s sealed key file, if there is one.
+    fn sealed_key_id(dir: &std::path::Path) -> Option<[u8; 32]> {
+        std::fs::read(dir.join(VIEW_KEY_SEALED)).ok()?.get(32..64)?.try_into().ok()
+    }
+
+    fn locked_dir(&self) -> Option<PathBuf> {
+        let dir = self.cfg.data_dir.join(LOCKED_DIR);
+        dir.join("sync.db").exists().then_some(dir)
+    }
+
+    /// Keeps `view-key.sealed` sealed to the current user's recovery key. The file is the
+    /// recovery public key, the key's id, then the sealed key.
+    pub(crate) fn seal_view_key(&self) -> Result<()> {
+        let path = self.cfg.data_dir.join(VIEW_KEY_SEALED);
+        let recipient = self.user.recovery_public();
+        let mut out = recipient.0.to_vec();
+        out.extend(view_key_id(&self.db_key));
+        if std::fs::read(&path).is_ok_and(|b| b.get(..64) == Some(&out[..])) {
+            return Ok(());
+        }
+        out.extend(crypto::seal_to_device(self.env.as_ref(), &recipient.0, &self.db_key.0)?);
+        let tmp = path.with_extension("sealed.tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    /// Unlocks a database waiting in `locked/` if it was sealed to `user`'s recovery key: it
+    /// becomes this device's database and what was written here since is carried over.
+    /// Returns whether it did.
+    pub(crate) fn unlock_with(&mut self, user: &UserSecret) -> Result<bool> {
+        let Some(dir) = self.locked_dir() else { return Ok(false) };
+        let Some(key) = Self::unseal_locked(&dir, user) else { return Ok(false) };
+        self.adopt_locked(&dir, key)?;
+        Ok(true)
+    }
+
+    fn unseal_locked(dir: &std::path::Path, user: &UserSecret) -> Option<store::DbKey> {
+        let b = std::fs::read(dir.join(VIEW_KEY_SEALED)).ok()?;
+        if b.get(..32)? != user.recovery_public().0 {
+            return None;
+        }
+        let k = crypto::unseal(user.recovery_key(), b.get(64..)?).ok()?;
+        Some(store::DbKey(k.try_into().ok()?))
+    }
+
+    /// Swaps in the locked database, re-encrypted under this device's key, and replays this
+    /// device's own events into it.
+    fn adopt_locked(&mut self, dir: &std::path::Path, key: store::DbKey) -> Result<()> {
+        let db_path = self.cfg.data_dir.join("sync.db");
+        let locked = dir.join("sync.db");
+        let interim_scopes = self.scope_ids()?;
+        let interim: Vec<Vec<u8>> = {
+            let mut stmt = self.db.prepare("SELECT bytes FROM events ORDER BY seq")?;
+            stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+        };
+        let staged = self.cfg.data_dir.join("sync.db.unlocking");
+        let _ = std::fs::remove_file(&staged);
+        {
+            let c = store::open(Some(&locked), Some(&key))?;
+            c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            c.execute("ATTACH DATABASE ?1 AS unlocked KEY ?2", params![staged.to_string_lossy(), format!("x'{}'", hex::encode(self.db_key.0))])?;
+            c.query_row("SELECT sqlcipher_export('unlocked')", [], |_| Ok(()))?;
+            c.execute_batch("DETACH DATABASE unlocked;")?;
+        }
+        self.checkpointer.reopen();
+        self.db = Connection::open_in_memory()?;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(store::sidecar(&db_path, suffix));
+        }
+        std::fs::rename(&staged, &db_path)?;
+
+        let db = store::open(Some(&db_path), Some(&self.db_key))?;
+        if let Some(c) = store::meta(&db, "device_cert")?.and_then(|b| payload::decode::<DeviceCert>(&b).ok())
+            && c.device != self.device_key()
+        {
+            store::set_meta(&db, "restored_user", &c.user.0)?;
+        }
+        db.execute_batch(
+            "DELETE FROM meta WHERE key IN ('device_cert', 'loro_peer', 'self_revoked');
+             DELETE FROM outbox; DELETE FROM peers; DELETE FROM storage_peers;",
+        )?;
+        let rebuild = store::migrate(&db)?;
+        store::set_meta(&db, "device_pub", &self.device.public().0)?;
+        store::set_meta(&db, "device_cert", &payload::encode(&self.cert))?;
+        store::set_meta(&db, "loro_peer", &self.loro.peer_id().to_le_bytes())?;
+        let max_hlc: i64 = db.query_row("SELECT COALESCE(MAX(hlc), 0) FROM events", [], |r| r.get(0))?;
+        self.db = db;
+        self.clock.observe(max_hlc as u64, self.env.now_ms());
+        self.discard_caches();
+        self.seeded_keys.clear();
+        self.upsert_known_device(&self.cert.clone())?;
+        if rebuild {
+            self.rebuild_all_views()?;
+        }
+        self.tx(|r| {
+            for s in &interim_scopes {
+                r.join_scope(*s)?;
+            }
+            for b in interim {
+                if let Ok(Decoded::Known(e)) = Envelope::decode(&b) {
+                    r.accept(e)?;
+                }
+            }
+            Ok(())
+        })?;
+        for scope in self.scope_ids()? {
+            self.refresh_conversation(scope)?;
+        }
+        std::fs::remove_dir_all(dir)?;
+        self.changes.push(Change::IdentityChanged);
+        Ok(())
+    }
+
+    /// Whether the scope never leaves this device.
+    pub fn is_device_local(&self, scope: ScopeId) -> Result<bool> {
+        let r: Option<i64> = self.db.query_row("SELECT replication FROM scopes WHERE scope = ?", [&scope.0[..]], |r| r.get(0)).optional()?;
+        Ok(r == Some(store::replication::DEVICE_LOCAL))
+    }
+
+    /// Scopes that sync with other devices.
+    pub fn synced_scope_ids(&self) -> Result<Vec<ScopeId>> {
+        let mut stmt = self.db.prepare_cached("SELECT scope FROM scopes WHERE replication = ? ORDER BY scope")?;
+        let rows: Vec<Vec<u8>> = stmt.query_map([store::replication::SYNCED], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        Ok(rows.into_iter().filter_map(|b| ScopeId::from_slice(&b)).collect())
     }
 
     /// The user a restored database belonged to, until this device takes on that identity.
@@ -352,7 +561,7 @@ impl Replica {
     /// Whether this device holds a restored database for another identity, so entering that
     /// identity's recovery phrase would unlock its history.
     pub fn recovery_available(&self) -> Result<bool> {
-        Ok(self.restored_user()?.is_some_and(|u| u != self.user_key()))
+        Ok(self.restored_user()?.is_some_and(|u| u != self.user_key()) || self.locked_dir().is_some())
     }
 
     fn load_or_issue_cert(db: &Connection, cfg: &ReplicaConfig, user: &UserSecret, device: &DeviceSecret, env: &dyn Env) -> Result<DeviceCert> {
@@ -493,6 +702,8 @@ impl Replica {
     pub fn close(&mut self) -> Result<()> {
         self.checkpointer.close();
         self.flush()?;
+        // Decrypted copies of opened attachments don't outlive the session.
+        self.blobs.evict_plain(0, None);
         self._lock = None;
         Ok(())
     }
@@ -593,6 +804,9 @@ impl Replica {
                 "tombstones",
                 "reactions",
                 "reaction_removed",
+                "app_data_view",
+                "app_data_events",
+                "conversation_tags",
                 "conversations_view",
                 "pending_decrypt",
                 "scopes",
@@ -847,6 +1061,9 @@ impl Replica {
     }
 
     pub(crate) fn has_other_devices(&mut self, scope: ScopeId) -> Result<bool> {
+        if self.is_device_local(scope)? {
+            return Ok(false);
+        }
         let me = self.device_key();
         let st = self.auth_mut(scope)?.full_state();
         Ok(st.certs.keys().any(|d| *d != me && !st.revoked.contains(d)))

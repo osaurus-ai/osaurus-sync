@@ -48,6 +48,7 @@ fn config(dir: &std::path::Path, name: &str) -> CoreConfig {
         platform: Platform::MacOs,
         history: None,
         network: NetworkConfig { enabled: true, ..local_network_config() },
+        max_app_data_bytes: None,
         api_version: api_version(),
     }
 }
@@ -67,7 +68,7 @@ fn logs_reach_the_listener_and_the_support_bundle_is_redacted() {
     let dir = tempfile::tempdir().unwrap();
     let mac = SyncCore::open(config(dir.path(), "Alice's Mac"), Box::new(Keys::default())).unwrap();
     let pc = SyncCore::open(config(dir.path(), "Alice's PC"), Box::new(Keys::default())).unwrap();
-    let scope = mac.create_conversation("Medical notes".into()).unwrap();
+    let scope = mac.create_conversation("Medical notes".into(), Replication::Synced).unwrap();
     mac.send_message(
         scope.clone(),
         OutgoingMessage {
@@ -78,6 +79,7 @@ fn logs_reach_the_listener_and_the_support_bundle_is_redacted() {
             as_agent: None,
             tool_call_id: None,
             tool_name: None,
+            app_data: vec![],
         },
     )
     .unwrap();

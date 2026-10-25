@@ -21,8 +21,9 @@ impl Replica {
             Some(Control::Genesis(g)) => {
                 self.upsert_known_device(&g.owner_device)?;
                 self.db.execute(
-                    "INSERT OR IGNORE INTO conversations_view(scope, kind, created_hlc) VALUES (?, ?, ?)",
-                    params![&scope.0[..], g.scope_kind as i64, e.hlc as i64],
+                    "INSERT INTO conversations_view(scope, kind, created_hlc, created_ms) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(scope) DO UPDATE SET kind = ?2, created_hlc = ?3, created_ms = ?4",
+                    params![&scope.0[..], g.scope_kind as i64, e.hlc as i64, g.created_ms as i64],
                 )?;
                 self.refresh_conversation(scope)?;
             }
@@ -174,8 +175,79 @@ impl Replica {
                 self.apply_loro(e.scope, &p)?;
                 self.refresh_conversation(e.scope)?;
             }
+            Content::AppData(p) => self.apply_app_data(e, hash, principal, p)?,
         }
         Ok(())
+    }
+
+    /// Keeps the latest write per (target, namespace, writer) by (HLC, author device). Only the
+    /// target author's writes are read. Superseded writes lose their blobs right away and their
+    /// payloads at compaction.
+    fn apply_app_data(&mut self, e: &Envelope, hash: EventHash, principal: Principal, p: payload::AppDataPayload) -> Result<()> {
+        if self.tombstoned(&p.target)? {
+            self.purge_event(&hash)?;
+            self.delete_unreferenced_blobs(&p.blobs)?;
+            return Ok(());
+        }
+        self.db
+            .execute("INSERT OR IGNORE INTO app_data_events(hash, target, scope) VALUES (?, ?, ?)", params![&hash.0[..], &p.target.0[..], &e.scope.0[..]])?;
+        let ph = principal.to_hex();
+        let cur: Option<(i64, Vec<u8>, Vec<u8>)> = self
+            .db
+            .query_row(
+                "SELECT hlc, author_device, blobs FROM app_data_view WHERE target = ? AND namespace = ? AND principal = ?",
+                params![&p.target.0[..], p.namespace, ph],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((hlc, author, _)) = &cur
+            && (*hlc, &author[..]) >= (e.hlc as i64, &e.author.0[..])
+        {
+            self.delete_unreferenced_blobs(&p.blobs)?;
+            return Ok(());
+        }
+        self.db.execute(
+            "INSERT OR REPLACE INTO app_data_view(target, namespace, principal, scope, hash, hlc, author_device, bytes, blobs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![&p.target.0[..], p.namespace, ph, &e.scope.0[..], &hash.0[..], e.hlc as i64, &e.author.0[..], p.bytes, payload::encode(&p.blobs)],
+        )?;
+        for b in &p.blobs {
+            self.db.execute(
+                "INSERT OR IGNORE INTO blobs(hash, size, media_type, available) VALUES (?, ?, ?, ?)",
+                params![&b.hash[..], b.size as i64, b.media_type, self.blobs.has(&b.hash) as i64],
+            )?;
+            self.db.execute("INSERT OR IGNORE INTO blob_refs(hash, scope, event) VALUES (?, ?, ?)", params![&b.hash[..], &e.scope.0[..], &p.target.0[..]])?;
+        }
+        if let Some((_, _, old)) = cur
+            && let Ok(old) = payload::decode::<Vec<BlobRef>>(&old)
+        {
+            self.delete_unreferenced_blobs(&old)?;
+        }
+        self.emit_message_changed(&p.target)?;
+        Ok(())
+    }
+
+    /// Deletes blobs no message or app data row still lists.
+    fn delete_unreferenced_blobs(&mut self, refs: &[BlobRef]) -> Result<()> {
+        let mut gone = Vec::new();
+        for b in refs {
+            if !self.blob_listed(&b.hash)? {
+                self.db.execute("DELETE FROM blob_refs WHERE hash = ?", [&b.hash[..]])?;
+                gone.push(b.clone());
+            }
+        }
+        self.delete_blobs(&gone)
+    }
+
+    fn blob_listed(&self, hash: &[u8; 32]) -> Result<bool> {
+        let lists: Vec<Vec<u8>> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT m.blobs FROM blob_refs b JOIN messages_view m ON m.id = b.event WHERE b.hash = ?1
+                 UNION ALL SELECT a.blobs FROM blob_refs b JOIN app_data_view a ON a.target = b.event WHERE b.hash = ?1",
+            )?;
+            stmt.query_map([&hash[..]], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+        };
+        Ok(lists.iter().any(|l| payload::decode::<Vec<BlobRef>>(l).is_ok_and(|v| v.iter().any(|b| b.hash == *hash))))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -354,6 +426,27 @@ impl Replica {
         }
         self.db.execute("DELETE FROM edits WHERE target = ?", [&target.0[..]])?;
         self.db.execute("DELETE FROM reactions WHERE target = ?", [&target.0[..]])?;
+        let blobs: Vec<Vec<u8>> = {
+            let mut stmt = self.db.prepare_cached("SELECT blobs FROM app_data_view WHERE target = ?")?;
+            stmt.query_map([&target.0[..]], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+        };
+        for b in blobs {
+            if let Ok(refs) = payload::decode::<Vec<BlobRef>>(&b) {
+                self.delete_blobs(&refs)?;
+            }
+        }
+        // Every write, superseded ones included.
+        let writes: Vec<Vec<u8>> = {
+            let mut stmt = self.db.prepare_cached("SELECT hash FROM app_data_events WHERE target = ?")?;
+            stmt.query_map([&target.0[..]], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+        };
+        for h in writes {
+            if let Some(h) = EventHash::from_slice(&h) {
+                self.purge_event(&h)?;
+            }
+        }
+        self.db.execute("DELETE FROM app_data_view WHERE target = ?", [&target.0[..]])?;
+        self.db.execute("DELETE FROM app_data_events WHERE target = ?", [&target.0[..]])?;
         Ok(())
     }
 
@@ -401,7 +494,18 @@ impl Replica {
     pub(crate) fn rebuild_scope_views(&mut self, scope: ScopeId) -> Result<()> {
         let s = &scope.0[..];
         self.db.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT rowid FROM messages_view WHERE scope = ?)", [s])?;
-        for t in ["messages_view", "edits", "tombstones", "reactions", "reaction_removed", "pending_decrypt", "loro_snapshots"] {
+        for t in [
+            "messages_view",
+            "edits",
+            "tombstones",
+            "reactions",
+            "reaction_removed",
+            "app_data_view",
+            "app_data_events",
+            "conversation_tags",
+            "pending_decrypt",
+            "loro_snapshots",
+        ] {
             self.db.execute(&format!("DELETE FROM {t} WHERE scope = ?"), [s])?;
         }
         self.loro.remove(&scope);
@@ -455,6 +559,7 @@ impl Replica {
             stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
         };
         self.tx(|r| {
+            r.requalify_unsupported()?;
             for s in scopes {
                 if let Some(scope) = ScopeId::from_slice(&s) {
                     r.rebuild_scope_views(scope)?;
@@ -463,6 +568,28 @@ impl Replica {
             Ok(())
         })?;
         self.take_changes();
+        Ok(())
+    }
+
+    /// Content events stored as unsupported by an older release whose kind this release
+    /// knows: validates them so the rebuild applies them.
+    fn requalify_unsupported(&mut self) -> Result<()> {
+        let rows: Vec<Vec<u8>> = {
+            let mut stmt = self.db.prepare("SELECT bytes FROM events WHERE status = ? AND control = 0 AND kind != 0")?;
+            stmt.query_map([status::UNSUPPORTED], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+        };
+        for b in rows {
+            let Ok(Decoded::Known(e)) = Envelope::decode(&b) else { continue };
+            if !kind::is_known(e.kind) || kind::is_control(e.kind) {
+                continue;
+            }
+            let (v, _) = self.auth_mut(e.scope)?.validate_content(e.author, e.hlc, &e.control_parents, e.epoch);
+            let (s, reason) = match v {
+                Verdict::Valid => (status::VALID, None),
+                Verdict::Rejected(r) => (status::REJECTED, Some(r.code())),
+            };
+            self.db.execute("UPDATE events SET status = ?, reason = ? WHERE hash = ?", params![s, reason, &e.hash().0[..]])?;
+        }
         Ok(())
     }
 
@@ -481,9 +608,22 @@ impl Replica {
         let members: Vec<(String, i64)> = st.members.iter().map(|(p, r)| (p.to_hex(), *r as i64)).collect();
         let my_role = st.max_role(&self.device_key()).or_else(|| st.members.get(&self.me()).copied());
         self.db.execute(
-            "UPDATE conversations_view SET title = ?, pinned = ?, sort_order = ?, archived = ?, my_role = ?, members = ? WHERE scope = ?",
-            params![meta.title, meta.pinned as i64, meta.sort_order, meta.archived as i64, my_role.map(|r| r as i64), payload::encode(&members), &scope.0[..]],
+            "UPDATE conversations_view SET title = ?, pinned = ?, sort_order = ?, archived = ?, my_role = ?, members = ?, app_data = ? WHERE scope = ?",
+            params![
+                meta.title,
+                meta.pinned as i64,
+                meta.sort_order,
+                meta.archived as i64,
+                my_role.map(|r| r as i64),
+                payload::encode(&members),
+                payload::encode(&meta.app_data),
+                &scope.0[..]
+            ],
         )?;
+        self.db.execute("DELETE FROM conversation_tags WHERE scope = ?", [&scope.0[..]])?;
+        for (k, v) in &meta.tags {
+            self.db.execute("INSERT INTO conversation_tags(scope, key, value) VALUES (?, ?, ?)", params![&scope.0[..], k, v])?;
+        }
         match self.conversation(scope)? {
             Some(c) if c.my_role.is_some() => self.emit(Change::ConversationChanged(c)),
             Some(_) => self.emit(Change::ConversationRemoved(scope)),

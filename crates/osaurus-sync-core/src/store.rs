@@ -11,7 +11,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{Error, Result};
 
 pub const STORE_VERSION: i64 = 1 + MIGRATIONS.len() as i64;
-pub const VIEW_VERSION: i64 = 1;
+pub const VIEW_VERSION: i64 = 2;
+
+/// `scopes.replication`.
+pub mod replication {
+    pub const SYNCED: i64 = 0;
+    /// Never offered to another device; its key is sealed only to this device and the recovery key.
+    pub const DEVICE_LOCAL: i64 = 1;
+}
 
 pub mod status {
     pub const VALID: i64 = 0;
@@ -179,6 +186,8 @@ const MIGRATIONS: &[&str] = &[
     "CREATE TABLE left_scopes (scope BLOB PRIMARY KEY, left_ms INTEGER NOT NULL);",
     // 3: the only user an issued invite admits, when it was created for one.
     "ALTER TABLE invites_issued ADD COLUMN for_user BLOB;",
+    // 4: device-local scopes.
+    "ALTER TABLE scopes ADD COLUMN replication INTEGER NOT NULL DEFAULT 0;",
 ];
 
 const VIEW_SCHEMA: &str = r#"
@@ -248,9 +257,40 @@ CREATE TABLE IF NOT EXISTS conversations_view (
     sort_order REAL,
     archived INTEGER NOT NULL DEFAULT 0,
     created_hlc INTEGER NOT NULL DEFAULT 0,
+    created_ms INTEGER NOT NULL DEFAULT 0,
     my_role INTEGER,
-    members BLOB
+    members BLOB,
+    app_data BLOB
 );
+
+CREATE TABLE IF NOT EXISTS conversation_tags (
+    scope BLOB NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (scope, key)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS conversation_tags_value ON conversation_tags(key, value);
+
+CREATE TABLE IF NOT EXISTS app_data_view (
+    target BLOB NOT NULL,
+    namespace TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    scope BLOB NOT NULL,
+    hash BLOB NOT NULL,
+    hlc INTEGER NOT NULL,
+    author_device BLOB NOT NULL,
+    bytes BLOB NOT NULL,
+    blobs BLOB NOT NULL,
+    PRIMARY KEY (target, namespace, principal)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS app_data_scope ON app_data_view(scope);
+CREATE TABLE IF NOT EXISTS app_data_events (
+    hash BLOB PRIMARY KEY,
+    target BLOB NOT NULL,
+    scope BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS app_data_events_target ON app_data_events(target);
+CREATE INDEX IF NOT EXISTS app_data_events_scope ON app_data_events(scope);
 
 CREATE TABLE IF NOT EXISTS pending_decrypt (
     hash BLOB PRIMARY KEY,
@@ -259,19 +299,112 @@ CREATE TABLE IF NOT EXISTS pending_decrypt (
 );
 "#;
 
-const VIEW_TABLES: &[&str] =
-    &["messages_view", "messages_fts", "edits", "tombstones", "reactions", "reaction_removed", "conversations_view", "pending_decrypt"];
+const VIEW_TABLES: &[&str] = &[
+    "messages_view",
+    "messages_fts",
+    "edits",
+    "tombstones",
+    "reactions",
+    "reaction_removed",
+    "conversations_view",
+    "conversation_tags",
+    "app_data_view",
+    "app_data_events",
+    "pending_decrypt",
+];
 
-pub fn open(path: Option<&std::path::Path>) -> Result<Connection> {
+/// The key a database file is encrypted with (SQLCipher, raw 256-bit key).
+#[derive(Clone)]
+pub struct DbKey(pub [u8; 32]);
+
+impl std::fmt::Debug for DbKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DbKey(..)")
+    }
+}
+
+impl DbKey {
+    fn pragma(&self) -> String {
+        let hex: String = self.0.iter().map(|b| format!("{b:02x}")).collect();
+        format!("\"x'{hex}'\"")
+    }
+}
+
+/// Opens a database. With a key, the file is encrypted at rest and every page is authenticated:
+/// a wrong key fails here with `Crypto` rather than on first use.
+pub fn open(path: Option<&std::path::Path>, key: Option<&DbKey>) -> Result<Connection> {
     let conn = match path {
         Some(p) => Connection::open(p)?,
         None => Connection::open_in_memory()?,
     };
+    if let Some(k) = key {
+        apply_key(&conn, k)?;
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(conn)
+}
+
+/// Keys a fresh connection and checks the key against the file.
+pub fn apply_key(conn: &Connection, key: &DbKey) -> Result<()> {
+    conn.execute_batch(&format!("PRAGMA key = {};", key.pragma()))?;
+    match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::NotADatabase => {
+            Err(Error::Crypto("the database key doesn't match this database".into()))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Whether `path` holds an unencrypted SQLite database (one from before encryption at rest).
+pub fn is_plaintext(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head == b"SQLite format 3\0"
+}
+
+/// Encrypts an unencrypted database in place. The encrypted copy is written next to it and
+/// renamed over it, so an interruption leaves the plaintext original intact.
+pub fn encrypt_in_place(path: &std::path::Path, key: &DbKey) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+    export_over(conn, path, "db.encrypting", key)
+}
+
+/// Copies the tables in `conn`'s schema into a fresh file keyed with `key`, then renames it
+/// over `path`. Pages no table reaches are never read.
+fn export_over(conn: Connection, path: &std::path::Path, ext: &str, key: &DbKey) -> Result<()> {
+    let tmp = path.with_extension(ext);
+    let _ = std::fs::remove_file(&tmp);
+    conn.execute("ATTACH DATABASE ?1 AS fresh KEY ?2", params![tmp.to_string_lossy(), format!("x'{}'", hex_of(&key.0))])?;
+    conn.query_row("SELECT sqlcipher_export('fresh')", [], |_| Ok(()))?;
+    conn.execute_batch("DETACH DATABASE fresh;")?;
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(sidecar(path, suffix));
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Re-encrypts a database under a new key, in place.
+pub fn rekey(conn: &Connection, key: &DbKey) -> Result<()> {
+    conn.execute_batch(&format!("PRAGMA rekey = {};", key.pragma()))?;
+    Ok(())
+}
+
+fn hex_of(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+pub(crate) fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
 }
 
 /// The base-table version of a database, if it has one.
@@ -342,15 +475,19 @@ pub fn migrate(conn: &Connection) -> Result<bool> {
 
 /// Checks a database that may have been left mid-write. A damaged one is repaired when the
 /// damage is confined to view tables, which are caches: they're unlinked from the schema
-/// without reading their pages, `VACUUM` copies the base tables into a fresh file, and
+/// without reading their pages, the base tables are exported into a fresh file, and
 /// `migrate` rebuilds the views from `events`. Damage anywhere else is `Corrupt`. Returns the
 /// connection to use from then on.
-pub fn check_and_repair(conn: Connection, path: &std::path::Path) -> Result<Connection> {
-    let problems = integrity_problems(&conn)?;
+pub fn check_and_repair(conn: Connection, path: &std::path::Path, key: &DbKey) -> Result<Connection> {
+    // SQLCipher fails the check outright (as out of memory) on a page that doesn't authenticate.
+    let problems = integrity_problems(&conn).unwrap_or_else(|e| vec![e.to_string()]);
     if problems.is_empty() {
         return Ok(conn);
     }
     tracing::warn!(?problems, "database failed its integrity check; rebuilding views");
+    // A page that failed to decrypt leaves the connection's pager in an error state.
+    drop(conn);
+    let conn = open(Some(path), Some(key))?;
     let mut names: Vec<String> = VIEW_TABLES.iter().map(|t| format!("'{t}'")).collect();
     names.push("'messages_fts_data'".into());
     names.extend(["idx", "content", "docsize", "config"].iter().map(|s| format!("'messages_fts_{s}'")));
@@ -359,9 +496,12 @@ pub fn check_and_repair(conn: Connection, path: &std::path::Path) -> Result<Conn
         names.join(", ")
     ))?;
     drop(conn);
-    // A fresh connection, so the schema without the views is the one in use.
-    let conn = open(Some(path))?;
-    conn.execute_batch("VACUUM;")?;
+    // A fresh connection, so the schema without the views is the one in use. (SQLCipher's
+    // VACUUM refuses a file with a page that doesn't authenticate, even an unreachable one.)
+    let conn = open(Some(path), Some(key))?;
+    conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+    export_over(conn, path, "db.repairing", key)?;
+    let conn = open(Some(path), Some(key))?;
     let left = integrity_problems(&conn)?;
     if !left.is_empty() {
         return Err(Error::Corrupt(left.join("; ")));

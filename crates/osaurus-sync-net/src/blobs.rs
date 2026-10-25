@@ -22,8 +22,25 @@ impl Inner {
     }
 
     pub(crate) async fn fetch_blob(self: Arc<Self>, scope: ScopeId, hash: [u8; 32]) -> Result<PathBuf> {
-        if let Some(p) = lock(&self.state).replica.blob_path(scope, &hash)? {
-            return Ok(p);
+        self.clone().ensure_blob(scope, hash).await?;
+        lock(&self.state).replica.blob_path(scope, &hash)?.ok_or_else(|| anyhow!("blob vanished"))
+    }
+
+    pub(crate) async fn fetch_blob_bytes(self: Arc<Self>, scope: ScopeId, hash: [u8; 32]) -> Result<Vec<u8>> {
+        self.clone().ensure_blob(scope, hash).await?;
+        lock(&self.state).replica.blob_bytes(scope, &hash)?.ok_or_else(|| anyhow!("blob vanished"))
+    }
+
+    /// Downloads a blob from a device that can serve it, unless it's already here.
+    async fn ensure_blob(self: Arc<Self>, scope: ScopeId, hash: [u8; 32]) -> Result<()> {
+        {
+            let st = lock(&self.state);
+            if st.replica.blob_ref(scope, &hash)?.is_none() {
+                return Err(osaurus_sync_core::Error::NotFound("blob".into()).into());
+            }
+            if st.replica.blob_store().has(&hash) {
+                return Ok(());
+            }
         }
         let connected: Vec<DeviceKey> = lock(&self.peers).keys().copied().collect();
         let mut candidates: Vec<DeviceKey> = {
@@ -44,12 +61,11 @@ impl Inner {
                     let mut st = lock(&self.state);
                     st.replica.mark_blob_available(&hash)?;
                     let changes = st.replica.take_changes();
-                    let path = st.replica.blob_path(scope, &hash)?.ok_or_else(|| anyhow!("blob vanished"))?;
                     drop(st);
                     if !changes.is_empty() {
                         self.listener.changes(changes);
                     }
-                    return Ok(path);
+                    return Ok(());
                 }
                 Err(e) => {
                     debug!(?peer, "blob fetch failed: {e:#}");
