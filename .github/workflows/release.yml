@@ -156,6 +156,14 @@ jobs:
         run: |
           rustup toolchain install || rustup show
           rustup target add ${{ matrix.target }}
+      - name: Perl for the OpenSSL build
+        # SQLCipher builds OpenSSL from source on Windows, and Git Bash's perl lacks modules
+        # OpenSSL's Configure needs.
+        run: |
+          perl=/c/Strawberry/perl/bin/perl.exe
+          if [ ! -x "$perl" ]; then choco install strawberryperl -y --no-progress; fi
+          "$perl" -v | head -2
+          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
       - name: Build native library
         run: cargo build -p osaurus-sync-ffi --lib --release --locked --target ${{ matrix.target }}
       - uses: actions/setup-dotnet@v4
