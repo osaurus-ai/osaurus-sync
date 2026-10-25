@@ -143,6 +143,12 @@ impl MembershipState {
         self.certs.iter().filter(|(d, users)| users.contains_key(user) && !self.revoked.contains(d)).map(|(d, _)| *d).collect()
     }
 
+    /// Every device that has acted for `user`, revoked ones included. A removal needs a cutoff
+    /// for each: without one, what the device wrote before the removal counts as written after.
+    pub fn devices_ever_of(&self, user: &UserKey) -> Vec<DeviceKey> {
+        self.certs.iter().filter(|(_, users)| users.contains_key(user)).map(|(d, _)| *d).collect()
+    }
+
     pub fn is_certified(&self, device: &DeviceKey) -> bool {
         self.certs.contains_key(device) && !self.revoked.contains(device)
     }

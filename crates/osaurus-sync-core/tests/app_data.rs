@@ -371,3 +371,44 @@ fn signing_out_keeps_owned_conversations_on_this_device() {
     assert_eq!(got, ["keep me", "after sign-out"]);
     assert!(!a.replica.is_authorized(mine, &b.replica.device_key()).unwrap());
 }
+
+#[test]
+fn a_joined_device_can_sign_out_keeping_its_conversations() {
+    let env = Arc::new(TestEnv::new(10, 1_700_000_000_000));
+    let mut a = open("Mac", env.clone());
+    let mut b = open("Other Mac", env.clone());
+    let shared = a.replica.create_scope(ScopeKind::Conversation, "From the first Mac").unwrap();
+    a.replica.send_message(shared, text("keep me")).unwrap();
+    pair(&mut a, &mut b);
+    copy_scope(&a.replica, &mut b.replica, shared);
+    let own = b.replica.create_scope(ScopeKind::Conversation, "Started here").unwrap();
+    let local = b.replica.create_scope_with(ScopeKind::Conversation, "Headless", Replication::DeviceLocal).unwrap();
+
+    b.replica.sign_out_keeping_data().unwrap();
+    assert!(b.replica.is_device_revoked(&a.replica.device_key()).unwrap());
+    for scope in [shared, own, local] {
+        let c = b.replica.conversation(scope).unwrap().unwrap();
+        assert_eq!(c.replication, Replication::DeviceLocal);
+        assert_eq!(c.my_role, Some(Role::Owner));
+    }
+    let got: Vec<String> = b.replica.messages(shared, None, 10).unwrap().messages.into_iter().map(|m| m.content).collect();
+    assert_eq!(got, ["keep me"]);
+}
+
+#[test]
+fn signing_out_keeps_what_the_revoked_device_wrote() {
+    let env = Arc::new(TestEnv::new(11, 1_700_000_000_000));
+    let mut a = open("Mac", env.clone());
+    let mut b = open("Other Mac", env.clone());
+    let scope = a.replica.create_scope(ScopeKind::Conversation, "Chat").unwrap();
+    a.replica.send_message(scope, text("from the Mac")).unwrap();
+    pair(&mut a, &mut b);
+    copy_scope(&a.replica, &mut b.replica, scope);
+    env.advance(5);
+    b.replica.send_message(scope, text("from the other Mac")).unwrap();
+    copy_scope(&b.replica, &mut a.replica, scope);
+
+    a.replica.sign_out_keeping_data().unwrap();
+    let got: Vec<String> = a.replica.messages(scope, None, 10).unwrap().messages.into_iter().map(|m| m.content).collect();
+    assert_eq!(got, ["from the Mac", "from the other Mac"]);
+}
