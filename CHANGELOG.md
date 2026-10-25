@@ -4,7 +4,7 @@ Each release lists what changed for the apps that use the library. Versions foll
 versioning; `API_VERSION` and `PROTOCOL_VERSION` are listed whenever they change. The release
 workflow copies a version's section into its GitHub release notes.
 
-## Unreleased
+## 0.1.0-beta.2 - 2026-10-24
 
 `API_VERSION` and `PROTOCOL_VERSION` are unchanged; every addition is a new call.
 

@@ -49,7 +49,7 @@ merge rules in detail.
 
 ## Status
 
-The current release is **`v0.1.0-beta.1`**, an internal prerelease for building the client
+The current release is **`v0.1.0-beta.2`**, an internal prerelease for building the client
 apps. "Beta" here means:
 
 - The API and the wire protocol are versioned from this release on. Beta builds on different
@@ -129,7 +129,7 @@ Each release on GitHub has:
 The repository is private, so download the assets with the GitHub CLI:
 
 ```sh
-gh release download v0.1.0-beta.1 -R osaurus-ai/osaurus-sync \
+gh release download v0.1.0-beta.2 -R osaurus-ai/osaurus-sync \
   -p 'OsaurusSync-swift-local-*.zip' -p '*.nupkg'
 ```
 

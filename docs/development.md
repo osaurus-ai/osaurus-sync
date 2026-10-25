@@ -393,7 +393,7 @@ The repository is private, so client apps take prereleases from the GitHub relea
 GitHub CLI rather than from a package registry:
 
 ```sh
-gh release download v0.1.0-beta.1 -R osaurus-ai/osaurus-sync \
+gh release download v0.1.0-beta.2 -R osaurus-ai/osaurus-sync \
   -p 'OsaurusSync-swift-local-*.zip' -p '*.nupkg'
 ```
 
