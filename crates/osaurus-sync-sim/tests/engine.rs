@@ -93,6 +93,41 @@ fn a_device_that_does_not_know_the_code_cannot_grant_an_identity() {
 }
 
 #[test]
+fn joining_a_retired_identity_reports_failure() {
+    let mut sim = Sim::new(5);
+    let mac = sim.add_node("Mac", Platform::MacOs);
+    let pc = sim.add_node("PC", Platform::Windows);
+    let stolen = sim.add_node("Phone", Platform::Ios);
+    sim.pair(mac, pc);
+    sim.run(10_000);
+    sim.pair(mac, stolen);
+    sim.run(10_000);
+    let scope = sim.r(mac).create_scope(ScopeKind::Conversation, "Notes").unwrap();
+    sim.r(mac).send_message(scope, text("before")).unwrap();
+    sim.heal(&[]);
+    sim.run(50_000);
+    let retired = sim.r(mac).user_key();
+    // The phone is offline when the Mac revokes it and rotates, so it keeps the old identity.
+    sim.disconnect_all(stolen);
+    sim.disconnect_all(pc);
+    let phone = sim.nodes[stolen].device();
+    sim.rotate_identity(mac, &[phone]);
+    sim.poll(mac);
+    sim.heal(&[stolen]);
+    sim.run(50_000);
+    let current = sim.r(pc).user_key();
+    assert_ne!(current, retired);
+
+    // The PC is offered the phone's code; joining would move it back to the retired identity.
+    sim.nodes[pc].notices.clear();
+    sim.pair(stolen, pc);
+    sim.run(10_000);
+    assert!(sim.nodes[pc].notices.iter().any(|n| matches!(n, Notice::PairingFailed(_))));
+    assert!(!sim.nodes[pc].notices.iter().any(|n| matches!(n, Notice::Paired { .. })));
+    assert_eq!(sim.r(pc).user_key(), current);
+}
+
+#[test]
 fn live_push_and_acknowledgement() {
     let mut sim = Sim::new(3);
     let mac = sim.add_node("Mac", Platform::MacOs);
