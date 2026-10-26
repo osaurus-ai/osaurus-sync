@@ -163,10 +163,15 @@ fn local_api_and_callbacks() {
             }],
         )
         .unwrap();
-    let page = c.messages(legacy, None, 10).unwrap();
+    let page = c.messages(legacy.clone(), None, 10).unwrap();
     assert_eq!(page.messages[0].timestamp_ms, 1_600_000_000_000);
+    let imported = c.conversation(legacy.clone()).unwrap().unwrap();
+    assert_eq!(imported.last_activity_hlc >> 16, 1_600_000_000_000, "an import is as recent as its messages");
 
     let notes = c.create_conversation("Notes".into(), Replication::Synced).unwrap();
+    let order: Vec<String> = c.conversations().unwrap().into_iter().map(|x| x.scope).collect();
+    let position = |scope: &String| order.iter().position(|s| s == scope).unwrap();
+    assert!(position(&notes) < position(&legacy), "a new conversation lists above an imported one");
     let first = c.send_message(notes.clone(), text("first")).unwrap();
     let then = c.message(first).unwrap().unwrap().timestamp_ms;
     std::thread::sleep(std::time::Duration::from_millis(5));
