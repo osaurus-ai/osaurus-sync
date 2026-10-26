@@ -221,9 +221,11 @@ impl Replica {
     }
 
     fn conversations_where(&self, filter: &str, tail: &str, p: impl rusqlite::Params) -> Result<Vec<ConversationSummary>> {
+        // An imported conversation's messages keep their original times while its genesis is
+        // stamped at import, so activity is the newest message, and the genesis only when empty.
         let sql = format!(
             "SELECT c.scope, c.kind, c.title, c.pinned, c.sort_order, c.archived, c.my_role, c.members,
-                MAX(c.created_hlc, COALESCE((SELECT MAX(hlc) FROM messages_view m WHERE m.scope = c.scope), 0)) AS activity,
+                COALESCE((SELECT MAX(hlc) FROM messages_view m WHERE m.scope = c.scope), c.created_hlc) AS activity,
                 (SELECT content FROM messages_view m WHERE m.scope = c.scope ORDER BY hlc DESC, author_device DESC, id DESC LIMIT 1),
                 (SELECT COUNT(*) FROM messages_view m WHERE m.scope = c.scope AND m.principal != ?2
                     AND m.hlc > COALESCE((SELECT last_read_hlc FROM read_state r WHERE r.scope = c.scope), 0)),

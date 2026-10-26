@@ -6,6 +6,12 @@ workflow copies a version's section into its GitHub release notes.
 
 ## Unreleased
 
+**Fixes**
+
+- A conversation brought in with `importLegacyConversation` is as recent as its newest message.
+  Its `lastActivityHlc` was the time of the import, so every imported conversation looked just
+  active and the list showed them in import order.
+
 **App data**
 
 - [docs/app-data.md](docs/app-data.md) describes hosted runs, where one of the user's devices runs
