@@ -320,7 +320,7 @@ final class BindingTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .appendingPathComponent("../../../../tests/fixtures/app-data").standardized
         let names = try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasSuffix(".json") }.sorted()
-        XCTAssertEqual(names.count, 5)
+        XCTAssertEqual(names.count, 6)
         let core = try open("fixtures")
         var n = 0
         func files(_ list: Any?) throws -> [AttachmentFile] {
