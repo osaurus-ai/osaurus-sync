@@ -4,7 +4,10 @@ Each release lists what changed for the apps that use the library. Versions foll
 versioning; `API_VERSION` and `PROTOCOL_VERSION` are listed whenever they change. The release
 workflow copies a version's section into its GitHub release notes.
 
-## Unreleased
+## 0.1.0-beta.4 - 2026-10-26
+
+`API_VERSION` and `PROTOCOL_VERSION` are unchanged, so beta.4 devices keep syncing with beta.1
+through beta.3 ones, and apps built against beta.3 build against beta.4 unchanged.
 
 **Fixes**
 
@@ -20,6 +23,10 @@ workflow copies a version's section into its GitHub release notes.
   state (`ai.osaurus.host-run/1`), and the stop and approval namespaces (`ai.osaurus.run/1`,
   `ai.osaurus.approval/1`, `ai.osaurus.approval-answer/1`). New fixtures:
   `hosted.json` and `agent-directory.json`. The library itself is unchanged.
+- It also describes served chats: `workspace` sessions a device ran for someone else with one of
+  the user's agents. The server tags them `servedBy`, delivers the owner's turns from other
+  devices once, and publishes its approval requests for any of the user's devices to answer.
+  New fixture: `served.json`.
 
 ## 0.1.0-beta.3 - 2026-10-24
 
