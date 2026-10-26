@@ -85,6 +85,7 @@ Tags are small strings for indexed lookups (`conversations(filter:)`). Osaurus w
 | `externalSessionKey` | The caller's grouping key, when set |
 | `dispatchTaskId` | The dispatch task id, when set |
 | `hostDevice` | The host's device id, when the session is hosted (see [Hosted runs](#hosted-runs)) |
+| `servedBy` | The device that served a `workspace` session (see [Served chats](#served-chats)) |
 
 ## `ai.osaurus.session/1`
 
@@ -216,10 +217,57 @@ write replaces the other's:
   longer pending.
 - `alwaysAllow` changes the agent's tool policy on the host, as if it had been chosen there.
 
+## Served chats
+
+A `workspace` session is a conversation a device ran for someone else with one of the user's
+agents: a workspace teammate, an invite-link caller, or the user's own phone. The device that
+ran it is the *server*. Only the server talks to the caller; the user's other devices act
+through the conversation and the server carries the action out.
+
+- The server writes `servedBy` (its device id) when it creates or promotes the conversation.
+  Other writers keep the tag; it never changes. `hostDevice` is not used: these aren't hosted
+  runs, and no `hostRun` turn is ever written into them.
+- Readers list the session under the server's agent (`agentId` is the agent's id on the
+  server), labelled with the caller from the session's `workspace` object.
+- Turn `author` says who wrote each user turn: the caller (`teammate`, `invite_peer`, ...), the
+  owner at the server (`owner`), or the owner on another device (`owner_device`, with
+  `deviceLabel`).
+
+### Owner turns from other devices
+
+Another device writes the user's turn as an ordinary user message whose `author` is
+`owner_device`. The server delivers it to the caller and to a live run once:
+
+- It delivers only user messages written as the user (not `asAgent`) by one of the user's
+  non-revoked devices other than itself, whose `author` is `owner` or `owner_device`. Anything
+  else is history.
+- It records each delivered turn before acting on it, so a restart never delivers twice, and it
+  doesn't deliver turns older than seven days when it first sees them.
+- Sessions from the user's phone take no owner turns.
+
+### Owner approvals
+
+| Namespace | Written by | Fields |
+| --- | --- | --- |
+| `ai.osaurus.served-delivery/1` | Server | `v`; `delivered`: the ids of the owner turns from other devices it handled, oldest first, at most 200 |
+| `ai.osaurus.owner-approval/1` | Server | `v`; `pending`: the caller's tool calls waiting for the user, `{ id, tool, title, description, arguments?, caller?, agent?, offersConversationLease, requestedMs, expiresMs? }` |
+| `ai.osaurus.owner-approval-answer/1/<device>` | That device | `v`; `answers`: approval id to `{ answer, answeredMs }`, `answer` one of `approved`, `denied`, `allowed_for_conversation` |
+
+- Each answering device writes only the namespace ending in its own device id, so two devices
+  answering never overwrite each other.
+- The server applies the earliest answer from a non-revoked device and ignores answers for ids
+  that are no longer pending; the first answer, on any device or at the server, wins.
+- The server removes an approval from `pending` once it is answered, times out or its run ends;
+  readers then withdraw it. Timeouts and cancellation happen on the server only.
+- `allowed_for_conversation` is on offer only when `offersConversationLease` is true.
+  `arguments` is the tool call's JSON arguments as a string; callers never receive it.
+- Devices drop their answers for ids no longer pending.
+
 ## Fixtures
 
 `hosted.json` is a hosted run with a pending approval and a stop request; `agent-directory.json`
-is a device's directory. Each fixture describes a conversation (native fields, tags and session app data) and its
+is a device's directory; `served.json` is a served chat with a delivered owner turn and an
+answered owner approval. Each fixture describes a conversation (native fields, tags and session app data) and its
 messages (native fields, `attachments`, `app_data` and, per namespace, `app_data_blobs`).
 Attachment and blob entries carry their content as `text`; a test writes each to a file, imports the conversation with
 `importLegacyConversation`, and checks that every field reads back unchanged. Indexes in the JSON
@@ -227,6 +275,6 @@ refer to those lists in order.
 
 ## Replication
 
-Osaurus syncs interactive sessions (`chat`, `imported`) and keeps headless ones (`plugin`,
-`http`, `channel`, automations, `self_schedule`, `delegation`, `workspace`) device-local. The app
-data format is the same for both.
+Osaurus syncs interactive sessions (`chat`, `imported`) and served chats (`workspace`), and keeps
+headless ones (`plugin`, `http`, `channel`, automations, `self_schedule`, `delegation`)
+device-local. The app data format is the same for both.
