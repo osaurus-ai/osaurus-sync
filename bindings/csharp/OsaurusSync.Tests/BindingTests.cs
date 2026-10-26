@@ -321,7 +321,7 @@ public sealed class BindingTests : IDisposable
     {
         var root = FixtureDir();
         var names = Directory.GetFiles(root, "*.json").OrderBy(n => n, StringComparer.Ordinal).ToArray();
-        Assert.Equal(3, names.Length);
+        Assert.Equal(5, names.Length);
         using var core = Open("fixtures");
         var n = 0;
         AttachmentFile[] Files(System.Text.Json.Nodes.JsonNode? list) =>
