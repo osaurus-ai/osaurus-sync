@@ -1044,7 +1044,14 @@ impl Engine {
             out.push(Out::Notify(Notice::PairingFailed("grant does not match".into())));
             return Ok(());
         }
-        r.adopt_user(user)?;
+        if let Err(e) = r.adopt_user(user) {
+            self.counters.pairing_failures += 1;
+            tracing::warn!(?peer, error = %e, "couldn't join through pairing");
+            out.push(Out::Notify(Notice::PairingFailed(e.to_string())));
+            out.push(Out::Close(peer, "pairing failed".into()));
+            self.sessions.remove(&peer);
+            return Ok(());
+        }
         self.counters.pairings += 1;
         tracing::info!(?peer, "joined through pairing");
         let s = self.sessions.get_mut(&peer).unwrap();
